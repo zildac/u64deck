@@ -1,0 +1,589 @@
+# u64deck
+
+**v1.8.0 — Public Beta 6**
+
+
+A lightweight, self-hosted control deck for the **Ultimate 64** (and, minus the
+screen mirror, the 1541 Ultimate-II+). One small Python server, a plain HTML/CSS/JavaScript interface,
+no frontend build step, no Electron.
+
+Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on:
+
+- **Full settings access** — every configuration category the firmware exposes,
+  editable in place (enums become dropdowns, ranges become number fields),
+  with apply / save-to-flash / load-from-flash / factory-reset.
+- **Disk images as first-class objects** — browse *inside* a D64/D71/D81
+  (from Ultimate storage or a local file) and act on individual files:
+  - **Run** — extracts just that PRG and DMA-runs it. No mounting, no
+    `LOAD"$",8`, no waiting for a 1541.
+  - **Load** — same, but without RUN (handy for ML monitors / dev work).
+  - **Mount & Load** — for multi-load software: mounts the image, resets, and
+    types `LOAD"name",8,1` + `RUN` into the keyboard buffer for you.
+  - **Create blank images** — create formatted D64/D71/D81/DNP files in an
+    Ultimate storage folder. Enter USB0, SD, Flash, Temp or another mounted
+    folder first; the top-level `/` is only a virtual device list.
+- **Screen mirror with a keyboard that works** — VIC stream rendered at 50 fps
+  on a canvas; click it and type. Space bar included. Keys are batched over a
+  persistent TCP connection to the command socket for low latency.
+- **Audio mirror** — the U64 audio stream, played in the browser.
+- **Unambiguous stream state** — stopping or losing video replaces the last
+  frame with a C64-style VIDEO NOT CONNECTED panel, while the audio badge shows
+  off/connecting/live/reconnecting/error and the live chunks-per-second rate.
+- **Flexible WebM recording** — record combined video/audio, video-only or
+  audio-only with fixed-duration options, bitrate presets, native or 2×
+  pixel-perfect frames, filename templates, optional save-location selection
+  and UDP drop statistics; no FFmpeg or server-side transcoding.
+- **Favourites and recent items** — star frequently used storage folders, disk
+  images, individual PRGs/files inside D64/D71/D81 images, programs, Assembly64
+  releases, SID tunes/folders and Quick Launch entries, with a separate
+  automatically maintained recent list.
+- **Safer disk workflows** — remembered read-only/read-write/unlinked mount
+  modes, visible drive mode badges, timestamped duplication, backup-before-RW
+  mounting and warnings before discarding unlinked writes.
+- **Built-in Help and diagnostics** — contextual tooltips, a searchable Help
+  panel with examples for every major feature, and a sanitised diagnostics ZIP
+  for troubleshooting without sharing passwords or content files.
+- **Machine controls** — reset, reboot, pause/resume, menu button, power off.
+  The menu button opens the on-device menu in the mirror; remote keyboard input remains C64-only.
+- **Optional Retro Replay Fastload automation** — a persistent UI checkbox
+  presses F7 after u64deck-initiated resets/reboots and before mounted software
+  is loaded.
+- **SQLite-backed storage index** — incremental, searchable indexing with
+  automatic migration from legacy JSON caches, pause/resume, rates and ETA.
+- **Local USB index import** — remove a large collection stick from the Ultimate,
+  connect it to the u64deck PC and build `/USB0` (or another mapped subtree)
+  directly from local storage without FTP traffic.
+- **Auto-discovery** — *Select Ultimate…* sweeps your subnet and lists every
+  Ultimate on the network; one click to connect, no IP hunting.
+- **Stream quality options** — low-latency vs all-frames buffering, sharp vs
+  soft scaling, 2×/3×/fit sizing; remembered across sessions.
+- **Assembly64 workspace** — use a full-height, responsive two-pane search and release-file view to query the public Assembly64 database. Results include
+  labelled categories, ratings and readable update times; deploy straight to the
+  machine by running PRGs/CRTs, mounting disk images, using Mount & Run, or
+  browsing inside a downloaded D64 and running one file from it. Speaks the same protocol
+  as the firmware's built-in search (AQL `(field:"value")` queries,
+  `Assembly Query` user-agent, `Client-Id` header — reverse-engineered from
+  the firmware source, `client_id` configurable in `config.json`).
+
+## Screenshots
+
+![Screen mirror](docs/screen-tab.png)
+*Live VIC screen mirror with a working keyboard, stream controls and WebM recording — the bezel follows the machine's real border colour.*
+
+![Storage search](docs/storage-search.png)
+*Recursive storage search that looks inside disk images — here finding a PRG buried in a Compunet demo disk, across 60,000 indexed folders, in seconds.*
+
+![SID Jukebox](docs/jukebox.png)
+*SID Jukebox: instant search across the entire HVSC with composer/chip metadata, one-click playback through real SID silicon, and persistent play queues.*
+
+![Favourites](docs/favourites.png)
+*Favourites and recent items — star anything (folders, disks, files inside images, SID tunes, Assembly64 releases) for one-click access.*
+
+![Assembly64](docs/assembly64.png)
+*Assembly64 search: fresh scene releases, filterable by category, rating and recency — deploy straight onto the machine with Mount & Run.*
+
+## Quick start
+
+**Windows:** double-click `start.bat` (installs dependencies on first run,
+then starts the server), open http://localhost:8064 and hit **Select Ultimate…**
+in the header — it sweeps your local subnet(s) and lists every Ultimate it
+finds; click **Use** to connect. No IP required.
+
+Anywhere else (or by hand):
+
+```bash
+pip install -r requirements.txt
+python server.py --u64 192.168.1.64        # IP optional if you use Select Ultimate…
+# open http://localhost:8064
+```
+
+Settings (device, interface, transport, passwords) live in `config.json`,
+which u64deck **creates and updates by itself** — it is deliberately not
+shipped in release zips, so unzipping an update over your install keeps
+your settings. `config.example.json` documents the available keys
+(`u64_host`, `password` for the U64 network password, `ftp_user`/
+`ftp_password`, `local_ip`, `stream_transport`, multicast groups,
+`assembly64.client_id`).
+
+## Mount safety modes
+
+The **STORAGE** tab defaults existing disk images to **Unlinked**:
+
+- **Unlinked — temporary writes** permits drive writes while leaving the
+  original image unchanged. Removing or replacing the image discards them.
+- **Read-only (RO)** blocks drive writes.
+- **Read/write (RW)** commits C64 drive writes to the original image.
+
+The effective mode appears on each mount action, for example
+**Mount & Run · UNLINKED**. The selector can override it at any time.
+
+A blank D64/D71/D81/DNP created through **Create Blank Image** is mounted
+immediately on drive A as **Read/write**, because a newly created disk is
+normally intended to be populated. This is an action-level decision, not a
+permanent hidden tag: opening that image later treats it as an existing image
+and uses the selected default mode.
+
+**Duplicate Image** creates a timestamped sibling copy on Ultimate storage.
+**Back Up & Mount RW** verifies that a timestamped copy has been written before
+mounting the original read/write.
+
+## Stable index and automatic migration
+
+u64deck stores storage, parsed-image and SID metadata in one stable
+`.u64deck-index.sqlite3` beside the application. The filename is deliberately
+not derived from the Ultimate's IP address, so DHCP changes no longer create a
+fresh partial index.
+
+On the first launch after upgrading from an older build, u64deck:
+
+1. Detects all legacy `.u64deck-index-<address>-<id>.sqlite3` files.
+2. Creates transactionally consistent copies under a dated `index-backups/`
+   folder. The original databases are never modified.
+3. Merges directory listings, disk-image catalogues and SID metadata, preferring
+   the newest scan for each path. Historic orphaned child-cache rows that no
+   longer have a valid parent record are skipped; they cannot be used safely,
+   while the valid catalogue data continues to migrate.
+4. Validates foreign-key integrity and confirms that the merged database
+   preserves the storage, image and SID coverage of the source databases.
+5. Atomically switches to `.u64deck-index.sqlite3` only after validation.
+
+If migration fails, u64deck keeps using the currently selected legacy database
+and reports the error in **Settings → Search Index & Cache**. Do not delete old
+index files until the merged counts have been checked.
+
+## Help and diagnostics
+
+Use the text **Help** button in the top bar for searchable documentation, usage
+examples and troubleshooting across Screen & Recording, Storage, indexing, favourites,
+Assembly64, SID Jukebox and settings. **Export Diagnostics** under
+Settings → Diagnostics & Support downloads a ZIP containing version/build, sanitised
+configuration, device and runtime information, stream counters, index/cache
+statistics and recent errors. Passwords, secret/token/key fields and media
+content are excluded.
+
+## Requirements
+
+- Ultimate 64 with **firmware 3.11+** (REST API; 3.12+ for network password),
+  **or a Commodore 64 Ultimate** — including prkl_ultimate / Spiffy builds
+  (1.1.x firmware line), which expose the same `/v1` REST API, port-64
+  command socket, FTP and UDP streams. Screen/audio mirror needs a machine
+  with the VIC streamer (U64 / C64U — the 1541 Ultimate-II+ has none).
+- Python 3.10+ on any machine on the same LAN (or the standalone exe).
+
+## Setup
+
+### Standalone .exe (no Python needed)
+
+The repo includes a PyInstaller spec and a GitHub Actions workflow
+(`.github/workflows/build-exe.yml`) that compiles a single-file
+**`u64deck.exe`** on a Windows runner:
+
+1. Push this folder to a GitHub repo.
+2. The **build-exe** action runs on every push — grab `u64deck.exe` from the
+   workflow's artifacts (Actions tab → latest run → *u64deck-windows*).
+3. Tag a release (`git tag v1.8.0-beta.6 && git push --tags`) and the exe is attached
+   to the GitHub Release automatically.
+
+Double-click the exe: it starts the server, opens your browser, and you hit
+**Select Ultimate…**. A `config.json` placed next to the exe is picked up for
+passwords/ports. (The workflow smoke-tests each build — starts the exe and
+checks the UI serves — before publishing.) To build locally instead:
+`pip install pyinstaller && pyinstaller u64deck.spec` → `dist/u64deck.exe`.
+
+Note: unsigned PyInstaller exes sometimes trip SmartScreen/AV heuristics —
+you know the drill; it's your own build from your own repo.
+
+### Publishing / releases
+
+The repo is release-ready: `.gitignore` keeps `config.json` (passwords) and
+`library/` (third-party binaries — see below) out of version control, and
+pushing a `v*` tag makes the GitHub Action attach a freshly built
+`u64deck.exe` to the release.
+
+**Do not commit cartridge or disk images to a public repo** — files like a
+Compunet Reborn CRT are someone else's software; the `.gitignore` excludes
+`library/` for exactly this reason. Users drop their own copies in.
+
+### Discovery
+
+There's no broadcast/mDNS announce in the Ultimate firmware, so discovery
+works the way Ultimate64 Manager does it: a parallel TCP sweep of your /24
+on port 80, then a `GET /v1/info` on each hit to confirm it's actually an
+Ultimate. Takes a couple of seconds; needs **Web Remote Control** enabled on
+the device. If your Ultimate lives on a different subnet, type that subnet
+prefix (e.g. `192.168.50.`) into the extra-subnet box before scanning.
+
+### Stream quality
+
+In the SCREEN tab, **Stream Frames** picks between *Low latency* (drops stale
+frames if the browser falls behind — best over weak links) and *All frames*
+(buffers up to 64 frames so you keep the full 50 fps through brief hiccups —
+the right choice on wired or Wi-Fi 6 networks). **Display Style** toggles sharp
+nearest-neighbour vs soft CRT-ish scaling, and **Display Size** sets 2×/3×/fit.
+All three persist across sessions. The stream itself is a fixed format from
+the hardware (384×272, 4bpp, 50 fps, ~2.7 MB/s) — quality settings change
+how it's relayed and drawn, not the source.
+
+**Transport** picks how the stream travels:
+
+- *Direct (unicast)* — the device streams straight to this PC. Default.
+- *Multicast (shared)* — the device streams to a multicast group and u64deck
+  **joins** it (defaults `239.0.1.64`/`.65` — the same groups
+  prkl_ultimate's Data Streams page uses). Any number of receivers can watch
+  simultaneously: u64deck's mirror and VLC (via the vlc-u64stream plugin)
+  see the same stream, and neither steals it from the other. If a multicast
+  stream is already running (started from prkl's web page), just switching
+  Transport to Multicast makes it appear — no need to press Start, which
+  would merely re-point the device at the same group anyway.
+
+**Interface** matters on multi-homed machines: if you run virtual adapters
+(Hyper-V, WSL, VPNs), the automatic "which of my IPs should the device
+stream to" pick can land on the wrong one — the classic symptom is a stream
+that never arrives. Choose your real LAN adapter from the Interface dropdown
+(the list comes from your actual NICs) instead of disabling adapters; the
+choice applies to unicast destinations and to which NIC multicast groups are
+joined on, and re-points any running stream immediately. `local_ip` in
+`config.json` makes it permanent.
+
+Groups/ports are configurable (`multicast_video`, `multicast_audio`,
+`stream_transport` in `config.json`). Heads-up: in *Direct* mode, pressing
+Start redirects the device's single stream output to this PC — so if VLC was
+watching a multicast stream, it goes dark until you restart it. Multicast
+mode is the right setting if you use both.
+
+### Firewall
+
+The video/audio mirror needs inbound **UDP 11000 (video) and 11001 (audio)**
+from the Ultimate to the machine running u64deck. On Windows:
+
+```powershell
+New-NetFirewallRule -DisplayName "u64deck streams" -Direction Inbound `
+  -Protocol UDP -LocalPort 11000,11001 -Action Allow
+```
+
+## How the pieces talk
+
+| Function | Transport |
+| --- | --- |
+| Settings, mounting, run PRG/CRT/SID, machine control, stream start/stop | REST API (`/v1/...`) |
+| Keyboard injection, stream start/stop fallback for older firmware | TCP command socket, port 64 (`0xFF03 KEYB`) |
+| Video (384x272 @ 4bpp, 50 fps) / audio (S16LE stereo, 47983 Hz) | UDP 11000 / 11001 → WebSocket → canvas / WebAudio |
+| Browsing Ultimate storage, fetching images for inspection | FTP (port 21) |
+
+D64/D71/D81 parsing (directory + sector-chain extraction) happens server-side
+in `d64.py`, so "run this one PRG off that disk" is: FTP-fetch (or upload) →
+parse → extract → `POST /v1/runners:run_prg`. The disk drive never spins.
+
+### Cartridges vs DMA run (Retro Replay etc.)
+
+Running a PRG/SID/MOD uses the firmware's DMA loader, which swaps in an
+internal boot cartridge and then restores yours. With a freezer cart
+(Retro Replay / Action Replay) the restore handshake can fail, and the
+firmware's fallback is a **hard reset into the cart menu** — the classic
+"demo starts, machine reboots to the RR screen". u64deck defends against
+this by default (`cart_safe_run: true`): before a DMA run it blanks the
+Cartridge config item, runs, then writes the original value back. Config
+changes only apply at the next reset, so the launched program keeps
+running with the cart parked — and flash is never written, so even a
+worst-case crash is undone by a power cycle. CRT launches are exempt
+(they replace the cartridge by definition). Trade-off: while a program
+started this way runs, the freezer is inactive until the next reset.
+
+### Cartridge boot menus (Retro Replay etc.)
+
+Mount & Run and Mount & Load type into the keyboard buffer after a reset. With a
+cartridge like **Retro Replay** active, reset lands in the cart's boot menu
+first — and if the typed `LOAD` characters arrive while that menu is up, the
+menu interprets them (that's how you end up staring at the MC monitor).
+
+The SCREEN tab has an **Auto F7 Fastload** checkbox. When enabled, u64deck
+presses F7 after Reset or Reboot actions started from its UI, selecting
+**INSTALL FASTLOAD** on the Retro Replay screen. It also applies to Mount & Run
+and Mount & Load so the LOAD command is not sent into the cartridge menu. The
+choice persists across restarts and is disabled by default. It only applies to
+resets/reboots initiated by u64deck; it cannot react to the Ultimate's physical
+reset button or resets triggered by software running on the C64.
+
+The corresponding advanced `config.json` settings are:
+
+- `boot_wait` — seconds between reset and typing (default 2.8; raise to
+  ~4.5 if your cartridge or firmware takes longer).
+- `boot_prekey` — the cartridge-menu key. The UI checkbox sets this to `"F7"`
+  or clears it. Other supported manual values are F1–F8, RETURN and SPACE.
+
+## Favourites and recent items
+
+The **FAVOURITES** tab is a lightweight launcher for commonly used content.
+Use the ☆ control in Ultimate storage, Assembly64, the SID browser/search/
+play queue or Quick Launch to save an item. Opening, mounting, running or playing
+content also updates the recent-items list automatically. The state lives in
+`user_items.json` next to `config.json`; release archives do not include it, so
+updates preserve it.
+
+## Video and audio recording
+
+The SCREEN tab's **Record** button starts the mirror's video and audio streams
+when required, captures the 384×272 canvas at 50 fps and combines it with the
+48 kHz stereo audio stream using the browser's `MediaRecorder`. Stopping creates
+a timestamped `.webm` download. Recording is performed locally in the browser;
+no capture data is sent elsewhere and no FFmpeg installation is required.
+Chrome/Edge provide the most consistent WebM support. A dedicated red dot
+shows recording activity; the button, elapsed time and global opaque tooltip
+remain stable while status updates occur. MP4 is selected automatically where
+the browser supports it, with WebM fallback and repaired duration metadata for
+seeking.
+
+Before streaming starts, after **Stop video**, or after an unexpected browser
+video-socket disconnect, the canvas displays a deliberate VIDEO NOT CONNECTED
+panel instead of leaving the final C64 frame frozen. The panel also reports when
+audio remains connected. The audio badge separately shows its connection state
+and, while live, the received chunk rate (normally about 31/s).
+
+## SID Jukebox
+
+The SID JUKEBOX tab plays SID collections through the machine's real SID chip:
+point it at an Ultimate storage folder (or the **Open SID Jukebox** button in the
+STORAGE browser plays the folder you're looking at), or load local .sid
+files. The play queue shows title/author/released parsed from the PSID/RSID
+headers; click any tune to play, ⏮ ⏭ ⏹ and shuffle do what they say, and
+multi-tune SIDs get a subsong selector. The queue expands to fill the remaining
+Jukebox height and keeps its headings visible while only the rows scroll. When
+all indexed entries share one author, that author appears once in the queue
+heading instead of being repeated in every row; mixed-author queues retain the
+Author column, while narrower windows fold author/release details beneath the
+title. Folder and saved-play-queue entries are loaded lazily, browser requests
+have timeouts and status polling cannot overlap, so a busy native SID player
+does not make the whole interface unresponsive.
+
+**Auto-advance**: tunes advance automatically. With HVSC's
+`Songlengths.md5` configured (`songlengths_path` in `config.json`), each
+tune plays for its documented length; without it, `sid_default_secs`
+(default 180) applies (0 = loop forever). If your HVSC lives on the device, you don't even need to set it:
+on first jukebox use u64deck **auto-detects the HVSC root** (a folder
+with MUSICIANS + DOCUMENTS, e.g. `/Usb0/HVSC` or `/Usb0/C64Music`),
+saves it as `hvsc_path`, wires `songlengths_path` to its
+`DOCUMENTS/Songlengths.md5`, and fetches that over FTP (cached locally).
+The jukebox browser and 🎲 Random dive then home to the collection
+automatically.
+
+**🔎 HVSC search**: the search box in the SID JUKEBOX tab searches the
+*entire collection instantly* — no device traffic per query. Before a SID
+metadata scan, HVSC's own Songlengths.md5 provides a filename/path index.
+After a metadata scan, SQLite also searches header title, author, release and
+path fields. Multi-word queries AND together ("hubbard sanxion"). ▶ Play on a
+hit loads that tune's folder as the play queue and starts it.
+
+**Chip and Format filters**: the Chip selector filters 6581, 8580, Either,
+Mixed/Multi-SID and Unknown declarations. Format filters PSID or RSID. A text
+term is optional, so selecting a Chip or Format and searching with a blank text
+box returns all matching indexed tunes. Chip badges use the same meanings in
+search results, the Play Queue and Now Playing: amber 6581, cyan 8580, violet
+Either, pink Mixed/Multi-SID and grey Unknown. The dropdown selection remains
+the indication of the active filter. These filters use the SID metadata
+catalogue described below.
+
+**SID Index & Metadata**: use the clearly labelled **SID Index** button in the
+SID JUKEBOX browser toolbar to open or close the indexing controls. Once a scan
+is complete the button shows the indexed tune count; while a scan is running it
+shows live parsed progress. The scan parses the small PSID/RSID header for every
+tune and stores title, author, release, chip model, PSID/RSID format, header
+version, subtune count, default subtune, clock and SID count in the same
+per-device SQLite database. Play queues stay lazy — the complete tune is still
+fetched only when it is played — but the Chip and other columns can now be
+populated immediately.
+
+There are two scan sources:
+
+- **Refresh From Ultimate** reads only SID headers over FTP. It is incremental
+  but a complete HVSC collection can still take a long time because of the
+  number of individual files.
+- **Build From Local HVSC** is the preferred initial scan. Connect the storage
+  to the PC, select the local HVSC folder (the folder containing `MUSICIANS`
+  and `DOCUMENTS`), and map it to the same Ultimate path, normally
+  `/USB0/HVSC`. Selecting the drive root is also accepted when u64deck can find
+  one unambiguous `HVSC` or `C64Music` child. The scan is read-only and reads
+  only the first 124 bytes of each SID.
+
+Both modes support pause, resume and stop. Unchanged files are reused using
+size/mtime metadata. Leave **rescan unchanged files** off for normal refreshes;
+it deliberately bypasses the cache and reparses every header. A completed local
+index does not need to be rebuilt unless the collection changes or a full rescan
+is intentionally requested. Completed scans reconcile removed tunes so stale
+search results are not left behind.
+
+**⭳ Updates?**: compares your collection's release (read from STIL.txt /
+BUGlist.txt headers on the device) against the latest on hvsc.c64.org.
+Applying updates stays a job for the official HVSC Update Tool on your
+PC (update packs rename/move thousands of files by script — not
+something to improvise over FTP against your only copy); once applied,
+press **↻ Re-detect** to reload the collection path and Songlengths, then run
+the local or Ultimate SID metadata refresh to reconcile header metadata.
+
+**🎲 Random Dive**: chooses a random `.sid` from the case-insensitive SQLite
+storage index beneath the current path. For HVSC paths it can fall back to the
+Songlengths index after mapping the configured collection root. The selected
+SID starts immediately and its containing folder becomes a lazy Play Queue:
+only a tune that is actually played is fetched, avoiding a burst of FTP work
+while the Ultimate's native SID player is active. Errors distinguish an
+unindexed folder, a folder with no SIDs and an unresolved HVSC mapping.
+
+## Search
+
+The 🔎 box in Browse Ultimate Storage searches **recursively from the current
+folder down** — matching folder names, file names, and (with "in images"
+ticked) the directory entries *inside* every D64/D71/D81 it finds. Results
+are actionable: Mount & Run / Browse images, Run PRGs and T64s, jump to the
+containing folder, or Run a hit straight out of its disk image. **🗂 Index volume** walks an entire subtree once (background job with
+live status and Stop) — every folder listing and every disk image goes
+into the persistent caches, so subsequent searches of that tree run
+near-instantly, essentially offline. Re-indexing refreshes folder
+listings but reuses unchanged images (mtime-keyed), so it's cheap.
+Searches of un-indexed areas still walk live.
+
+After a completed **Local USB index**, the same control is relabelled
+**🔎 Verify from Ultimate**. Verification is optional: it walks the whole mapped
+subtree over FTP, keeps the local index available for searches while it runs,
+and reports unchanged/new/changed directory and image counts. Normal folder
+browsing already refreshes the folder being viewed, so an unchanged stick does
+not need a full verification pass when returned to the Ultimate.
+
+The search streams results live with a running status
+(folders walked, images opened, current path), governed only by the time
+limit you pick next to the box (30s up to ∞ — the Stop button is always
+available). Image directory listings are **cached persistently** across
+searches and restarts, keyed by path + size + FTP modification time, so
+a re-searched tree costs almost nothing on images — and a rewritten disk
+is automatically re-read, not served stale.
+
+## Blank disks
+
+**Create Blank Image** in the STORAGE browser creates a formatted blank image in the
+current folder using the firmware's own creator: D64 (35 or 40 tracks),
+D71, D81, or DNP (CMD native, choose track count), with a custom 16-char
+disk label. G64 isn't exposed by the device API — that one still needs the
+U64's own menu.
+
+## Multi-disk software (swap & queue)
+
+Two ways to handle "INSERT DISK 2" software, both ending at the **DISK SWAP**
+bar on the SCREEN tab, which swaps disks into the drive **without a reset** —
+the running software just sees the disk change:
+
+**Automatic** — just Mount & Run any disk from Ultimate storage. u64deck
+conservatively groups only sibling images whose complete title and recognised
+suffix match, such as `Game side1.d64` / `Game side2.d64`, `Game (Disk 1).d64`
+/ `Game (Disk 2).d64`, `ThePhoenixCode-Disk1-BZ.D64` /
+`ThePhoenixCode-Disk2-BZ.D64`, or `Scratch-1.d64` / `Scratch-2.d64`. A shared
+release/language tag after the disk number is retained as part of the match.
+Merely sharing a folder or ending in a number is not enough. Matching disks are naturally
+sorted, so `disk 10` follows `disk 9`. If there is more than one, the swap bar
+appears: numbered buttons jump to any disk and ▶ mounts the next. Ambiguous
+names remain a one-disk set; use the manual queue when needed. After each
+mount, u64deck reports what the matcher decided and lists the related images.
+The automatic set is reconstructed from the currently mounted device path after
+an application restart or when **Refresh Drive Status** is used.
+
+A compact **Mounted Drives** strip appears at the top of SCREEN and STORAGE,
+showing both drive images and their effective RO/RW/UNLINKED mode. Click it to
+jump to the full eject and refresh controls.
+
+**Manual queue** — when you want to choose the exact disks and order: in the
+STORAGE tab, choose **Add to Swap Queue** on each image in order (1, 2, 3…); the DISK SWAP QUEUE
+panel lists your picks (✕ removes one). Then **Mount #1 & arm** boots the
+set, or **Arm only** stages it for later. Your click order is the disk
+order — deliberately never re-sorted, so Side-B-first oddities work. For
+disks on your PC instead of the device, use the multi-file picker in the
+same panel (**Arm local set**): the whole set uploads, disk 1 mounts, and
+the swap bar drives the rest — device storage never touched.
+
+Mid-demo the ritual is: software asks for disk N → click **N** (or ▶) in the
+swap bar → click the screen → press the key it's waiting for. Done.
+
+## Security notes (honest ones too)
+
+The Ultimate's own services — REST, FTP, the port-64 socket, even the
+network password header — are **plaintext by firmware design**; nothing a
+client can do changes that, so treat the device like the friendly LAN
+appliance it is (put it on your IoT VLAN if you segment).
+
+The **browser → u64deck** hop, however, is ours to secure:
+
+- `http_host` in `config.json` — set `"127.0.0.1"` to make the UI reachable
+  from this machine only. The default `"0.0.0.0"` serves the whole LAN
+  (needed for phone/tablet use — but then anyone on the network can drive
+  your C64).
+- `tls_certfile` / `tls_keyfile` — point at a cert/key pair and the UI is
+  served over https (e.g. `openssl req -x509 -newkey rsa:2048 -nodes
+  -keyout key.pem -out cert.pem -days 365 -subj "/CN=u64deck"`).
+
+`config.json` may contain the device passwords, which is why it's
+`.gitignore`d and excluded from release zips.
+
+
+## Known limitations (honest ones)
+
+- **Keyboard = keyboard buffer.** The U64 exposes typed-character injection,
+  not key-matrix state, so anything that reads the matrix directly (most
+  games) won't see remote input, and keys can't be held down. That's a
+  hardware/firmware boundary every remote tool shares.
+- **Run (DMA) is single-file.** Multi-load games/demos need their disk —
+  that's what Mount & Load is for.
+- **Mount & Load timing** is a fixed ~2.8 s wait for BASIC after reset. If you
+  run a fastloader kernal or odd cartridge config, adjust the sleep in
+  `image_mount_load` in `server.py`.
+- **Assembly64 endpoints aren't officially documented**; the tab shows raw
+  responses so the templates in `config.json` can be adapted if the service
+  changes shape.
+- One image at a time is cached in RAM per browse (last 8 kept).
+
+## Files
+
+```
+server.py          FastAPI backend + WebSocket stream bridge
+ultimate.py        REST / TCP command socket / UDP receivers / FTP client
+d64.py             D64/D71/D81 directory parser + file extractor
+index_store.py     SQLite filesystem and disk-image catalogue
+local_indexer.py   read-only local USB scanner and path mapper
+sid_indexer.py     read-only local SID-header metadata scanner
+device_coordinator.py  priority scheduling for Ultimate operations
+static/index.html  the whole UI
+config.json        host + ports + Assembly64 endpoint templates
+```
+
+### Building the initial index from a local USB stick
+
+For a large collection, local indexing avoids transferring every directory and
+D64/D71/D81 through the Ultimate's FTP service:
+
+1. Stop any current index and safely remove the stick from the Ultimate.
+2. Connect it to the PC running u64deck.
+3. Open **Settings → Build Index From Local USB**.
+4. Select the detected drive (or enter its local folder) and map it to the same
+   Ultimate path, normally `/USB0`.
+5. Press **Build local index**. Pause, resume and stop use the same controls as
+   network indexing.
+6. Return the stick to the Ultimate when the scan completes.
+
+The process is read-only and writes only to u64deck's per-device SQLite file.
+It never copies, renames or modifies content on the USB stick. Matching images
+already present in SQLite are reused, and a completed import removes stale
+catalogue paths that no longer exist on the local volume. Returning an unchanged
+stick to the Ultimate requires no further action: searches use the imported
+index immediately, and opening a folder refreshes that folder. The optional
+**Verify from Ultimate** action is only for a full FTP comparison after changes.
+
+### Occasional incomplete status responses
+
+The Ultimate's embedded HTTP server can occasionally close a status response
+before sending its advertised body. u64deck retries safe GET requests once over
+a fresh connection and preserves the last known device details while it performs
+a quick follow-up check. Mutating operations are never automatically replayed.
+
+### Indexing and device writes
+
+Volume indexing runs in the background. Operations that modify Ultimate storage,
+such as creating a blank disk image, temporarily pause the indexer and wait for
+any active FTP transfer to finish. Storage containing legacy 8-bit filenames is
+handled automatically if the Ultimate FTP service cannot decode a listing as
+UTF-8. Indexing resumes automatically when the write
+completes.

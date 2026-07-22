@@ -1,0 +1,27 @@
+{
+  "u64_host": "",
+  "password": "",
+  "http_port": 8064,
+  "video_port": 11000,
+  "audio_port": 11001,
+  "ftp_user": "anonymous",
+  "ftp_password": "",
+  "assembly64": {
+    "base": "http://hackerswithstyle.se/leet",
+    "client_id": "Ultimate"
+  },
+  "boot_wait": 2.8,
+  "boot_prekey": "",
+  "http_host": "0.0.0.0",
+  "tls_certfile": "",
+  "tls_keyfile": "",
+  "cart_safe_run": true,
+  "songlengths_path": "",
+  "sid_default_secs": 180,
+  "sid_local_source": "",
+  "sid_index_root": "",
+  "hvsc_path": "",
+  "default_mount_mode": "unlinked",
+  "mount_mode_policy_version": 2,
+  "browser_startup": "edge_app"
+}

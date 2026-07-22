@@ -1,0 +1,26 @@
+# user settings — contains device/FTP/network passwords, never commit
+config.json
+
+# user content + third-party binaries (cartridges, disks) — not redistributable
+library/*
+!library/README.txt
+
+__pycache__/
+.pytest_cache/
+build/
+dist/
+*.pyc
+.imagecache.json
+.dircache.json
+.indexmeta.json
+playlists.json
+user_items.json
+.u64deck-index-*.sqlite3
+.u64deck-index-*.sqlite3-wal
+.u64deck-index-*.sqlite3-shm
+.legacy-cache-imported
+.songlengths.cache
+.u64deck-index.sqlite3
+.u64deck-index.sqlite3-wal
+.u64deck-index.sqlite3-shm
+index-backups/

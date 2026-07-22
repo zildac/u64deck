@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>u64deck</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<header>
+  <div class="header-status">
+    <div class="header-mainline">
+      <div class="brand"><span class="brand-name">**** u64deck ****</span> <span class="brand-version" id="ver"></span></div>
+      <div id="devinfo">connecting…</div>
+    </div>
+    <div class="ready-line">READY.<span class="cursor"></span></div>
+  </div>
+  <div class="row header-actions">
+    <button onclick="openDiscover()">Select Ultimate…</button>
+    <button id="helpBtn" onclick="openHelp()">Help</button>
+  </div>
+  <div class="machine">
+    <button class="tip" data-tip="Reset the C64 core. The Ultimate device and network services remain running." onclick="machine('reset')">Reset C64</button>
+    <button class="tip" data-tip="Restart the complete Ultimate device. Streams and network control disconnect briefly." onclick="machine('reboot')">Reboot Ultimate</button>
+    <button onclick="machine('pause')">Pause C64</button>
+    <button onclick="machine('resume')">Resume C64</button>
+    <button onclick="machine('menu_button')" title="open the Ultimate menu on the C64 display">Ultimate Menu</button>
+    <button class="danger" onclick="if(confirm('Power off the Ultimate 64?'))machine('poweroff')">Power Off Ultimate</button>
+  </div>
+</header>
+
+<main>
+<nav>
+  <button data-tab="screen" class="active" onclick="tab('screen')">SCREEN</button>
+  <button data-tab="home" onclick="tab('home')">FAVOURITES</button>
+  <button data-tab="disks" onclick="tab('disks')">STORAGE</button>
+  <button data-tab="settings" onclick="tab('settings')">SETTINGS</button>
+  <button data-tab="asm64" onclick="tab('asm64')">ASSEMBLY64</button>
+  <button data-tab="sid" onclick="tab('sid')">SID JUKEBOX</button>
+</nav>
+
+<!-- ============ SCREEN ============ -->
+<section id="tab-screen" class="active">
+  <button id="screenDriveSummary" class="drive-summary-strip" onclick="jumpToMountedDrives()" title="Open Mounted Drives in Storage">
+    <span class="drive-summary-title">MOUNTED DRIVES</span>
+    <span class="drive-summary-content">Checking Drive A and Drive B…</span>
+  </button>
+  <div class="crt-wrap">
+    <div class="crt"><div class="crt-inner">
+      <canvas id="screen" width="384" height="272" tabindex="0"
+        aria-label="C64 screen — click to focus, then keys are sent to the machine"></canvas>
+    </div></div>
+    <div class="screen-side">
+      <div class="panel">
+        <h2>SCREEN &amp; RECORDING</h2>
+        <div class="row" style="margin-bottom:8px">
+          <button id="btnVideo" class="primary" onclick="toggleVideo()">Start Video</button>
+          <button id="btnAudio" onclick="toggleAudio()">Start Audio</button>
+          <button onclick="toggleFullscreen()" title="double-click the screen also toggles">Full Screen</button>
+          <button id="btnRecord" class="tip" data-tip="Record video, audio, or both. Auto prefers MP4 when the browser supports it and otherwise uses WebM." onclick="toggleRecording()"><span id="recordDot" class="record-dot" aria-hidden="true"></span><span id="recButtonLabel">Record</span></button>
+          <span id="recStatus" class="badge" style="display:none">00:00</span>
+          <span id="recSummary" class="hint rec-summary">Combined · Standard · Auto</span>
+          <label class="hint" title="After Reset C64, Reboot Ultimate, Mount & Run or Mount & Load, wait for the Retro Replay menu and press F7 to install Fastload">
+            <input type="checkbox" id="autoFastload" onchange="autoFastloadChanged()"> Auto F7 Fastload
+          </label>
+          <button onclick="screenshot()" title="save the current frame as PNG">📷</button>
+          <span class="meter-group" aria-label="stream rates">
+            <span id="fps" class="badge">0 fps</span>
+            <span id="aud" class="badge" title="Ultimate audio stream status">Audio off</span>
+          </span>
+        </div>
+        <div class="row" style="margin-bottom:8px;flex-wrap:wrap;gap:6px">
+          <label class="hint tip" data-tip="Controls how the live WebSocket handles incoming frames. It does not change recording bitrate or file quality.">Stream frames
+            <select id="qMode" onchange="qualityChanged()">
+              <option value="1">Low latency (drop stale)</option>
+              <option value="64">All frames (fast LAN / Wi-Fi 6)</option>
+            </select>
+          </label>
+          <label class="hint">Display style
+            <select id="qRender" onchange="renderChanged()">
+              <option value="pixelated">Sharp</option>
+              <option value="auto">Soft (CRT-ish)</option>
+            </select>
+          </label>
+          <label class="hint">Display size
+            <select id="qScale" onchange="scaleChanged()">
+              <option value="2">2×</option>
+              <option value="3">3×</option>
+              <option value="fit">Fit width</option>
+            </select>
+          </label>
+          <label class="hint">Stream route
+            <select id="qTransport" onchange="transportChanged()">
+              <option value="unicast">Direct (this PC)</option>
+              <option value="multicast">Multicast (share w/ VLC)</option>
+            </select>
+          </label>
+          <label class="hint">Network interface
+            <select id="qIface" onchange="ifaceChanged()">
+              <option value="">Auto</option>
+            </select>
+          </label>
+        </div>
+        <details id="recordOptions" class="record-options">
+          <summary>Recording settings</summary>
+          <div class="row" style="margin-top:8px;gap:6px">
+            <label class="hint tip" data-tip="Combined records the canvas and Ultimate audio. Video-only and audio-only omit the other stream.">Mode
+              <select id="recMode"><option value="combined">video + audio</option><option value="video">video only</option><option value="audio">audio only</option></select>
+            </label>
+            <label class="hint tip" data-tip="Choose manual stop or automatically stop after the selected time.">Duration
+              <select id="recDuration"><option value="0">manual</option><option value="30">30 sec</option><option value="60">1 min</option><option value="300">5 min</option><option value="600">10 min</option></select>
+            </label>
+            <label class="hint tip" data-tip="Controls recording bitrate. It does not change the Ultimate stream quality.">Recording quality
+              <select id="recQuality"><option value="compact">compact</option><option value="standard" selected>standard</option><option value="high">high</option></select>
+            </label>
+            <label class="hint tip" data-tip="Auto prefers MP4/H.264/AAC where supported, then falls back to WebM. Choose a format to force it when available.">Format
+              <select id="recFormat"><option value="auto">auto</option><option value="mp4">MP4</option><option value="webm">WebM</option></select>
+            </label>
+            <label class="hint tip" data-tip="Native records the exact 384×272 C64 frame. 2× records a pixel-doubled 768×544 frame.">Frame
+              <select id="recScale"><option value="native">native 384×272</option><option value="2">pixel-perfect 2×</option></select>
+            </label>
+          </div>
+          <div class="row" style="margin-top:8px;gap:6px">
+            <label class="hint" style="flex:1">Filename
+              <input id="recFilename" style="width:min(420px,100%)" value="u64deck-{date}-{time}-{mode}" placeholder="u64deck-{date}-{time}-{mode}">
+            </label>
+            <label class="hint tip" data-tip="Chrome and Edge can ask where to save. Other browsers use the normal Downloads folder."><input type="checkbox" id="recChooseLocation"> choose location</label>
+            <span id="recDrops" class="hint">drops: video 0 · audio 0</span>
+          </div>
+          <div id="recCapability" class="hint" style="margin-top:7px">Checking browser recording support…</div>
+        </details>
+        <div class="kstat" id="kbstat">Click the screen to capture the keyboard.</div>
+        <div class="hint" style="margin-top:8px">
+          Esc = RUN/STOP · F1–F8 · cursor keys · Backspace = DEL · Home / Shift-Home = CLR.
+          Keys use the established C64 keyboard-buffer path, so typing works wherever
+          normal text input works. The Ultimate's on-device menu still requires a local
+          keyboard or joystick.
+        </div>
+      </div>
+      <div class="panel" id="swapPanel" style="display:none">
+        <h2>DISK SWAP</h2>
+        <div class="row" style="align-items:center;flex-wrap:wrap;gap:6px">
+          <button class="mini" onclick="swapPrev()">◀</button>
+          <span id="swapBtns" style="display:flex;gap:4px;flex-wrap:wrap"></span>
+          <button class="mini" onclick="swapNext()">▶</button>
+          <span id="swapLabel" class="hint"></span>
+        </div>
+        <div id="swapDecision" class="hint swap-decision"></div>
+        <div class="hint" style="margin-top:4px">Swaps the disk in the drive <b>without a reset</b> —
+          for "insert disk 2" moments. Set auto-builds only from matching disk/side names in the same folder when you mount.</div>
+      </div>
+      <div class="panel">
+        <h2>QUICK LAUNCH</h2>
+        <div id="qlbtns" class="row" style="flex-wrap:wrap;gap:6px"><span class="hint">empty — add files below</span></div>
+        <div class="row" style="margin-top:8px">
+          <input type="file" id="qlfile" accept=".crt,.prg,.sid,.mod,.d64,.d71,.d81,.g64" style="flex:1">
+          <button class="mini" onclick="qlAdd()">Add to library</button>
+        </div>
+        <div class="hint" style="margin-top:4px">Files live in the <b>library/</b> folder next to the
+          server — drop a Compunet Reborn .crt in and it's one click away. Right-click a button to remove.</div>
+      </div>
+      <div class="panel">
+        <h2>SEND TEXT TO C64</h2>
+        <div class="row">
+          <input id="typeline" style="flex:1" placeholder='e.g. LOAD"$",8' onkeydown="if(event.key==='Enter')sendLine()">
+          <button onclick="sendLine()">Send + Return</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FAVOURITES ============ -->
+<section id="tab-home">
+  <div class="panel">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <div>
+        <h2 style="margin-bottom:4px">FAVOURITES &amp; RECENT ITEMS</h2>
+        <div class="hint">Star storage items, Assembly64 releases, SID tunes/folders and Quick Launch files for one-click access.</div>
+      </div>
+      <div class="row">
+        <select id="itemTypeFilter" onchange="itemsRender()" title="filter favourites and recent items">
+          <option value="">all types</option>
+          <option value="folder">folders</option>
+          <option value="disk">disk images</option>
+          <option value="disk_entry">files inside disks</option>
+          <option value="program">programs / cartridges</option>
+          <option value="assembly64">Assembly64</option>
+          <option value="sid">SID tunes</option>
+          <option value="sid_folder">SID folders</option>
+          <option value="library">Quick Launch</option>
+        </select>
+        <button class="mini" onclick="itemsLoad()">↻ refresh</button>
+      </div>
+    </div>
+  </div>
+  <div class="fav-grid">
+    <div class="panel">
+      <h2>★ FAVOURITES <span id="favCount" class="hint"></span></h2>
+      <div id="favList"><span class="hint">loading…</span></div>
+    </div>
+    <div class="panel">
+      <div class="row" style="justify-content:space-between">
+        <h2 style="margin:0">RECENTLY USED <span id="recentCount" class="hint"></span></h2>
+        <button class="mini" onclick="clearRecents()">Clear</button>
+      </div>
+      <div id="recentList" style="margin-top:12px"><span class="hint">loading…</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ STORAGE ============ -->
+<section id="tab-disks">
+  <button id="storageDriveSummary" class="drive-summary-strip" onclick="jumpToMountedDrives()" title="Jump to Mounted Drives">
+    <span class="drive-summary-title">MOUNTED DRIVES</span>
+    <span class="drive-summary-content">Checking Drive A and Drive B…</span>
+  </button>
+  <div class="split">
+    <div>
+      <div class="panel">
+        <h2>BROWSE ULTIMATE STORAGE</h2>
+        <div class="row" style="align-items:center;margin-bottom:6px">
+          <button class="mini" id="btnUp" onclick="fsUp()" title="parent directory">⬆ Up</button>
+          <button class="mini" onclick="jukeFolder(FS.path)" title="play all SIDs in this folder">♫ Open SID Jukebox</button>
+          <button class="mini tip" data-tip="Create a formatted D64, D71, D81 or DNP in the current writable storage folder." id="newDiskBtn" onclick="newDiskToggle()">＋ Create Blank Image</button>
+          <label class="hint tip" data-tip="Default for existing images opened from Storage, Search, Favourites, Assembly64 or this PC. Unlinked keeps writes temporary; newly created blank images are mounted RW immediately.">Default mount mode
+            <select id="mountModeDefault" onchange="mountModeChanged()"><option value="unlinked">Unlinked — temporary writes</option><option value="readonly">Read-only (RO)</option><option value="readwrite">Read/write (RW)</option></select>
+          </label>
+          <input id="fsQuery" style="width:150px" placeholder="🔎 search this folder…"
+            onkeydown="if(event.key==='Enter')fsSearch()">
+          <select id="fsBudget" title="search time limit" onchange="localStorage.setItem('u64deck.search.budget',this.value)">
+            <option value="30">30s</option>
+            <option value="60" selected>60s</option>
+            <option value="120">2m</option>
+            <option value="300">5m</option>
+            <option value="600">10m</option>
+            <option value="1800">30m</option>
+            <option value="0">∞ no limit</option>
+          </select>
+          <button class="mini primary" id="fsGo" onclick="fsSearch()">Search</button>
+          <button class="mini" id="idxBtn" onclick="idxToggle()"
+            title="walk this subtree once and store folders plus disk-image directories in SQLite">🗂 Build Index</button>
+          <button class="mini" id="idxPauseBtn" onclick="idxPauseToggle()" style="display:none"
+            title="temporarily pause or resume background indexing">⏸ Pause</button>
+          <label class="hint" title="also open every d64/d71/d81 found and search the files inside">
+            <input type="checkbox" id="fsInside" checked> search inside disk images</label>
+          <div class="crumbs" id="crumbs" style="margin-bottom:0"></div>
+        </div>
+        <div id="idxStatus" class="hint" style="display:none;margin:4px 0"></div>
+        <div id="fsSearchOut" style="display:none;margin:6px 0;padding:6px;border:1px solid var(--line);border-radius:4px">
+          <div class="row" style="justify-content:space-between;align-items:center">
+            <span id="fsSearchTitle" class="hint"></span>
+            <button class="mini" onclick="$('#fsSearchOut').style.display='none'">✕ close</button>
+          </div>
+          <div id="fsSearchList" style="max-height:min(60vh,850px);overflow:auto;margin-top:4px"></div>
+        </div>
+        <div id="newDiskForm" style="display:none;margin:6px 0;padding:6px;border:1px solid var(--line);border-radius:4px">
+          <div class="row" style="flex-wrap:wrap;gap:6px;align-items:center">
+            <input id="ndName" style="flex:1;min-width:130px" placeholder="file name e.g. work"
+              onkeydown="if(event.key==='Enter')newDiskCreate()">
+            <select id="ndKind" onchange="newDiskKind()">
+              <option value="d64">D64 (1541)</option>
+              <option value="d71">D71 (1571)</option>
+              <option value="d81">D81 (1581)</option>
+              <option value="dnp">DNP (CMD native)</option>
+            </select>
+            <select id="ndTracks"><option>35</option><option>40</option></select>
+            <input id="ndLabel" style="width:130px" maxlength="16" placeholder="disk label (16)">
+            <button class="mini primary" id="newDiskCreateBtn" onclick="newDiskCreate()">Create &amp; Mount RW</button>
+          </div>
+          <div class="hint" id="newDiskHint" style="margin-top:3px">Formatted blank image created in the current folder, then mounted read/write on drive A. Existing images still use the selected default safety mode. (G64 is available through the Ultimate menu.)</div>
+        </div>
+        <div id="fslist" class="hint">loading…</div>
+      </div>
+      <div class="panel" id="queuePanel">
+        <h2>DISK SWAP QUEUE</h2>
+        <div id="queueList" class="hint">empty — ＋Queue disks above (in order: 1, 2, 3…), or pick
+          local images below</div>
+        <div class="row" style="margin-top:8px;flex-wrap:wrap">
+          <button class="primary" onclick="queueArm(true)">Mount First &amp; Arm Queue</button>
+          <button onclick="queueArm(false)">Arm Queue</button>
+          <button onclick="queueClear()">Clear</button>
+          <input type="file" id="queueLocal" accept=".d64,.d71,.d81,.g64" multiple style="flex:1;min-width:180px">
+          <button class="mini" onclick="queueLocalArm()">Use Selected Files as Queue</button>
+        </div>
+        <div class="hint" style="margin-top:4px">Armed queues appear as the DISK SWAP bar on the
+          SCREEN tab — click ▶ or a number to mount the next disk, no reset.</div>
+      </div>
+      <div class="panel">
+        <h2>FILES FROM THIS PC</h2>
+        <div class="row">
+          <input type="file" id="localfile" accept=".d64,.d71,.d81,.prg,.crt,.sid,.g64">
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button class="primary" onclick="localOpen()">Inspect Image</button>
+          <button id="localMountRunBtn" class="primary mount-mode-action" data-mount-base="Mount &amp; Run" onclick="localMountRun()">Mount &amp; Run · UNLINKED</button>
+          <button id="localMountABtn" class="mount-mode-action" data-mount-base="Mount to A" onclick="localMount('a')">Mount to A · UNLINKED</button>
+          <button id="localMountBBtn" class="mount-mode-action" data-mount-base="Mount to B" onclick="localMount('b')">Mount to B · UNLINKED</button>
+          <button onclick="localRun()">Run Program or Cartridge</button>
+          <select id="localmode" onchange="mountModeChanged(this)" class="tip" data-tip="Read-only protects the file; read/write commits drive writes; unlinked keeps writes temporary.">
+            <option value="unlinked">Unlinked — temporary writes</option>
+            <option value="readonly">Read-only (RO)</option>
+            <option value="readwrite">Read/write (RW)</option>
+          </select>
+        </div>
+      </div>
+      <div class="panel" id="mountedDrivesPanel">
+        <h2>MOUNTED DRIVES</h2>
+        <div id="drivestat" class="hint">–</div>
+        <div class="row" style="margin-top:8px">
+          <button onclick="driveAct('a','remove')">Eject Drive A</button>
+          <button onclick="driveAct('b','remove')">Eject Drive B</button>
+          <button onclick="refreshDrives()">Refresh Drive Status</button>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="panel" id="inspector" style="display:none">
+        <h2 id="inspTitle">DISK IMAGE CONTENTS</h2>
+        <div class="row" style="margin-bottom:10px">
+          <span id="inspMeta" class="hint"></span>
+          <span style="flex:1"></span>
+          <select id="inspDrive"><option value="a">drive A</option><option value="b">drive B</option></select>
+          <select id="inspMode" onchange="mountModeChanged(this)" class="tip" data-tip="Read-only protects the original; read/write commits changes; unlinked discards temporary writes when removed.">
+            <option value="unlinked">Unlinked — temporary writes</option>
+            <option value="readonly">Read-only (RO)</option>
+            <option value="readwrite">Read/write (RW)</option>
+          </select>
+          <button id="inspMountBtn" class="mount-mode-action" data-mount-base="Mount Image" onclick="inspMountWhole()">Mount Image · UNLINKED</button>
+        </div>
+        <table>
+          <thead><tr><th>File</th><th>Type</th><th>Blk</th><th>Load</th><th style="width:265px"></th></tr></thead>
+          <tbody id="inspFiles"></tbody>
+        </table>
+        <div class="hint" style="margin-top:10px">
+          <b>Run Instantly</b> DMA-loads just that PRG — instant, no drive involved. Multi-load
+          software needs its disk: use <b>Mount &amp; Load</b>, which mounts the image, resets,
+          and types LOAD"name",8,1 + RUN for you.
+        </div>
+      </div>
+      <div class="panel" id="inspEmpty">
+        <h2>DISK IMAGE CONTENTS</h2>
+        <div class="hint">Open a .d64 / .d71 / .d81 from Ultimate storage or a local file to
+        list its contents and run an individual PRG.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ SETTINGS ============ -->
+<section id="tab-settings">
+  <div class="panel">
+    <h2>DESKTOP APP</h2>
+    <div class="row" style="align-items:flex-end">
+      <label class="hint tip" data-tip="Controls what start.bat opens on this PC. Edge app mode uses a dedicated u64deck window and profile without changing your default browser.">Open on startup
+        <select id="localBrowserStartup" onchange="localSettingsSave()">
+          <option value="edge_app">Microsoft Edge app window (recommended)</option>
+          <option value="system">System default browser</option>
+          <option value="none">Do not open automatically</option>
+        </select>
+      </label>
+      <span id="localBrowserStatus" class="hint">loading local launcher settings…</span>
+    </div>
+    <div class="hint" style="margin-top:7px">This affects only the browser opened by <code>start.bat</code>. You can still open u64deck manually in Firefox, Chrome, a phone or another device.</div>
+  </div>
+  <div class="panel">
+    <div class="row">
+      <button class="primary" onclick="saveDirty()" id="btnApply" disabled>Apply Changes</button>
+      <button onclick="cfgAction('save_to_flash')">Save to Flash</button>
+      <button onclick="cfgAction('load_from_flash')">Load from Flash</button>
+      <button class="danger" onclick="if(confirm('Reset ALL settings to factory defaults?'))cfgAction('reset_to_default')">Factory Defaults</button>
+      <span class="hint">Changes apply to the running config; “Save to flash” makes them stick.</span>
+    </div>
+  </div>
+  <div class="setgrid">
+    <div class="catlist" id="catlist"></div>
+    <div class="setitems panel" id="setitems"><span class="hint">Pick a category.</span></div>
+  </div>
+  <div class="panel">
+    <h2>SEARCH INDEX &amp; CACHE</h2>
+    <div id="cacheStats" class="hint">…</div>
+    <div class="row" style="margin-top:6px">
+      <button class="mini" onclick="cacheStatsLoad()">↻ refresh</button>
+      <button class="mini" onclick="cacheParseErrorsToggle()" title="show disk images whose internal directories could not be parsed">Image Parse Details</button>
+      <button class="mini" onclick="cacheClearImages()" title="forget disk-image directories — the next search re-reads them">Clear Image Cache</button>
+      <button class="mini danger tip" data-tip="Removes only u64deck's SQLite catalogue. It never deletes files from the Ultimate." onclick="cacheClearIndex()">Clear Storage Index</button>
+      <button class="mini primary tip" data-tip="Download a sanitised ZIP containing version, connectivity, stream and index information for troubleshooting." onclick="downloadDiagnostics()">Export Diagnostics</button>
+    </div>
+    <div id="parseErrorPanel" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)">
+      <div id="parseErrorList" class="hint">loading…</div>
+    </div>
+    <div style="border-top:1px solid var(--line);margin-top:12px;padding-top:10px">
+      <h2 style="margin-bottom:6px">BUILD INDEX FROM LOCAL USB</h2>
+      <div class="row" style="flex-wrap:wrap;gap:6px">
+        <select id="localVolume" style="min-width:230px" onchange="localVolumePicked()">
+          <option value="">detecting local drives…</option>
+        </select>
+        <input id="localIndexSource" style="flex:1;min-width:220px" placeholder="local drive or folder, e.g. E:\">
+        <input id="localIndexRoot" style="width:130px" value="/USB0" title="Ultimate path represented by this local drive">
+        <button class="mini" onclick="localVolumesLoad()">↻ drives</button>
+        <button class="mini primary" id="localIdxBtn" onclick="localIndexToggle()">Build Index From Local USB</button>
+        <button class="mini" id="localIdxPauseBtn" onclick="idxPauseToggle()" style="display:none">⏸ Pause</button>
+      </div>
+      <div class="hint" style="margin-top:6px">
+        Remove the USB stick from the Ultimate, connect it to this PC, then map its local path to the same Ultimate storage path.
+        The scan is read-only: no files are copied, renamed or changed.
+      </div>
+      <div id="localIdxStatus" class="hint" style="display:none;margin-top:6px"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ ASSEMBLY64 ============ -->
+<section id="tab-asm64">
+  <div class="panel asm-search-panel">
+    <div class="asm-section-heading">
+      <div>
+        <h2>SEARCH ASSEMBLY64</h2>
+        <div class="hint">Find public releases, inspect their files and deploy supported content directly to the Ultimate.</div>
+      </div>
+      <span class="badge">PUBLIC DATABASE</span>
+    </div>
+    <div id="asmForm" class="asm-search-form">
+      <span class="hint">Loading search fields…</span>
+    </div>
+  </div>
+
+  <div class="asm-workspace">
+    <div class="panel asm-workspace-panel" id="asmout">
+      <div class="asm-pane-heading">
+        <div>
+          <h2 id="asmResTitle">SEARCH RESULTS</h2>
+          <div id="asmResMeta" class="hint">Enter one or more search terms above.</div>
+        </div>
+      </div>
+      <div id="asmtable" class="asm-scroll asm-empty-state">
+        <div class="asm-empty-icon">A64</div>
+        <strong>Search the Assembly64 catalogue</strong>
+        <span>Results will appear here. Select a release to see its downloadable files.</span>
+      </div>
+    </div>
+
+    <div class="panel asm-workspace-panel" id="asmfiles">
+      <div class="asm-pane-heading">
+        <div>
+          <h2 id="asmFilesTitle">RELEASE FILES</h2>
+          <div id="asmFilesMeta" class="hint">No release selected.</div>
+        </div>
+      </div>
+      <div id="asmfilelist" class="asm-scroll asm-empty-state">
+        <div class="asm-empty-icon">▤</div>
+        <strong>Select a release</strong>
+        <span>Files and available run, mount or inspect actions will appear here.</span>
+      </div>
+    </div>
+  </div>
+
+  <details class="asm-dev-details"><summary class="hint">Developer Details</summary>
+    <pre class="raw" id="asmraw"></pre></details>
+</section>
+
+<!-- ============ SID JUKEBOX ============ -->
+<section id="tab-sid">
+  <div class="panel sid-jukebox-controls">
+    <h2>SID JUKEBOX</h2>
+    <div class="row" style="flex-wrap:wrap;gap:6px">
+      <input id="jkPath" style="flex:1;min-width:220px" placeholder="Ultimate folder e.g. /Usb0/HVSC/MUSICIANS/H/Hubbard_Rob"
+        onkeydown="if(event.key==='Enter')jkBrowse($('#jkPath').value)">
+      <button onclick="jkBrowse($('#jkPath').value)">📂 Browse</button>
+      <button class="primary" onclick="jukeFolder($('#jkPath').value)">♫ Play Folder</button>
+      <button onclick="jkRandom()" title="pick a random indexed SID below the current path, start it immediately, then load its folder">🎲 Random Dive</button>
+      <input id="jkSearch" style="width:170px" placeholder="🔎 search all of HVSC…"
+        onkeydown="if(event.key==='Enter')jkSearchGo()">
+      <select id="jkChip" title="filter indexed SID metadata by declared chip model" onchange="jkSearchFilterChanged()">
+        <option value="all">Chip: All</option>
+        <option value="6581">Chip: 6581</option>
+        <option value="8580">Chip: 8580</option>
+        <option value="either">Chip: Either</option>
+        <option value="mixed">Chip: Mixed / Multi-SID</option>
+        <option value="unknown">Chip: Unknown</option>
+      </select>
+      <select id="jkFormat" title="filter by SID file format" onchange="jkSearchFilterChanged()">
+        <option value="all">Format: All</option>
+        <option value="PSID">Format: PSID</option>
+        <option value="RSID">Format: RSID</option>
+      </select>
+      <button class="mini" onclick="jkSearchGo()">Search</button>
+      <input type="file" id="jkLocal" accept=".sid" multiple style="min-width:180px">
+      <button onclick="jukeLocal()">Load Local SIDs</button>
+    </div>
+    <div id="jkSearchOut" style="display:none;margin-top:8px;padding:6px;border:1px solid var(--line);border-radius:4px">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <span id="jkSearchTitle" class="hint"></span>
+        <button class="mini" onclick="$('#jkSearchOut').style.display='none'">✕</button>
+      </div>
+      <div id="jkSearchList" style="max-height:min(65vh,900px);overflow:auto;margin-top:4px"></div>
+    </div>
+    <div id="jkBrowser" style="margin-top:8px">
+      <div class="row" style="align-items:center;gap:6px;flex-wrap:wrap">
+        <button class="mini" onclick="jkBrowseUp()">⬆ Up</button>
+        <button class="mini" onclick="jkHvsc(false)" title="jump to your HVSC collection (auto-detected on first use)">⌂ HVSC</button>
+        <button class="mini" onclick="jkHvsc(true)" title="re-detect the HVSC folder and reload Songlengths after moving or updating the collection">↻ Re-detect</button>
+        <button class="mini" onclick="jkUpdateCheck()" title="compare your collection's release against the latest on hvsc.c64.org">⭳ Updates?</button>
+        <button class="mini" id="jkSidIndexToggle" onclick="jkSidIndexTogglePanel()"
+          aria-controls="jkSidIndex" aria-expanded="false"
+          title="open SID metadata indexing controls and status">SID Index</button>
+        <span id="jkVer" class="hint"></span>
+        <span id="jkBPath" class="hint"></span>
+        <span id="jkBCount" class="hint"></span>
+        <button class="mini primary" id="jkBLoad" style="display:none"
+          onclick="jukeFolder(JKB.path)">♫ Play This Folder</button>
+      </div>
+      <div id="jkBDirs" style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px"></div>
+    </div>
+    <details id="jkSidIndex" style="margin-top:10px;border-top:1px solid var(--line);padding-top:8px">
+      <summary style="cursor:pointer;font-weight:700">SID INDEX &amp; METADATA</summary>
+      <div class="hint" style="margin:6px 0">
+        Parses only SID headers and stores title, author, chip, format and subtune metadata in SQLite.
+        The local option is much faster for a complete HVSC collection and is read-only.
+      </div>
+      <div class="row" style="flex-wrap:wrap;gap:6px;align-items:center">
+        <input id="jkSidRoot" style="min-width:190px" placeholder="Ultimate HVSC path, e.g. /USB0/HVSC">
+        <button class="mini primary" id="jkSidUltimateBtn" onclick="jkSidIndexUltimate()">Refresh From Ultimate</button>
+        <label class="hint"><input type="checkbox" id="jkSidForce"> rescan unchanged files</label>
+      </div>
+      <div class="row" style="flex-wrap:wrap;gap:6px;align-items:center;margin-top:6px">
+        <select id="jkSidVolume" style="min-width:220px" onchange="jkSidVolumePicked()">
+          <option value="">detecting local drives…</option>
+        </select>
+        <input id="jkSidSource" style="flex:1;min-width:220px" placeholder="local HVSC folder, e.g. E:\HVSC">
+        <button class="mini" onclick="jkSidVolumesLoad()">↻ drives</button>
+        <button class="mini primary" id="jkSidLocalBtn" onclick="jkSidIndexLocal()">Build From Local HVSC</button>
+        <button class="mini" id="jkSidPauseBtn" onclick="jkSidIndexPause()" style="display:none">⏸ Pause</button>
+      </div>
+      <div id="jkSidIndexStatus" class="hint" style="display:none;margin-top:6px"></div>
+    </details>
+    <div class="row" style="margin-top:10px;align-items:center;flex-wrap:wrap;gap:6px">
+      <button onclick="jk('prev')">⏮</button>
+      <button class="primary" onclick="jkPlayCurrent()">▶</button>
+      <button onclick="jk('stop')">⏹</button>
+      <button onclick="jk('next')">⏭</button>
+      <button id="jkNowStar" class="mini star" style="display:none" onclick="jkToggleNowFavourite()"
+        title="add or remove the currently playing SID from Favourites">☆</button>
+      <label class="hint"><input type="checkbox" id="jkShuffle" onchange="jkShuffleSet()"> Shuffle</label>
+      <button id="jkAudio" onclick="toggleAudio().then(()=>jkAudioSync())" title="stream the machine's audio to this browser">🔊 Listen here</button>
+      <span id="jkNow" class="hint"></span>
+      <span id="jkSong" style="display:none"></span>
+    </div>
+    <div class="hint" id="jkSlInfo" style="margin-top:4px"></div>
+  </div>
+  <div class="panel sid-queue-panel" id="jkListPanel" style="display:none">
+    <div class="sid-queue-heading">
+      <h2 id="jkListTitle">PLAY QUEUE</h2>
+      <span id="jkListContext" class="hint"></span>
+    </div>
+    <div class="row sid-queue-tools">
+      <input id="plName" style="width:160px" placeholder="play queue name…"
+        onkeydown="if(event.key==='Enter')plSave()">
+      <button class="mini" onclick="plSave()" title="save the current play queue (device tunes only)">💾 Save</button>
+      <select id="plSel" style="min-width:160px"><option value="">— saved play queues —</option></select>
+      <button class="mini primary" onclick="plLoad()" title="replace the current play queue with the saved one">▶ Load</button>
+      <button class="mini" onclick="plDelete()" title="delete the selected saved play queue">🗑</button>
+    </div>
+    <div id="jkList" class="sid-queue-list" role="table" aria-label="SID play queue"></div>
+  </div>
+</section>
+</main>
+
+<div id="globalTooltip" class="global-tooltip" role="tooltip" aria-hidden="true"></div>
+<div id="toasts"></div>
+<div id="helpOverlay" class="help-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
+  <div class="help-window">
+    <div class="row help-head">
+      <h2 id="helpTitle" style="margin:0">U64DECK HELP</h2>
+      <input id="helpSearch" style="flex:1" placeholder="Search help…" oninput="renderHelp()">
+      <span id="helpVersion" class="hint"></span>
+      <button onclick="closeHelp()">Close</button>
+    </div>
+    <div class="help-body"><nav id="helpNav" class="help-nav"></nav><div id="helpContent" class="help-content"></div></div>
+  </div>
+</div>
+
+<script src="/static/help_content.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,77 @@
+name: build-exe
+
+# Builds a standalone u64deck.exe on a Windows runner.
+# - Every push to main / manual run: exe available as a workflow artifact.
+# - Push a tag like v1.0: exe attached to a GitHub Release.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write   # needed to attach the exe to releases
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt pyinstaller
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Build
+        run: pyinstaller u64deck.spec
+
+      - name: Smoke test the exe
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist/u64deck.exe" -ArgumentList "--no-browser","--u64","203.0.113.9" -PassThru
+          $ready = $false
+          $deadline = (Get-Date).AddSeconds(30)
+          try {
+            do {
+              Start-Sleep -Milliseconds 500
+              $p.Refresh()
+              if ($p.HasExited) {
+                throw "u64deck.exe exited before the UI became ready (exit code $($p.ExitCode))"
+              }
+              try {
+                $r = Invoke-WebRequest -Uri "http://127.0.0.1:8064/" -UseBasicParsing -TimeoutSec 2
+                if ($r.StatusCode -eq 200) { $ready = $true }
+              } catch {
+                # Server may still be starting; retry until the deadline.
+              }
+            } while (-not $ready -and (Get-Date) -lt $deadline)
+
+            if (-not $ready) { throw "UI did not serve within 30 seconds" }
+            Write-Host "exe smoke test OK"
+          } finally {
+            $p.Refresh()
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: u64deck-windows
+          path: dist/u64deck.exe
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/u64deck.exe
+          fail_on_unmatched_files: true
