@@ -219,6 +219,23 @@ DIAG_EVENTS = deque(maxlen=200)
 MOUNT_STATE = {"a": {}, "b": {}}
 VALID_MOUNT_MODES = {"readonly", "readwrite", "unlinked"}
 
+# Firmware 3.15+ on Ultimate 64-class hardware exposes matrix-level input.
+# Older firmware returns 404; hardware without the CIA1 implementation returns
+# 501. Keep capability state per device so normal UI polling does not probe on
+# every request, while reconnect/device-switch paths can force a fresh check.
+MATRIX_KEYBOARD_INPUTS = {
+    *list("abcdefghijklmnopqrstuvwxyz"), *list("0123456789"),
+    "inst_del", "return", "cursor_left_right", "cursor_up_down",
+    "f1", "f3", "f5", "f7", "left_shift", "right_shift",
+    "plus", "minus", "period", "colon", "at", "comma", "pound",
+    "star", "semicolon", "clr_home", "equals", "arrow_up",
+    "arrow_left", "slash", "ctrl", "space", "commodore",
+    "run_stop", "restore",
+}
+MATRIX_TRANSITIONS = {"press", "release", "tap"}
+INPUT_CAPABILITIES: dict[str, dict] = {}
+INPUT_CAP_LOCK = threading.Lock()
+
 VALID_BROWSER_STARTUP = {"edge_app", "system", "none"}
 
 def _normalise_browser_startup(value: object) -> str:
@@ -371,6 +388,118 @@ def err(e: Exception, code: int = 502):
     raise HTTPException(status_code=code, detail=str(e))
 
 
+def _input_cache_key(client: UltimateREST | None = None) -> str:
+    client = client or rest
+    return str(getattr(client, "host", "") or CFG.get("u64_host", "")).strip()
+
+
+def _input_status(client: UltimateREST | None = None, force: bool = False) -> dict:
+    """Return cached/probed matrix-input capability for one Ultimate."""
+    client = client or rest
+    host = _input_cache_key(client)
+    if not client or not host:
+        return {"available": False, "mode": "buffer", "status": 0,
+                "label": "Legacy KERNAL buffer", "host": host,
+                "detail": "No device configured"}
+    with INPUT_CAP_LOCK:
+        cached = INPUT_CAPABILITIES.get(host)
+        if cached and not force:
+            return dict(cached)
+    try:
+        probe = client.probe_machine_input()
+        available = bool(probe.get("available"))
+        status = int(probe.get("status") or 0)
+        result = {
+            "available": available,
+            "mode": "matrix" if available else "buffer",
+            "status": status,
+            "label": "CIA1 keyboard matrix" if available else "Legacy KERNAL buffer",
+            "host": host,
+            "detail": str(probe.get("detail") or "")[:200],
+            "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+    except Exception as exc:
+        # A failed probe must never make the rest of u64deck unusable. Use the
+        # established buffer path for this session and retry on reconnect.
+        result = {"available": False, "mode": "buffer", "status": 0,
+                  "label": "Legacy KERNAL buffer", "host": host,
+                  "detail": str(exc)[:200],
+                  "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    with INPUT_CAP_LOCK:
+        INPUT_CAPABILITIES[host] = dict(result)
+    return result
+
+
+def _validate_matrix_events(events) -> list[dict]:
+    if not isinstance(events, list) or not events:
+        raise ValueError("events must be a non-empty list")
+    if len(events) > 64:
+        raise ValueError("machine input accepts at most 64 events per request")
+    clean = []
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            raise ValueError(f"events[{index}] must be an object")
+        kind = str(event.get("kind") or "")
+        if kind == "release_all":
+            clean.append({"kind": "release_all"})
+            continue
+        if kind != "keyboard":
+            raise ValueError(f"events[{index}].kind must be keyboard or release_all")
+        inputs = event.get("inputs")
+        transition = str(event.get("transition") or "")
+        if not isinstance(inputs, list) or not inputs or len(inputs) > 8:
+            raise ValueError(f"events[{index}].inputs must contain 1 to 8 keys")
+        normalised = []
+        for value in inputs:
+            key = str(value or "").strip().lower()
+            if key not in MATRIX_KEYBOARD_INPUTS:
+                raise ValueError(f"events[{index}] contains unknown keyboard input {key!r}")
+            if key not in normalised:
+                normalised.append(key)
+        if transition not in MATRIX_TRANSITIONS:
+            raise ValueError(f"events[{index}].transition must be press, release or tap")
+        clean.append({"kind": "keyboard", "inputs": normalised,
+                      "transition": transition})
+    return clean
+
+
+def _matrix_send(events, *, client: UltimateREST | None = None,
+                 force_probe: bool = False):
+    client = client or rest
+    status = _input_status(client, force=force_probe)
+    if not status.get("available"):
+        raise UltimateError("CIA1 matrix input is not available on this device")
+    clean = _validate_matrix_events(events)
+    try:
+        return client.machine_input(clean)
+    except Exception:
+        # Re-probe after the next successful reconnect rather than trusting a
+        # stale capability entry after a firmware/device restart.
+        with INPUT_CAP_LOCK:
+            INPUT_CAPABILITIES.pop(_input_cache_key(client), None)
+        raise
+
+
+def _matrix_release_all(*, client: UltimateREST | None = None,
+                        silent: bool = True, cached_only: bool = False) -> bool:
+    client = client or rest
+    try:
+        if cached_only:
+            with INPUT_CAP_LOCK:
+                status = dict(INPUT_CAPABILITIES.get(_input_cache_key(client)) or {})
+        else:
+            status = _input_status(client)
+        if not status.get("available"):
+            return False
+        _matrix_send([{"kind": "release_all"}], client=client)
+        return True
+    except Exception as exc:
+        if not silent:
+            raise
+        _warn_event("matrix-release-all", f"could not release matrix input: {exc}")
+        return False
+
+
 def cache_image(name: str, data: bytes) -> dict:
     img = DiskImage(data, name_hint=name)
     token = uuid.uuid4().hex[:12]
@@ -492,7 +621,11 @@ def api_connect(payload: dict = Body(...)):
         new_cmd.close()
         return {"connected": False, "host": host, "error": str(e)}
     old_rest, old_cmd = rest, cmd
+    # Release any held CIA1 keys on the old target before changing device.
+    if old_rest:
+        _matrix_release_all(client=old_rest, silent=True, cached_only=True)
     rest, cmd, devfs = new_rest, new_cmd, new_devfs
+    input_status = _input_status(new_rest, force=True)
     CFG["u64_host"] = host
     CFG["password"] = password
     save_config()
@@ -503,13 +636,15 @@ def api_connect(payload: dict = Body(...)):
             old_rest.close()
     except Exception:
         pass
-    return {"connected": True, "host": host, "info": device_info}
+    return {"connected": True, "host": host, "info": device_info,
+            "input": input_status}
 
 
 # --- basic / machine ----------------------------------------------------
 
 def _clean_shutdown():
     _juke_cancel_timer()
+    _matrix_release_all(silent=True, cached_only=True)
     global _INDEX_STORE, _INDEX_STORE_PATH, _INDEX_THREAD
     if INDEXJOB.get("running"):
         INDEXJOB["stop"] = True
@@ -647,6 +782,38 @@ def info():
         err(e)
 
 
+@app.get("/api/input/status")
+def input_status(refresh: bool = Query(False)):
+    if not CFG.get("u64_host"):
+        return _input_status()
+    return _input_status(force=bool(refresh))
+
+
+@app.post("/api/input/events")
+def input_events(payload: dict = Body(...)):
+    try:
+        clean = _validate_matrix_events(payload.get("events"))
+        state = _matrix_send(clean)
+        return {"errors": [], "mode": "matrix", "sent": len(clean),
+                "state": state}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except (UltimateError, httpx.HTTPError) as exc:
+        err(exc)
+
+
+@app.post("/api/input/release_all")
+def input_release_all():
+    status = _input_status()
+    if not status.get("available"):
+        return {"errors": [], "released": False, "mode": "buffer"}
+    try:
+        _matrix_send([{"kind": "release_all"}])
+        return {"errors": [], "released": True, "mode": "matrix"}
+    except (UltimateError, httpx.HTTPError) as exc:
+        err(exc)
+
+
 @app.put("/api/machine/{action}")
 def machine(action: str):
     allowed = {"reset", "reboot", "pause", "resume", "poweroff", "menu_button"}
@@ -656,6 +823,8 @@ def machine(action: str):
         # Keep the reset/reboot and optional post-boot key as one interactive
         # operation so indexing cannot resume during the cartridge-menu wait.
         with DEVICE_OP.operation("interactive", f"machine {action}"):
+            if action in {"reset", "reboot"}:
+                _matrix_release_all(silent=True)
             result = rest.put(f"/v1/machine:{action}")
             pressed = None
             if action == "reset":
@@ -785,6 +954,7 @@ async def mount_upload(drive: str = Form("a"), mode: str = Form("readwrite"),
     drive, mode = _drive_key(drive), _mount_mode(mode)
     name, data = await _read_upload(file, MAX_MOUNT_UPLOAD)
     try:
+        _matrix_release_all(silent=True)
         out = await run_in_threadpool(rest.mount_attachment, drive, name, data,
                                       mode=mode)
         _remember_mount(drive, mode, name=name)
@@ -798,6 +968,7 @@ def mount_device(drive: str = "a", mode: str = "readwrite", image: str = Query(.
     drive, mode = _drive_key(drive), _mount_mode(mode)
     _swap_build_from_device(image, drive, mode)
     try:
+        _matrix_release_all(silent=True)
         out = rest.mount_path(drive, image, mode=mode)
         _remember_mount(drive, mode, path=image, name=image.rsplit("/", 1)[-1])
         return _swap_response(out)
@@ -864,6 +1035,7 @@ def _copy_device_file(source: str, destination: str | None = None, tag: str = "c
     if destination == source:
         raise HTTPException(400, "destination must differ from source")
     with DEVICE_OP.operation("interactive", f"copying {source}"):
+        _matrix_release_all(silent=True)
         data = devfs.fetch(source, max_size=MAX_MOUNT_UPLOAD)
         devfs.upload(destination, data)
     parent = destination.rsplit("/", 1)[0] or "/"
@@ -889,6 +1061,7 @@ def mount_backup_then_rw(payload: dict = Body(...)):
     drive = _drive_key(payload.get("drive", "a"))
     try:
         backup = _copy_device_file(source, None, "backup")
+        _matrix_release_all(silent=True)
         out = rest.mount_path(drive, source, mode="readwrite")
         _remember_mount(drive, "readwrite", path=source, name=source.rsplit("/", 1)[-1])
         _swap_build_from_device(source, drive, "readwrite")
@@ -977,6 +1150,7 @@ def image_mount_load(token: str, index: int = Query(...), drive: str = Query("a"
         err(e, 404)
     try:
         with DEVICE_OP.operation("interactive", "mounting and loading disk file"):
+            _matrix_release_all(silent=True)
             if device_path:
                 rest.mount_path(drive, device_path, mode=mode)
             else:
@@ -998,6 +1172,13 @@ def image_mount_load(token: str, index: int = Query(...), drive: str = Query("a"
 
 _PREKEYS = {"F1": 133, "F2": 137, "F3": 134, "F4": 138, "F5": 135,
             "F6": 139, "F7": 136, "F8": 140, "RETURN": 13, "SPACE": 32}
+_PREKEY_MATRIX = {
+    "F1": ["f1"], "F2": ["left_shift", "f1"],
+    "F3": ["f3"], "F4": ["left_shift", "f3"],
+    "F5": ["f5"], "F6": ["left_shift", "f5"],
+    "F7": ["f7"], "F8": ["left_shift", "f7"],
+    "RETURN": ["return"], "SPACE": ["space"],
+}
 
 
 def _configured_boot_prekey() -> str:
@@ -1014,15 +1195,24 @@ def _send_boot_prekey(delay: float = 1.0, retry_window: float = 0.0) -> str | No
     prekey = _configured_boot_prekey()
     if not prekey:
         return None
+    prefer_matrix = _input_status().get("available", False)
     time.sleep(max(0.0, delay))
     deadline = time.monotonic() + max(0.0, retry_window)
+    attempts = 0
     while True:
         try:
-            cmd.type_petscii(bytes([_PREKEYS[prekey]]))
+            if prefer_matrix:
+                _matrix_send([{"kind": "keyboard",
+                               "inputs": _PREKEY_MATRIX[prekey],
+                               "transition": "tap"}],
+                             force_probe=attempts > 0)
+            else:
+                cmd.type_petscii(bytes([_PREKEYS[prekey]]))
             return prekey
-        except UltimateError:
+        except (UltimateError, httpx.HTTPError):
             if time.monotonic() >= deadline:
                 raise
+            attempts += 1
             time.sleep(0.4)
 
 
@@ -1052,6 +1242,7 @@ def _mount_and_boot(drive: str, mode: str, *, device_path: str = None,
     """Mount an image and autostart it: reset, LOAD"*",{bus},1 + RUN."""
     drive, mode = _drive_key(drive), _mount_mode(mode)
     with DEVICE_OP.operation("interactive", "mounting and booting disk"):
+        _matrix_release_all(silent=True)
         if device_path:
             rest.mount_path(drive, device_path, mode=mode)
         else:
@@ -1166,6 +1357,58 @@ def _runner_for(name: str) -> str:
     return "run_prg"
 
 
+def _bcd_byte(value: int) -> int:
+    """Encode a non-negative decimal value from 0 to 99 as packed BCD."""
+    value = max(0, min(99, int(value)))
+    return ((value // 10) << 4) | (value % 10)
+
+
+def _sid_ssl_payload(data: bytes) -> bytes | None:
+    """Build the Ultimate player's compact per-SID ``.ssl`` length array.
+
+    The firmware reads at most 512 bytes and expects two packed-BCD bytes per
+    subtune: minutes followed by seconds. Missing subtunes are represented by
+    zeroes, which makes the player retain its normal default for those entries.
+    """
+    meta = _parse_sid(data)
+    if not meta:
+        return None
+    times = SONGLENGTHS.get(str(meta.get("md5") or "").lower())
+    if not times:
+        return None
+
+    songs = min(256, max(1, int(meta.get("songs") or 1)))
+    payload = bytearray()
+    for index in range(songs):
+        if index >= len(times):
+            payload.extend((0, 0))
+            continue
+        try:
+            total = max(0, int(float(times[index]) + 0.5))
+        except (TypeError, ValueError, OverflowError):
+            payload.extend((0, 0))
+            continue
+        minutes, seconds = divmod(total, 60)
+        if minutes > 99:
+            minutes, seconds = 99, 59
+        payload.extend((_bcd_byte(minutes), _bcd_byte(seconds)))
+    return bytes(payload) if any(payload) else None
+
+
+def _post_sid_upload(filename: str, data: bytes, songnr: int | None = None):
+    """Upload a SID with its compact per-file song-length array when known."""
+    params = {"songnr": int(songnr)} if songnr else {}
+    ssl_payload = _sid_ssl_payload(data)
+    ssl_name = Path(filename).with_suffix(".ssl").name
+    return rest.post_sid(
+        filename,
+        data,
+        songlengths=ssl_payload,
+        songlengths_filename=ssl_name,
+        **params,
+    )
+
+
 @app.put("/api/run/device")
 def run_device(path: str = Query(...)):
     try:
@@ -1195,6 +1438,9 @@ async def run_upload(file: UploadFile = File(...)):
         if runner == "run_crt":
             return await run_in_threadpool(
                 rest.post_file, f"/v1/runners:{runner}", name, data)
+        if runner == "sidplay":
+            return await run_in_threadpool(
+                _run_cart_safe, lambda: _post_sid_upload(name, data))
         return await run_in_threadpool(
             _run_cart_safe,
             lambda: rest.post_file(f"/v1/runners:{runner}", name, data))
@@ -1232,6 +1478,8 @@ STREAM_LAST = {}    # per-stream record of the last start/stop attempt
 
 
 def _stream_ctl(name: str, on: bool):
+    if not on:
+        _matrix_release_all(silent=True)
     stream_id = {"video": 0, "audio": 1}[name]
     port = CFG["video_port"] if name == "video" else CFG["audio_port"]
     recv = video if name == "video" else audio
@@ -1363,6 +1611,7 @@ async def ws_video(ws: WebSocket, buffer: int = 1):
         pass                                   # client gone or server stopping
     finally:
         video.unsubscribe(on_frame)
+        _matrix_release_all(silent=True)
 
 
 @app.websocket("/ws/audio")
@@ -1392,6 +1641,7 @@ async def ws_audio(ws: WebSocket):
         pass                                   # client gone or server stopping
     finally:
         audio.unsubscribe(on_chunk)
+        _matrix_release_all(silent=True)
 
 
 # --- Assembly64 ----------------------------------------------------------
@@ -1533,6 +1783,7 @@ def _asm_deploy_bytes(filename: str, action: str, data: bytes):
         return cache_image(filename, data)
     if action in ("mount_a", "mount_b"):
         drive, mode = action[-1], _mount_mode(None)
+        _matrix_release_all(silent=True)
         out = rest.mount_attachment(drive, filename, data, mode=mode)
         _remember_mount(drive, mode, name=filename)
         return out
@@ -1542,6 +1793,7 @@ def _asm_deploy_bytes(filename: str, action: str, data: bytes):
         return _mount_and_boot("a", _mount_mode(None), name=filename, data=data)
     if low.endswith((".d64", ".d71", ".d81", ".g64")):
         mode = _mount_mode(None)
+        _matrix_release_all(silent=True)
         out = rest.mount_attachment("a", filename, data, mode=mode)
         _remember_mount("a", mode, name=filename)
         rest.put("/v1/machine:reset")
@@ -1549,8 +1801,7 @@ def _asm_deploy_bytes(filename: str, action: str, data: bytes):
     if low.endswith(".crt"):
         return rest.post_file("/v1/runners:run_crt", filename, data)
     if low.endswith(".sid"):
-        return _run_cart_safe(
-            lambda: rest.post_file("/v1/runners:sidplay", filename, data))
+        return _run_cart_safe(lambda: _post_sid_upload(filename, data))
     if low.endswith(".mod"):
         return _run_cart_safe(
             lambda: rest.post_file("/v1/runners:modplay", filename, data))
@@ -2942,6 +3193,7 @@ def _swap_go(index: int):
     index = index % len(SWAP["items"])
     it = SWAP["items"][index]
     try:
+        _matrix_release_all(silent=True)
         if it["kind"] == "device":
             rest.mount_path(SWAP["drive"], it["path"], mode=SWAP["mode"])
         else:
@@ -3059,30 +3311,39 @@ def load_songlengths():
 
     songlengths_path may be a LOCAL file, or a DEVICE path (e.g.
     /Usb0/HVSC/DOCUMENTS/Songlengths.md5) fetched over FTP and cached
-    locally, so a device-resident HVSC needs no PC-side copy."""
+    locally, so a device-resident HVSC needs no PC-side copy. The parsed
+    lengths are also used to generate a compact per-SID ``.ssl`` attachment
+    for the Ultimate's native player.
+    """
     SONGLENGTHS.clear()
+    HVSC_INDEX.clear()
     path = CFG.get("songlengths_path") or ""
     if not path:
         return 0
     p = Path(path)
-    text = None
+    raw = None
     if p.is_file():
-        text = p.read_text(errors="replace")
+        try:
+            raw = p.read_bytes()
+        except OSError:
+            raw = None
     else:
         cache = ROOT / ".songlengths.cache"
         try:
-            data = devfs.fetch(path)
-            text = data.decode(errors="replace")
+            raw = devfs.fetch(path)
             try:
-                cache.write_text(text)
+                cache.write_bytes(raw)
             except OSError:
                 pass
         except Exception:
             if cache.is_file():
-                text = cache.read_text(errors="replace")
-    if text is None:
+                try:
+                    raw = cache.read_bytes()
+                except OSError:
+                    raw = None
+    if raw is None:
         return 0
-    HVSC_INDEX.clear()
+    text = bytes(raw).decode(errors="replace")
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -3238,9 +3499,9 @@ def _juke_play(index: int, song: int = 0):
     it = _juke_materialise(JUKE["items"][index])
     song = song or it["meta"].get("start_song", 1)
     try:
-        _run_cart_safe(lambda: rest.post_file("/v1/runners:sidplay",
-                                              it["label"], it["data"],
-                                              songnr=song))
+        _run_cart_safe(lambda: _post_sid_upload(
+            it["label"], it["data"], songnr=song
+        ))
     except (UltimateError, httpx.HTTPError) as e:
         err(e)
     JUKE.update({"index": index, "song": song, "playing": True})
@@ -4291,6 +4552,7 @@ def juke_stop():
     _juke_cancel_timer()
     JUKE["playing"] = False
     try:
+        _matrix_release_all(silent=True)
         rest.put("/v1/machine:reset")
     except Exception:
         pass
@@ -4365,6 +4627,7 @@ def library_run(name: str = Query(...), drive: str = Query("a")):
         if low.endswith((".d64", ".d71", ".d81", ".g64", ".dnp")):
             drive, mode = _drive_key(drive), _mount_mode(None)
             with DEVICE_OP.operation("interactive", "launching library disk"):
+                _matrix_release_all(silent=True)
                 out = rest.mount_attachment(drive, p.name, data, mode=mode)
                 _remember_mount(drive, mode, name=p.name)
                 rest.put("/v1/machine:reset")
@@ -4375,6 +4638,8 @@ def library_run(name: str = Query(...), drive: str = Query("a")):
         runner = _runner_for(p.name)
         if runner == "run_crt":
             return rest.post_file(f"/v1/runners:{runner}", p.name, data)
+        if runner == "sidplay":
+            return _run_cart_safe(lambda: _post_sid_upload(p.name, data))
         return _run_cart_safe(
             lambda: rest.post_file(f"/v1/runners:{runner}", p.name, data))
     except ValueError as e:
@@ -4442,6 +4707,7 @@ def diagnostics_export(payload: dict = Body(default={})):
                     "executable": Path(sys.executable).name},
         "browser": {str(k): str(v)[:1000] for k, v in list(browser.items())[:30]},
         "device": device,
+        "input": _input_status(),
         "stream": stream_stats(),
         "index": fs_index_status(),
         "sid_index": juke_index_status(),

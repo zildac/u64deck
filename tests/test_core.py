@@ -98,6 +98,208 @@ def test_legacy_cache_import_tolerates_duplicate_paths(tmp_path: Path):
     finally:
         store.close()
 
+def test_sid_upload_uses_duplicate_file_parts_in_required_order():
+    captured = {}
+
+    class FakeClient:
+        def post(self, path, params=None, files=None):
+            captured.update({"path": path, "params": params, "files": files})
+            request = httpx.Request("POST", "http://u64" + path)
+            return httpx.Response(200, json={"errors": []}, request=request)
+
+    rest = ultimate.UltimateREST.__new__(ultimate.UltimateREST)
+    rest.coordinator = None
+    rest.client = FakeClient()
+    result = rest.post_sid(
+        "Tune.sid", b"SID", songlengths=b"\x01\x23", songlengths_filename="Tune.ssl", songnr=3
+    )
+
+    assert result == {"errors": []}
+    assert captured["path"] == "/v1/runners:sidplay"
+    assert captured["params"] == {"songnr": 3}
+    assert captured["files"] == [
+        ("file", ("Tune.sid", b"SID", "application/octet-stream")),
+        ("file", ("Tune.ssl", b"\x01\x23", "application/octet-stream")),
+    ]
+
+
+def test_sid_upload_omits_optional_songlength_part_when_unavailable():
+    captured = {}
+
+    class FakeClient:
+        def post(self, path, params=None, files=None):
+            captured["files"] = files
+            request = httpx.Request("POST", "http://u64" + path)
+            return httpx.Response(200, json={"errors": []}, request=request)
+
+    rest = ultimate.UltimateREST.__new__(ultimate.UltimateREST)
+    rest.coordinator = None
+    rest.client = FakeClient()
+    rest.post_sid("Tune.sid", b"SID")
+    assert captured["files"] == [
+        ("file", ("Tune.sid", b"SID", "application/octet-stream")),
+    ]
+
+
+def test_songlength_loader_parses_lengths_and_path_index(tmp_path: Path):
+    raw = (
+        b"; /MUSICIANS/T/Test/Tune.sid\r\n"
+        b"0123456789abcdef0123456789abcdef=0:10 1:02.5\r\n"
+    )
+    path = tmp_path / "Songlengths.md5"
+    path.write_bytes(raw)
+    previous_path = server.CFG.get("songlengths_path", "")
+    previous_lengths = dict(server.SONGLENGTHS)
+    previous_index = list(server.HVSC_INDEX)
+    try:
+        server.CFG["songlengths_path"] = str(path)
+        assert server.load_songlengths() == 1
+        assert server.SONGLENGTHS["0123456789abcdef0123456789abcdef"] == [10.0, 62.5]
+        assert server.HVSC_INDEX == [
+            ("/musicians/t/test/tune.sid", "/MUSICIANS/T/Test/Tune.sid")
+        ]
+    finally:
+        server.CFG["songlengths_path"] = previous_path
+        server.SONGLENGTHS.clear()
+        server.SONGLENGTHS.update(previous_lengths)
+        server.HVSC_INDEX[:] = previous_index
+
+
+def _minimal_sid(*, songs=1):
+    data = bytearray(0x7C)
+    data[:4] = b"PSID"
+    data[4:6] = (2).to_bytes(2, "big")
+    data[0x0E:0x10] = int(songs).to_bytes(2, "big")
+    data[0x10:0x12] = (1).to_bytes(2, "big")
+    return bytes(data)
+
+
+def test_sid_ssl_payload_is_compact_bcd_per_subtune():
+    sid = _minimal_sid(songs=4)
+    digest = server.hashlib.md5(sid).hexdigest()
+    previous = dict(server.SONGLENGTHS)
+    try:
+        server.SONGLENGTHS.clear()
+        server.SONGLENGTHS[digest] = [12, 62.5, 5999, 6001]
+        assert server._sid_ssl_payload(sid) == bytes([
+            0x00, 0x12,  # 0:12
+            0x01, 0x03,  # 1:03 (fractional seconds round half-up)
+            0x99, 0x59,  # 99:59
+            0x99, 0x59,  # clamped to the firmware's BCD range
+        ])
+    finally:
+        server.SONGLENGTHS.clear()
+        server.SONGLENGTHS.update(previous)
+
+
+def test_sid_ssl_payload_uses_zeroes_for_missing_subtunes_and_caps_at_512_bytes():
+    sid = _minimal_sid(songs=300)
+    digest = server.hashlib.md5(sid).hexdigest()
+    previous = dict(server.SONGLENGTHS)
+    try:
+        server.SONGLENGTHS.clear()
+        server.SONGLENGTHS[digest] = [65]
+        payload = server._sid_ssl_payload(sid)
+        assert payload is not None
+        assert len(payload) == 512
+        assert payload[:4] == bytes([0x01, 0x05, 0x00, 0x00])
+        assert payload[4:] == bytes(508)
+    finally:
+        server.SONGLENGTHS.clear()
+        server.SONGLENGTHS.update(previous)
+
+
+def test_sid_ssl_payload_falls_back_when_sid_or_length_match_is_unavailable():
+    previous = dict(server.SONGLENGTHS)
+    try:
+        server.SONGLENGTHS.clear()
+        assert server._sid_ssl_payload(b"not a sid") is None
+        assert server._sid_ssl_payload(_minimal_sid()) is None
+    finally:
+        server.SONGLENGTHS.clear()
+        server.SONGLENGTHS.update(previous)
+
+
+def test_sid_upload_rejects_songlength_payloads_above_firmware_limit():
+    rest = ultimate.UltimateREST.__new__(ultimate.UltimateREST)
+    rest.coordinator = None
+    rest.client = object()
+    with pytest.raises(ValueError, match="exceeds 512 bytes"):
+        rest.post_sid("Tune.sid", b"SID", songlengths=bytes(513))
+
+
+def test_local_sid_upload_uses_enhanced_sidplay_path(monkeypatch):
+    calls = []
+    monkeypatch.setattr(server, "_post_sid_upload",
+                        lambda name, data, songnr=None: calls.append((name, data, songnr)) or {"ok": True})
+    monkeypatch.setattr(server, "_run_cart_safe", lambda action: action())
+    upload = UploadFile(filename="Local.sid", file=io.BytesIO(b"SID"))
+    result = asyncio.run(server.run_upload(upload))
+    assert result == {"ok": True}
+    assert calls == [("Local.sid", b"SID", None)]
+
+
+def test_assembly64_sid_deploy_uses_enhanced_sidplay_path(monkeypatch):
+    calls = []
+    monkeypatch.setattr(server, "_post_sid_upload",
+                        lambda name, data, songnr=None: calls.append((name, data, songnr)) or {"ok": True})
+    monkeypatch.setattr(server, "_run_cart_safe", lambda action: action())
+    result = server._asm_deploy_bytes("Assembly.sid", "run", b"SID")
+    assert result == {"ok": True}
+    assert calls == [("Assembly.sid", b"SID", None)]
+
+
+def test_quick_launch_sid_uses_enhanced_sidplay_path(tmp_path: Path, monkeypatch):
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "Favourite.sid").write_bytes(b"SID")
+    calls = []
+    monkeypatch.setattr(server, "ROOT", tmp_path)
+    monkeypatch.setattr(server, "_post_sid_upload",
+                        lambda name, data, songnr=None: calls.append((name, data, songnr)) or {"ok": True})
+    monkeypatch.setattr(server, "_run_cart_safe", lambda action: action())
+    result = server.library_run("Favourite.sid")
+    assert result == {"ok": True}
+    assert calls == [("Favourite.sid", b"SID", None)]
+
+
+def test_sidplay_helper_forwards_compact_ssl_and_subtune_then_falls_back():
+    calls = []
+
+    class FakeRest:
+        def post_sid(self, name, data, **kwargs):
+            calls.append((name, data, kwargs))
+            return {"errors": []}
+
+    sid = _minimal_sid(songs=2)
+    digest = server.hashlib.md5(sid).hexdigest()
+    previous_rest = server.rest
+    previous_lengths = dict(server.SONGLENGTHS)
+    try:
+        server.rest = FakeRest()
+        server.SONGLENGTHS.clear()
+        server.SONGLENGTHS[digest] = [10, 75]
+        server._post_sid_upload("Tune.sid", sid, songnr=2)
+        server.SONGLENGTHS.clear()
+        server._post_sid_upload("Loose.sid", sid)
+    finally:
+        server.rest = previous_rest
+        server.SONGLENGTHS.clear()
+        server.SONGLENGTHS.update(previous_lengths)
+
+    assert calls == [
+        ("Tune.sid", sid, {
+            "songlengths": bytes([0x00, 0x10, 0x01, 0x15]),
+            "songlengths_filename": "Tune.ssl",
+            "songnr": 2,
+        }),
+        ("Loose.sid", sid, {
+            "songlengths": None,
+            "songlengths_filename": "Loose.ssl",
+        }),
+    ]
+
+
 def test_ftp_listing_falls_back_for_invalid_utf8_filename(monkeypatch):
     connections = []
     transfers = []
@@ -835,7 +1037,7 @@ def test_release_version_is_consistent_in_code_ui_and_changelog():
     changelog = (Path(server.ROOT) / "CHANGELOG.md").read_text(encoding="utf-8")
     assert 'id="ver"' in html
     assert '"/api/app_config"' in js
-    assert "## 1.8.0 — Public Beta 6" in changelog.split("## 1.8.0 — Public Beta 2", 1)[0]
+    assert "## 1.8.0 — Public Beta 9" in changelog.split("## 1.8.0 — Public Beta 2", 1)[0]
 
 
 def test_built_in_help_contains_no_release_specific_versions():
@@ -868,7 +1070,7 @@ def test_header_identity_and_device_details_share_an_aligned_status_block():
 
 
 
-def test_experimental_menu_remote_is_removed_and_c64_keyboard_remains():
+def test_experimental_telnet_remote_is_removed_and_matrix_keyboard_is_present():
     static = Path(server.ASSETS) / "static"
     html = (static / "index.html").read_text(encoding="utf-8")
     js = (static / "app.js").read_text(encoding="utf-8")
@@ -876,7 +1078,8 @@ def test_experimental_menu_remote_is_removed_and_c64_keyboard_remains():
     assert "/api/menu_remote" not in js
     assert "Ultimate Menu (experimental)" not in html + js
     assert '"/api/keys"' in js
-    assert "keys go to the C64" in js
+    assert '"/api/input/events"' in js
+    assert "CIA1 matrix input active" in js
     assert not hasattr(ultimate, "UltimateTelnet")
     assert not hasattr(ultimate, "VT100Screen")
 
@@ -895,7 +1098,7 @@ def test_frontend_is_split_without_a_build_tool():
 def test_release_metadata_is_centralised():
     import release
     assert server.VERSION == release.VERSION == "1.8.0"
-    assert release.RELEASE_LABEL == "Public Beta 6"
+    assert release.RELEASE_LABEL == "Public Beta 9"
     assert server.BUILD == release.build_id(server.ASSETS, Path(server.__file__).parent)
 
 
@@ -989,9 +1192,9 @@ def test_random_dive_starts_from_sqlite_without_ftp_folder_walk(monkeypatch):
             return bytes(sid)
 
     class FakeRest:
-        def post_file(self, path, name, data, **kwargs):
-            assert path == "/v1/runners:sidplay"
+        def post_sid(self, name, data, **kwargs):
             assert name == "test.sid"
+            assert kwargs["songnr"] == 1
             return {"ok": True}
 
     previous_fs, previous_rest = server.devfs, server.rest
@@ -1858,8 +2061,94 @@ def test_public_beta_help_and_now_playing_star_are_present():
     assert "jkToggleNowFavourite" in js
     assert ".u64deck-index.sqlite3" in help_js
     assert "star beside the playback controls" in help_js
-    assert "Public Beta 6" in readme
+    assert "Public Beta 9" in readme
     assert ".u64deck-index.sqlite3" in readme
+
+
+def test_machine_input_capability_probe_caches_supported_and_fallback_paths():
+    class FakeClient:
+        host = "192.0.2.64"
+        def __init__(self, status): self.status = status; self.probes = 0
+        def probe_machine_input(self):
+            self.probes += 1
+            return {"available": self.status == 200, "status": self.status,
+                    "state": {} if self.status == 200 else None, "detail": ""}
+    server.INPUT_CAPABILITIES.clear()
+    supported = FakeClient(200)
+    first = server._input_status(supported, force=True)
+    second = server._input_status(supported)
+    assert first["mode"] == "matrix" and first["available"] is True
+    assert second == first and supported.probes == 1
+    unsupported = FakeClient(501)
+    fallback = server._input_status(unsupported, force=True)
+    assert fallback["mode"] == "buffer" and fallback["status"] == 501
+
+
+def test_machine_input_event_validation_enforces_schema_and_limits():
+    valid = server._validate_matrix_events([
+        {"kind": "keyboard", "inputs": ["left_shift", "f1"], "transition": "tap"},
+        {"kind": "release_all"},
+    ])
+    assert valid == [
+        {"kind": "keyboard", "inputs": ["left_shift", "f1"], "transition": "tap"},
+        {"kind": "release_all"},
+    ]
+    with pytest.raises(ValueError, match="at most 64 events"):
+        server._validate_matrix_events([{"kind": "release_all"}] * 65)
+    with pytest.raises(ValueError, match="1 to 8 keys"):
+        server._validate_matrix_events([{"kind": "keyboard", "inputs": ["a"] * 9,
+                                         "transition": "press"}])
+    with pytest.raises(ValueError, match="unknown keyboard input"):
+        server._validate_matrix_events([{"kind": "keyboard", "inputs": ["escape"],
+                                         "transition": "tap"}])
+    with pytest.raises(ValueError, match="keyboard or release_all"):
+        server._validate_matrix_events([{"kind": "joystick", "port": 2,
+                                         "inputs": ["fire"], "transition": "tap"}])
+
+
+def test_matrix_send_and_release_all_use_firmware_event_payload():
+    class FakeClient:
+        host = "192.0.2.65"
+        def __init__(self): self.sent = []
+        def probe_machine_input(self):
+            return {"available": True, "status": 200, "state": {}, "detail": ""}
+        def machine_input(self, events):
+            self.sent.append(events); return {"keyboard": []}
+    fake = FakeClient(); server.INPUT_CAPABILITIES.clear()
+    result = server._matrix_send([
+        {"kind": "keyboard", "inputs": ["left_shift", "cursor_left_right"],
+         "transition": "press"}], client=fake, force_probe=True)
+    assert result == {"keyboard": []}
+    assert server._matrix_release_all(client=fake, silent=False) is True
+    assert fake.sent[-1] == [{"kind": "release_all"}]
+
+
+def test_boot_prekey_uses_matrix_f7_when_capable(monkeypatch):
+    previous = dict(server.CFG); sent = []
+    try:
+        server.CFG["boot_prekey"] = "F7"
+        monkeypatch.setattr(server, "_input_status", lambda *a, **k: {"available": True})
+        monkeypatch.setattr(server, "_matrix_send", lambda events, **kwargs: sent.append(events) or {})
+        monkeypatch.setattr(server.time, "sleep", lambda _delay: None)
+        assert server._send_boot_prekey(delay=0) == "F7"
+        assert sent == [[{"kind": "keyboard", "inputs": ["f7"], "transition": "tap"}]]
+    finally:
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_beta7_frontend_tracks_held_keys_chords_and_release_safety():
+    static = Path(server.ASSETS) / "static"
+    html = (static / "index.html").read_text(encoding="utf-8")
+    js = (static / "app.js").read_text(encoding="utf-8")
+    assert "const MATRIX_HELD=new Map()" in js
+    assert "if(ev.repeat||MATRIX_HELD.has(id))return" in js
+    assert 'transition:"press"' in js and 'transition:"release"' in js
+    assert '["left_shift","f1"]' in js
+    assert '["left_shift","cursor_left_right"]' in js
+    assert 'matrixReleaseAll("screen blur")' in js
+    assert 'matrixReleaseAll("tab switch")' in js
+    assert 'keepalive:true' in js
+    assert "SPACE</button>" in html and "RUN/STOP</button>" in html and "RESTORE</button>" in html
 
 
 def test_stable_index_migration_skips_legacy_orphan_image_entries(tmp_path: Path):

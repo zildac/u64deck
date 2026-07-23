@@ -116,9 +116,65 @@ class UltimateREST:
             except ValueError:
                 return {"raw": r.text}
 
+    def post_sid(self, filename: str, data: bytes, *, songlengths: bytes | None = None,
+                 songlengths_filename: str = "songlengths.ssl", **params):
+        """Upload a SID and, when available, its compact ``.ssl`` length array.
+
+        The Ultimate SID runner accepts the SID as the first multipart ``file``
+        attachment and an optional per-SID song-length file as the second part,
+        again using the ``file`` field name. Firmware reads at most 512 bytes
+        from that second file, so reject larger payloads before any request can
+        overload the device.
+        """
+        if songlengths and len(songlengths) > 512:
+            raise ValueError("SID song-length payload exceeds 512 bytes")
+        with self._operation("REST upload /v1/runners:sidplay"):
+            files = [
+                ("file", (filename, data, "application/octet-stream")),
+            ]
+            if songlengths:
+                files.append((
+                    "file",
+                    (songlengths_filename, songlengths, "application/octet-stream"),
+                ))
+            r = self._check(self.client.post(
+                "/v1/runners:sidplay", params=params or None, files=files
+            ))
+            try:
+                return r.json()
+            except ValueError:
+                return {"raw": r.text}
+
     # convenience wrappers ----------------------------------------------
     def info(self):
         return self.get_json("/v1/info")
+
+    def probe_machine_input(self):
+        """Probe the firmware's CIA1 keyboard/joystick input endpoint.
+
+        Ultimate 64 firmware returns a state snapshot with HTTP 200 when the
+        matrix-level API is available. Older firmware returns 404 and hardware
+        without the Ultimate 64 CIA implementation returns 501. Those two
+        responses are capabilities, not transport failures, so expose them to
+        the caller without raising UltimateError.
+        """
+        path = "/v1/machine:input"
+        with self._operation(f"REST GET {path}"):
+            r = self._safe_get(path)
+            if r.status_code in {404, 501}:
+                return {"available": False, "status": r.status_code,
+                        "state": None, "detail": r.text[:200]}
+            self._check(r)
+            try:
+                state = r.json()
+            except ValueError:
+                state = {"raw": r.text}
+            return {"available": True, "status": r.status_code,
+                    "state": state, "detail": ""}
+
+    def machine_input(self, events):
+        """Submit CIA1 keyboard/joystick state transitions."""
+        return self.post_json("/v1/machine:input", {"events": events})
 
     def run_prg(self, name: str, data: bytes):
         return self.post_file("/v1/runners:run_prg", name, data)

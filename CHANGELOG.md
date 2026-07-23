@@ -1,5 +1,65 @@
 # Changelog
 
+## 1.8.0 — Public Beta 9
+
+- Corrected uploaded SID duration metadata to use the firmware-native per-SID
+  `.ssl` format: two packed-BCD bytes per subtune (minutes and seconds), with a
+  maximum attachment size of 512 bytes.
+- Removed the Public Beta 8 behaviour that uploaded the complete multi-megabyte
+  `Songlengths.md5` database for every SID. This prevents SID-player lag and
+  avoids blocking unrelated REST requests such as mounted-drive status polling.
+- Added a hard 512-byte client guard and automatic single-file fallback when a
+  SID has no matching Songlengths entry, so playback never depends on duration
+  metadata.
+- Applied the corrected compact attachment consistently to SID Jukebox, local
+  uploads, Quick Launch and Assembly64 playback while preserving `songnr` and
+  the required duplicate multipart `file` field order.
+- Refreshed the GitHub Actions build workflow to the current supported major
+  versions of checkout, setup-python and upload-artifact before publication.
+- Updated Help, README, release metadata and regression coverage consistently
+  for Public Beta 9 / archive 69.
+
+## 1.8.0 — Public Beta 8
+
+- Added accurate duration metadata for uploaded SID playback. When HVSC
+  `Songlengths.md5` is available, u64deck now sends it as the optional second
+  multipart attachment accepted by `POST /v1/runners:sidplay`, allowing the
+  Ultimate's native SID-player screen to display the documented subtune length
+  instead of its generic five-minute estimate.
+- Added a dedicated SID upload client that preserves the required attachment
+  order and duplicate `file` field names: SID first, Songlengths second.
+- Applied the enhanced upload path consistently to SID Jukebox playback, local
+  uploads, Quick Launch library SIDs and Assembly64 SID deployment while
+  retaining the selected `songnr`. Device-resident `PUT` playback remains
+  unchanged.
+- Retained exact Songlengths bytes alongside the parsed auto-advance index and
+  preserved graceful single-file playback whenever Songlengths is unavailable.
+- Updated Help, README, release metadata and regression coverage consistently
+  for Public Beta 8 / archive 68.
+
+## 1.8.0 — Public Beta 7
+
+- Added capability-detected CIA1 keyboard-matrix input through the firmware's
+  `machine:input` REST endpoint. Supported Ultimate 64 devices now receive real
+  key press/release events, held keys and chords from the Screen tab, while
+  older firmware and unsupported hardware retain the KERNAL-buffer fallback.
+- Added browser-to-C64 matrix translation for letters, digits, punctuation,
+  cursor directions, function keys, Shift, CTRL, Commodore, RUN/STOP and
+  RESTORE. F2/F4/F6/F8 and left/up cursor movement use atomic Shift chords.
+- Added visible SPACE, RUN/STOP and RESTORE quick actions and surfaced the
+  detected input mode in the device header, Screen panel and diagnostics.
+- Added held-key tracking and browser auto-repeat suppression, plus ordered
+  matrix event batching within the firmware limits of 64 events per request and
+  eight keys per keyboard event.
+- Added `release_all` safety on focus loss, page/tab exit, stream and WebSocket
+  shutdown, device changes, reset/reboot and mount flows so a remote key cannot
+  remain stuck on the physical machine.
+- Retained the existing keyboard-buffer path for Send Text, LOAD/RUN automation
+  and non-capable devices. Retro Replay Auto-F7 now uses a matrix tap when the
+  endpoint is available and falls back to PETSCII otherwise.
+- Updated Help, README, release metadata and regression coverage consistently
+  for Public Beta 7 / archive 67.
+
 ## 1.8.0 — Public Beta 6
 
 - Added a genuine **Mount & Run** action for Assembly64 disk images. The image is

@@ -57,6 +57,7 @@ window.addEventListener("resize",tooltipHide);
 document.addEventListener("keydown",e=>{if(e.key==="Escape")tooltipHide()});
 function tab(name){
   tooltipHide();
+  if(name!=="screen"&&document.querySelector("#tab-screen.active"))matrixReleaseAll("tab switch");
   document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("active",b.dataset.tab===name));
   document.querySelectorAll("section").forEach(s=>s.classList.toggle("active",s.id==="tab-"+name));
   if(name==="home")itemsLoad();
@@ -249,7 +250,8 @@ async function connectTo(host){
     const r=await api("/api/connect",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({host})});
     if(r.connected){toast("Connected to "+host,"ok");
-      const ov=$("#discOverlay");if(ov)ov.remove();loadInfo();}
+      if(r.input){INPUT_STATUS=r.input;renderInputMode()}
+      matrixClearLocalState();const ov=$("#discOverlay");if(ov)ov.remove();loadInfo();}
     else toast("Could not connect to "+host+": "+r.error,"err");
   }catch(e){toast(e.message,"err")}
 }
@@ -320,19 +322,47 @@ async function ifaceChanged(){
 
 /* ---------- device info / machine ---------- */
 let VER_SHOWN=false,LAST_DEVICE_INFO=null,INFO_FAILURES=0,INFO_RETRY_TIMER=null;
+let INPUT_STATUS={available:false,mode:"buffer",label:"Legacy KERNAL buffer",status:0};
+function inputModeSuffix(){
+  const matrix=INPUT_STATUS.available;
+  return ` <span class="input-mode ${matrix?"matrix":"buffer"}" title="${esc(INPUT_STATUS.label||"")}">· input ${matrix?"CIA1":"buffer"}</span>`;
+}
+function renderInputMode(){
+  const badge=$("#inputModeBadge"),help=$("#kbhelp");if(!badge||!help)return;
+  if(INPUT_STATUS.available){
+    badge.textContent="CIA1 matrix";badge.className="badge matrix";
+    help.innerHTML="Esc = RUN/STOP · F1–F8 · cursor keys · Backspace = DEL · Home / Shift-Home = CLR. <b>CIA1 matrix input is active</b>: held keys, chords, cracktros, games and the Ultimate menu are supported.";
+  }else{
+    badge.textContent="Legacy buffer";badge.className="badge buffer";
+    help.innerHTML="Esc = RUN/STOP · F1–F8 · cursor keys · Backspace = DEL · Home / Shift-Home = CLR. This Ultimate is using the <b>legacy KERNAL keyboard buffer</b>; matrix-scanning software and the Ultimate menu may not see remote keys.";
+  }
+}
 function renderDeviceInfo(i,suffix=""){
   $("#devinfo").innerHTML=`<b>${esc(i.product||"?")}</b> fw ${esc(i.firmware_version||"?")}`+
-    (i.core_version?` · core ${esc(i.core_version)}`:"")+(i.hostname?` · ${esc(i.hostname)}`:"")+suffix;
+    (i.core_version?` · core ${esc(i.core_version)}`:"")+(i.hostname?` · ${esc(i.hostname)}`:"")+inputModeSuffix()+suffix;
+}
+async function loadInputStatus(refresh=false){
+  try{
+    const r=await api("/api/input/status"+(refresh?"?refresh=true":""));
+    const wasMatrix=!!INPUT_STATUS.available;INPUT_STATUS=r||INPUT_STATUS;
+    if(wasMatrix&&!INPUT_STATUS.available)matrixClearLocalState();
+    renderInputMode();if(LAST_DEVICE_INFO)renderDeviceInfo(LAST_DEVICE_INFO);
+    return INPUT_STATUS;
+  }catch(e){
+    INPUT_STATUS={available:false,mode:"buffer",label:"Legacy KERNAL buffer",status:0,detail:e.message};
+    matrixClearLocalState();renderInputMode();if(LAST_DEVICE_INFO)renderDeviceInfo(LAST_DEVICE_INFO);
+    return INPUT_STATUS;
+  }
 }
 async function loadInfo(){
   if(!VER_SHOWN){try{const c=await api("/api/app_config");
     if(c.version){$("#ver").textContent="v"+c.version+(c.release_label?" · "+c.release_label:"")+(c.build?" · "+c.build:"");
       $("#ver").title="version "+c.version+(c.release_label?" ("+c.release_label+")":"")+", build "+(c.build||"?")+" — quote this in bug reports";
       VER_SHOWN=true}}catch(e){}}
-  try{const i=await api("/api/info");
+  try{const previousFailures=INFO_FAILURES,i=await api("/api/info");
     LAST_DEVICE_INFO=i;INFO_FAILURES=0;
     if(INFO_RETRY_TIMER){clearTimeout(INFO_RETRY_TIMER);INFO_RETRY_TIMER=null}
-    renderDeviceInfo(i);
+    await loadInputStatus(previousFailures>0);renderDeviceInfo(i);
   }catch(e){
     const unconfig=/No device configured/.test(e.message);
     if(!unconfig&&LAST_DEVICE_INFO&&INFO_FAILURES===0){
@@ -375,7 +405,7 @@ async function machine(a){try{
   }catch(e){toast(e.message,"err")}}
 
 /* ---------- keyboard ---------- */
-const P={ // KeyboardEvent.key -> PETSCII
+const P={ // KeyboardEvent.key -> PETSCII for the legacy KERNAL buffer
   Enter:13,Backspace:20,Delete:20,Escape:3,
   ArrowDown:17,ArrowUp:145,ArrowRight:29,ArrowLeft:157,
   Home:19,Insert:148,F1:133,F2:137,F3:134,F4:138,F5:135,F6:139,F7:136,F8:140};
@@ -385,6 +415,12 @@ function chToPet(ch){const o=ch.charCodeAt(0);
   if(o>=0x20&&o<=0x5D)return o;
   if(ch==="£")return 0x5C;
   return null}
+function legacyCodeForEvent(ev){
+  if(ev.key==="Home"&&ev.shiftKey)return 147;               // CLR
+  if(P[ev.key]!==undefined)return P[ev.key];
+  if(ev.key.length===1&&!ev.ctrlKey&&!ev.metaKey)return chToPet(ev.key);
+  return null;
+}
 let keyq=[],keyTimer=null,keySending=false,sentKeys=0;
 function queueKeys(codes){
   keyq.push(...codes);
@@ -404,8 +440,7 @@ async function flushKeys(){
       const batch=keyq.splice(0,8);
       await api("/api/keys",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({petscii:batch})});
-      sentKeys+=batch.length;
-      $("#kbstat").innerHTML=`Keyboard captured — <b>${sentKeys}</b> keys sent. Esc = RUN/STOP.`;
+      sentKeys+=batch.length;updateKeyboardStatus();
     }
   }catch(e){toast("keys: "+e.message,"err")}
   finally{
@@ -413,6 +448,114 @@ async function flushKeys(){
     if(keyq.length&&!keyTimer)keyTimer=setTimeout(flushKeys,6);
   }
 }
+
+// CIA1 matrix input -----------------------------------------------------
+// Browser keys are translated to firmware input names. A held-set suppresses
+// browser key-repeat and preserves press/release ordering for games and menus.
+const MATRIX_HELD=new Map();
+let MATRIX_QUEUE=[],MATRIX_SENDING=false;
+const MATRIX_DIRECT_CODE={
+  ShiftLeft:["left_shift"],ShiftRight:["right_shift"],
+  ControlLeft:["ctrl"],ControlRight:["ctrl"],
+  AltLeft:["commodore"],AltRight:["commodore"],
+};
+const MATRIX_CHAR={
+  " ":["space"],"+":["plus"],"-":["minus"],".":["period"],
+  ":":["colon"],"@":["at"],",":["comma"],"£":["pound"],
+  "*":["star"],";":["semicolon"],"=":["equals"],"/":["slash"],
+  "↑":["arrow_up"],"←":["arrow_left"],
+  "!":["left_shift","1"],'"':["left_shift","2"],
+  "#":["left_shift","3"],"$":["left_shift","4"],
+  "%":["left_shift","5"],"&":["left_shift","6"],
+  "'":["left_shift","7"],"(":["left_shift","8"],
+  ")":["left_shift","9"],"<":["left_shift","comma"],
+  ">":["left_shift","period"],"?":["left_shift","slash"],
+};
+function physicalModifierRecord(name,activeOnly=false){
+  for(const record of MATRIX_HELD.values()){
+    if(record.directModifier===name&&(!activeOnly||record.active))return record;
+  }
+  return null;
+}
+function matrixChord(inputs){
+  let chord=[...new Set(inputs)];
+  // Browser F2/uppercase mappings use left_shift as the canonical synthetic
+  // shift. Honour a physically-held right Shift instead so the same event is
+  // still an atomic C64 chord without inventing a second held modifier.
+  if(chord.includes("left_shift")&&!physicalModifierRecord("left_shift",true)
+      &&physicalModifierRecord("right_shift",true)){
+    chord=chord.map(x=>x==="left_shift"?"right_shift":x);
+  }
+  return chord;
+}
+function matrixMapping(ev){
+  if(MATRIX_DIRECT_CODE[ev.code])return MATRIX_DIRECT_CODE[ev.code];
+  const key=ev.key;
+  const special={
+    Enter:["return"],Backspace:["inst_del"],Delete:["inst_del"],
+    Escape:["run_stop"],ArrowRight:["cursor_left_right"],
+    ArrowLeft:["left_shift","cursor_left_right"],
+    ArrowDown:["cursor_up_down"],ArrowUp:["left_shift","cursor_up_down"],
+    Home:ev.shiftKey?["left_shift","clr_home"]:["clr_home"],
+    Insert:["left_shift","inst_del"],
+    F1:["f1"],F2:["left_shift","f1"],F3:["f3"],F4:["left_shift","f3"],
+    F5:["f5"],F6:["left_shift","f5"],F7:["f7"],F8:["left_shift","f7"],
+    Pause:["restore"],
+  };
+  if(special[key])return special[key];
+  if(key.length===1){
+    if(key>="a"&&key<="z")return [key];
+    if(key>="A"&&key<="Z")return ["left_shift",key.toLowerCase()];
+    if(key>="0"&&key<="9")return [key];
+    if(MATRIX_CHAR[key])return MATRIX_CHAR[key];
+  }
+  return null;
+}
+function matrixClearLocalState(){MATRIX_HELD.clear();MATRIX_QUEUE=[]}
+function queueMatrixEvent(event){
+  MATRIX_QUEUE.push(event);
+  if(!MATRIX_SENDING)flushMatrixEvents();
+}
+async function flushMatrixEvents(){
+  if(MATRIX_SENDING||!MATRIX_QUEUE.length||!INPUT_STATUS.available)return;
+  MATRIX_SENDING=true;
+  try{
+    while(MATRIX_QUEUE.length&&INPUT_STATUS.available){
+      const batch=MATRIX_QUEUE.splice(0,64);
+      await api("/api/input/events",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({events:batch})});
+      sentKeys+=batch.filter(e=>e.kind==="keyboard"&&e.transition!=="release").length;
+      updateKeyboardStatus();
+    }
+  }catch(e){
+    matrixClearLocalState();toast("matrix input: "+e.message,"err");await loadInputStatus(true);
+  }finally{MATRIX_SENDING=false;if(MATRIX_QUEUE.length&&INPUT_STATUS.available)flushMatrixEvents()}
+}
+function matrixReleaseAll(reason="",keepalive=false){
+  MATRIX_HELD.clear();MATRIX_QUEUE=[];
+  if(!INPUT_STATUS.available)return;
+  if(keepalive){
+    fetch("/api/input/release_all",{method:"POST",keepalive:true}).catch(()=>{});return;
+  }
+  // If a press request is already in flight, queue release_all behind it so a
+  // late press cannot overtake cleanup and leave a real key stuck.
+  queueMatrixEvent({kind:"release_all"});
+}
+function updateKeyboardStatus(){
+  const stat=$("#kbstat");if(!stat)return;
+  const mode=INPUT_STATUS.available?"CIA1 matrix":"legacy buffer";
+  stat.innerHTML=`Keyboard captured — <b>${sentKeys}</b> key events sent via ${mode}. Esc = RUN/STOP.`;
+}
+async function quickC64Key(name){
+  if(INPUT_STATUS.available){
+    queueMatrixEvent({kind:"keyboard",inputs:[name],transition:"tap"});
+    screenEl.focus({preventScroll:true});return;
+  }
+  const legacy={space:32,run_stop:3}[name];
+  if(legacy!==undefined){queueKeys([legacy]);screenEl.focus({preventScroll:true});return}
+  toast("RESTORE requires CIA1 matrix input on supported Ultimate 64 firmware","err");
+}
+
 const screenEl=$("#screen");
 function screenshot(){
   const ts=new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
@@ -431,17 +574,68 @@ screenEl.addEventListener("dblclick",toggleFullscreen);
 // the C64 canvas rather than re-activating whichever UI button was used last.
 screenEl.addEventListener("pointerdown",()=>screenEl.focus({preventScroll:true}));
 screenEl.addEventListener("keydown",ev=>{
-  // In fullscreen the browser reserves Esc for exiting — don't also send RUN/STOP
+  // In fullscreen the browser reserves Esc for exiting — don't also send RUN/STOP.
   if(ev.key==="Escape"&&document.fullscreenElement)return;
-  let code=null;
-  if(ev.key==="Home"&&ev.shiftKey)code=147;               // CLR
-  else if(P[ev.key]!==undefined)code=P[ev.key];
-  else if(ev.key.length===1&&!ev.ctrlKey&&!ev.metaKey)code=chToPet(ev.key);
+  if(INPUT_STATUS.available){
+    const mapped=matrixMapping(ev);if(!mapped)return;
+    ev.preventDefault();
+    const id=ev.code||ev.key;
+    if(ev.repeat||MATRIX_HELD.has(id))return;
+    const pressInputs=matrixChord(mapped);if(!pressInputs.length)return;
+    const directModifier=(MATRIX_DIRECT_CODE[ev.code]||[])[0]||"";
+    const suspended=[];
+    // A PC layout may require Shift to type a C64 key that is unshifted on the
+    // C64 (for example @ on a UK keyboard). Temporarily release only that
+    // physical Shift, then restore it when this key is released.
+    for(const shift of ["left_shift","right_shift"]){
+      const rec=physicalModifierRecord(shift,true);
+      if(rec&&!pressInputs.includes(shift)){
+        queueMatrixEvent({kind:"keyboard",inputs:[shift],transition:"release"});
+        rec.active=false;suspended.push(shift);
+      }
+    }
+    const releaseInputs=pressInputs.filter(input=>{
+      if(input!=="left_shift"&&input!=="right_shift")return true;
+      return !physicalModifierRecord(input,true);
+    });
+    const record={pressInputs,releaseInputs,directModifier,
+      active:!!directModifier,suspended};
+    MATRIX_HELD.set(id,record);
+    queueMatrixEvent({kind:"keyboard",inputs:pressInputs,transition:"press"});
+    return;
+  }
+  const code=legacyCodeForEvent(ev);
   if(code!==null){ev.preventDefault();queueKeys([code])}
 });
-screenEl.addEventListener("focus",()=>$("#kbstat").innerHTML=
-  "Keyboard captured — keys go to the C64. Esc = RUN/STOP (exits fullscreen instead when fullscreen).");
-screenEl.addEventListener("blur",()=>$("#kbstat").textContent="Click the screen to capture the keyboard.");
+screenEl.addEventListener("keyup",ev=>{
+  if(!INPUT_STATUS.available)return;
+  const id=ev.code||ev.key,record=MATRIX_HELD.get(id);if(!record)return;
+  ev.preventDefault();MATRIX_HELD.delete(id);
+  if(record.directModifier){
+    if(record.active)queueMatrixEvent({kind:"keyboard",inputs:record.releaseInputs,transition:"release"});
+  }else if(record.releaseInputs.length){
+    queueMatrixEvent({kind:"keyboard",inputs:record.releaseInputs,transition:"release"});
+  }
+  for(const modifier of record.suspended||[]){
+    const physical=physicalModifierRecord(modifier,false);
+    if(physical&&!physical.active){
+      queueMatrixEvent({kind:"keyboard",inputs:[modifier],transition:"press"});
+      physical.active=true;
+    }
+  }
+});
+screenEl.addEventListener("focus",()=>{
+  $("#kbstat").innerHTML=INPUT_STATUS.available
+    ?"Keyboard captured — CIA1 matrix input active. Held keys and chords go directly to the C64."
+    :"Keyboard captured — legacy KERNAL buffer active. Esc = RUN/STOP.";
+});
+screenEl.addEventListener("blur",()=>{
+  matrixReleaseAll("screen blur");
+  $("#kbstat").textContent="Click the screen to capture the keyboard.";
+});
+document.addEventListener("visibilitychange",()=>{if(document.hidden)matrixReleaseAll("page hidden")});
+window.addEventListener("pagehide",()=>matrixReleaseAll("page hide",true));
+window.addEventListener("beforeunload",()=>matrixReleaseAll("page unload",true));
 async function sendLine(){const t=$("#typeline").value;if(!t)return;
   try{await api("/api/keys",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({text:t+"\n"})});
@@ -525,6 +719,7 @@ function openVideoWS(){
   wsV.onmessage=ev=>drawFrame(ev.data);
   wsV.onerror=()=>{};
   wsV.onclose=()=>{
+    matrixReleaseAll("video WebSocket closed");
     const unexpected=videoWanted;
     videoOn=false;videoWanted=false;wsV=null;
     $("#btnVideo").textContent="Start video";$("#btnVideo").classList.add("primary");
@@ -572,6 +767,7 @@ function openAudioWS(reconnecting=false){
   wsA.onmessage=ev=>{audioOn=true;achunks++;if(audioState!=="live")setAudioState("live",Math.max(1,audioRate));playChunk(ev.data)};
   wsA.onerror=()=>{};
   wsA.onclose=()=>{
+    matrixReleaseAll("audio WebSocket closed");
     wsA=null;
     if(!audioWanted){audioOn=false;setAudioState("off",0);return}
     audioOn=false;setAudioState("reconnecting",0);

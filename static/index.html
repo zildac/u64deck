@@ -131,11 +131,16 @@
           <div id="recCapability" class="hint" style="margin-top:7px">Checking browser recording support…</div>
         </details>
         <div class="kstat" id="kbstat">Click the screen to capture the keyboard.</div>
-        <div class="hint" style="margin-top:8px">
+        <div class="row keyboard-quick" aria-label="C64 quick keys">
+          <span class="hint">Quick keys</span>
+          <button class="mini primary tip" data-tip="Tap the C64 SPACE key. Works in cracktros and matrix-scanning software when CIA1 input is available." onclick="quickC64Key('space')">SPACE</button>
+          <button class="mini tip" data-tip="Tap RUN/STOP. Works in matrix-scanning software when CIA1 input is available." onclick="quickC64Key('run_stop')">RUN/STOP</button>
+          <button class="mini tip" data-tip="Tap RESTORE through the firmware input endpoint. RESTORE is unavailable on the legacy keyboard-buffer path." onclick="quickC64Key('restore')">RESTORE</button>
+          <span id="inputModeBadge" class="badge">Detecting input…</span>
+        </div>
+        <div class="hint" id="kbhelp" style="margin-top:8px">
           Esc = RUN/STOP · F1–F8 · cursor keys · Backspace = DEL · Home / Shift-Home = CLR.
-          Keys use the established C64 keyboard-buffer path, so typing works wherever
-          normal text input works. The Ultimate's on-device menu still requires a local
-          keyboard or joystick.
+          Input capability is detected automatically for the selected Ultimate.
         </div>
       </div>
       <div class="panel" id="swapPanel" style="display:none">

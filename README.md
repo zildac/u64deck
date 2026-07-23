@@ -1,6 +1,6 @@
 # u64deck
 
-**v1.8.0 — Public Beta 6**
+**v1.8.0 — Public Beta 9**
 
 
 A lightweight, self-hosted control deck for the **Ultimate 64** (and, minus the
@@ -23,8 +23,15 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
     Ultimate storage folder. Enter USB0, SD, Flash, Temp or another mounted
     folder first; the top-level `/` is only a virtual device list.
 - **Screen mirror with a keyboard that works** — VIC stream rendered at 50 fps
-  on a canvas; click it and type. Space bar included. Keys are batched over a
-  persistent TCP connection to the command socket for low latency.
+  on a canvas; click it and type. On supported Ultimate 64 firmware, interactive
+  keys use CIA1 matrix-level press/release events, including held keys, chords,
+  cracktros, games and the Ultimate menu. Older firmware and unsupported
+  hardware fall back automatically to the established KERNAL keyboard buffer.
+- **Accurate native SID durations** — when HVSC `Songlengths.md5` is loaded,
+  u64deck generates the compact per-SID `.ssl` duration data expected by the
+  Ultimate and includes that as the optional second attachment for uploaded SID
+  playback, so the native SID-player screen can show the documented subtune
+  length instead of its generic five-minute estimate.
 - **Audio mirror** — the U64 audio stream, played in the browser.
 - **Unambiguous stream state** — stopping or losing video replaces the last
   frame with a C64-style VIDEO NOT CONNECTED panel, while the audio badge shows
@@ -44,10 +51,12 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
   panel with examples for every major feature, and a sanitised diagnostics ZIP
   for troubleshooting without sharing passwords or content files.
 - **Machine controls** — reset, reboot, pause/resume, menu button, power off.
-  The menu button opens the on-device menu in the mirror; remote keyboard input remains C64-only.
+  The menu button opens the on-device menu in the mirror; on matrix-capable
+  firmware the Screen keyboard can navigate it remotely.
 - **Optional Retro Replay Fastload automation** — a persistent UI checkbox
   presses F7 after u64deck-initiated resets/reboots and before mounted software
-  is loaded.
+  is loaded. Matrix-capable devices use a real F7 matrix tap; the legacy buffer
+  remains the fallback.
 - **SQLite-backed storage index** — incremental, searchable indexing with
   automatic migration from legacy JSON caches, pause/resume, rates and ETA.
 - **Local USB index import** — remove a large collection stick from the Ultimate,
@@ -68,13 +77,13 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
 ## Screenshots
 
 ![Screen mirror](docs/screen-tab.png)
-*Live VIC screen mirror with a working keyboard, stream controls and WebM recording — the bezel follows the machine's real border colour.*
+*Live VIC screen mirror with a working keyboard, stream controls and recording — the bezel follows the machine's real border colour.*
 
 ![Storage search](docs/storage-search.png)
-*Recursive storage search that looks inside disk images — here finding a PRG buried in a Compunet demo disk, across 60,000 indexed folders, in seconds.*
+*Recursive storage search that looks inside disk images — finding a PRG buried in a Compunet demo disk, across 60,000 indexed folders, in seconds.*
 
 ![SID Jukebox](docs/jukebox.png)
-*SID Jukebox: instant search across the entire HVSC with composer/chip metadata, one-click playback through real SID silicon, and persistent play queues.*
+*SID Jukebox: instant search across the entire HVSC with composer/chip metadata, one-click playback through the machine's own audio, and persistent play queues.*
 
 ![Favourites](docs/favourites.png)
 *Favourites and recent items — star anything (folders, disks, files inside images, SID tunes, Assembly64 releases) for one-click access.*
@@ -163,7 +172,8 @@ content are excluded.
 
 ## Requirements
 
-- Ultimate 64 with **firmware 3.11+** (REST API; 3.12+ for network password),
+- Ultimate 64 with **firmware 3.11+** (REST API; 3.12+ for network password;
+  3.15+ for CIA1 keyboard input),
   **or a Commodore 64 Ultimate** — including prkl_ultimate / Spiffy builds
   (1.1.x firmware line), which expose the same `/v1` REST API, port-64
   command socket, FTP and UDP streams. Screen/audio mirror needs a machine
@@ -181,7 +191,7 @@ The repo includes a PyInstaller spec and a GitHub Actions workflow
 1. Push this folder to a GitHub repo.
 2. The **build-exe** action runs on every push — grab `u64deck.exe` from the
    workflow's artifacts (Actions tab → latest run → *u64deck-windows*).
-3. Tag a release (`git tag v1.8.0-beta.6 && git push --tags`) and the exe is attached
+3. Tag a release (`git tag v1.8.0-beta.9 && git push --tags`) and the exe is attached
    to the GitHub Release automatically.
 
 Double-click the exe: it starts the server, opens your browser, and you hit
@@ -355,9 +365,14 @@ title. Folder and saved-play-queue entries are loaded lazily, browser requests
 have timeouts and status polling cannot overlap, so a busy native SID player
 does not make the whole interface unresponsive.
 
-**Auto-advance**: tunes advance automatically. With HVSC's
-`Songlengths.md5` configured (`songlengths_path` in `config.json`), each
-tune plays for its documented length; without it, `sid_default_secs`
+**Auto-advance and native duration display**: tunes advance automatically. With
+HVSC's `Songlengths.md5` configured (`songlengths_path` in `config.json`),
+u64deck generates a tiny per-SID `.ssl` duration array and attaches that when it
+uploads a SID, allowing the Ultimate's own SID-player screen to show the
+documented length for the selected subtune. The complete Songlengths database
+is never uploaded to the device. Each tune plays for its documented length in
+u64deck;
+without Songlengths, `sid_default_secs`
 (default 180) applies (0 = loop forever). If your HVSC lives on the device, you don't even need to set it:
 on first jukebox use u64deck **auto-detects the HVSC root** (a folder
 with MUSICIANS + DOCUMENTS, e.g. `/Usb0/HVSC` or `/Usb0/C64Music`),

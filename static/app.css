@@ -37,6 +37,8 @@ header{display:flex;align-items:center;gap:14px;padding:10px 16px;flex:0 0 auto;
 @media (prefers-reduced-motion:reduce){.ready-line .cursor{animation:none}}
 #devinfo{color:var(--dim);font-size:13px;font-weight:400;letter-spacing:.01em;white-space:nowrap}
 #devinfo b{color:var(--txt);font-weight:700}
+#devinfo .input-mode.matrix{color:var(--ok)}
+#devinfo .input-mode.buffer{color:var(--warn)}
 #devinfo .reconnecting{color:var(--warn)}
 .header-actions{align-items:center}
 .machine{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
@@ -158,6 +160,9 @@ canvas#screen:focus{outline:3px solid var(--acc2);outline-offset:4px}
 .screen-side{min-width:260px;flex:1;max-width:420px}
 .kstat{font-size:12px;color:var(--dim)}
 .kstat b{color:var(--ok)}
+.keyboard-quick{margin-top:8px;align-items:center;gap:6px;flex-wrap:wrap}
+.keyboard-quick .badge.matrix{color:var(--ok);border-color:rgba(108,255,178,.35)}
+.keyboard-quick .badge.buffer{color:var(--warn)}
 @media(max-width:1220px){canvas#screen{width:576px;height:408px}}
 @media(max-width:900px){canvas#screen{width:384px;height:272px}.crt{padding:14px}}
 
