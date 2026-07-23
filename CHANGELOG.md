@@ -1,5 +1,129 @@
 # Changelog
 
+## 1.8.0 — Public Beta 10.4
+
+- Renamed the SID Jukebox queue column from **Len** to **Length** and now
+  pre-populates it as soon as tunes enter the queue. Lazy HVSC entries use the
+  path catalogue already present in `Songlengths.md5`, including the selected
+  subsong, so the complete SID does not need to be fetched first; unknown
+  durations display as an em dash.
+- Made Jukebox **Stop** responsive immediately in the browser and changed the
+  backend to send the command-socket reset packet first, with REST reset as a
+  compatibility fallback. This avoids waiting behind ordinary device-status
+  traffic while retaining the existing, expected reset to the C64 command line.
+- Suppressed periodic Jukebox refreshes while Stop is pending so an older
+  playing snapshot cannot briefly reappear in the UI.
+- Corrected remaining README Jukebox wording so Search and Random Dive describe
+  the one-tune queue behaviour introduced in Public Beta 10.3.
+- Added regression coverage for path-based queued lengths, selected subsongs,
+  the complete **Length** heading, command-socket reset framing and REST fallback.
+- Updated release metadata consistently for Public Beta 10.4 / archive 74.
+
+## 1.8.0 — Public Beta 10.3
+
+- Changed individual SID results to create and play a one-tune queue instead of
+  silently loading every SID in the containing composer folder. Folder queues
+  are now loaded only through the explicit **Play This Folder** action, while
+  **＋** appends only the selected tune.
+- Changed **♪ More like this** to insert SIDFlow recommendations immediately
+  after the current tune. Radio top-ups still append at the end, preserving
+  explicit queue choices.
+- Added **Clear Queue**. It disarms Radio, resets the SIDFlow session and clears
+  pending tunes while allowing a currently playing SID to finish naturally;
+  saved play queues, favourites and similarity data are unaffected. Non-trivial
+  clears receive a confirmation in the UI.
+- Expanded Help with the complete SIDFlow acquisition, local-processing, More
+  like this, Radio, matching/fallback and queue-management behaviour, with
+  prominent credit to **SIDFlow (Chris Gleissner)**.
+- Made the README screenshot gallery canonical, updated the Jukebox caption for
+  SIDFlow More like this and Radio, and restructured Quick start into standalone
+  Windows executable, Windows source and cross-platform tiers. Added SmartScreen,
+  SHA-256 and normal-user launch guidance.
+- Added a final SIDFlow promotion fallback using SQLite's backup API when both
+  the completed build and validated ready-copy remain locked against Windows
+  filesystem renames. This avoids requiring elevation or another download.
+- Added regression coverage for one-tune playback, recommendation insertion,
+  queue clearing/Radio disarming, rename-free SIDFlow promotion and the
+  canonical README structure.
+- Updated release metadata consistently for Public Beta 10.3 / archive 73.
+
+## 1.8.0 — Public Beta 10.2
+
+- Fixed repeated Windows SIDFlow import failures caused by the fixed
+  `.sidflow-similarity.sqlite.building` filename. Every import now uses a
+  unique `.building-<id>` database, so a stale or externally locked artifact
+  cannot block a new download.
+- Closed every short-lived SIDFlow SQLite connection explicitly. Python's
+  connection context manager handles transactions but does not close the file;
+  the leaked handles previously blocked re-downloads and replacement of the
+  live compact database on Windows.
+- Made the validated `.ready-*` promotion fallback functional by closing its
+  validation connection before `os.replace`, preventing u64deck from locking
+  its own rescue copy.
+- Changed stale `.building*`, `.ready-*` and interrupted-download cleanup to
+  best-effort diagnostics. An undeletable remnant is reported once, is never
+  shown as the current similarity-data error and cannot stop a fresh import.
+- Added regression coverage for unique sequential build names, locked stale
+  artifacts, balanced connection lifecycles, ready-copy fallback, repeated
+  status polling followed by re-download, and diagnostic-only cleanup errors.
+- Retained the Public Beta 10.1 perceptual-vector ranking, path corrections and
+  SIDFlow attribution unchanged.
+- Updated release metadata consistently for Public Beta 10.2 / archive 72.
+
+## 1.8.0 — Public Beta 10.1
+
+- Reworked SIDFlow recommendations to use the production export's perceptual
+  `features_json` fingerprints rather than the highly quantised `e/m/c/p`
+  classifier values. The importer extracts 48 documented numeric dimensions,
+  computes corpus mean/standard deviation, z-scores and L2-normalises each
+  track, then stores compact float32 unit vectors under local schema
+  `u64deck-featvec-1`.
+- Added a data-quality guard that reports and blocks recommendations when more
+  than half of the extracted vectors are identical instead of silently
+  returning meaningless 100%-similar matches.
+- Changed acquisition to require the full SIDFlow feature export. The current
+  mobile profile is no longer preferred because it omits `features_json`; the
+  Settings copy now explains that the roughly 400 MB source is downloaded once,
+  slimmed to a normally sub-40 MB local database and deleted.
+- Fixed Windows final-import promotion failures by coordinating local database
+  readers, extending lock retries, and using a validated temporary ready-copy
+  fallback when the just-closed `.building` SQLite file remains locked.
+- Corrected HVSC path joins to remain case-insensitive end-to-end, preserve the
+  canonical SIDFlow track ID, strip an optional leading `C64Music/` segment and
+  continue rejecting non-HVSC paths cleanly.
+- Corrected the vertical alignment of the Jukebox Songlengths status and
+  **Powered by SIDFlow (Chris Gleissner)** attribution.
+- Expanded SIDFlow regression coverage for real feature extraction, missing
+  values, normalisation, local vector-schema gating, degenerate data, Windows
+  promotion fallback, case-insensitive mapping and `C64Music/` paths.
+- Updated release metadata consistently for Public Beta 10.1 / archive 71.
+
+## 1.8.0 — Public Beta 10
+
+- Added **♪ More like this** to the SID Jukebox Now Playing area and Play Queue
+  rows. Recommendations use the active SID/subsong as the seed and append the
+  closest unseen matches already present in the current Ultimate SID index.
+- Added **Radio** mode, which tops up the queue near its end using the most
+  recently played tune while maintaining a session played-set to prevent
+  repeats.
+- Added a Settings → Search Index & Cache acquisition workflow for SIDFlow's
+  portable similarity export: manifest-first schema gating, `SHA256SUMS`
+  verification, streamed progress, mobile-profile preference, clean restart
+  after interruption and atomic promotion of a completed local database.
+- Added a compact `.sidflow-similarity.sqlite` importer that retains only track
+  identity and the `e/m/c/p` similarity vectors, preserves future precomputed
+  neighbour rows when supplied, and deletes the large downloaded source after
+  a successful import.
+- Added case-insensitive HVSC-root path mapping, exact subsong identity,
+  cosine-similarity ranking with three-dimensional fallback when `p` is NULL,
+  device-presence filtering and clear absence/schema/path-drift messages.
+- Added prominent **Powered by SIDFlow (Chris Gleissner)** attribution in the
+  Jukebox, Settings, Help, README and release notes.
+- Added regression coverage for schema gating, slimming and source cleanup,
+  path/subsong mapping, cosine ordering, device filtering, Radio no-repeat,
+  graceful absence and release-archive hygiene.
+- Updated release metadata consistently for Public Beta 10 / archive 70.
+
 ## 1.8.0 — Public Beta 9
 
 - Corrected uploaded SID duration metadata to use the firmware-native per-SID

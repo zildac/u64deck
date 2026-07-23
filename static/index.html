@@ -395,6 +395,19 @@
     <div id="parseErrorPanel" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)">
       <div id="parseErrorList" class="hint">loading…</div>
     </div>
+    <div class="sidflow-settings" style="border-top:1px solid var(--line);margin-top:12px;padding-top:10px">
+      <div class="row" style="align-items:baseline;gap:10px;flex-wrap:wrap">
+        <h2 style="margin-bottom:4px">SIDFLOW SIMILARITY DATA</h2>
+        <span class="sidflow-credit">Powered by SIDFlow (Chris Gleissner)</span>
+      </div>
+      <div id="sidflowStatus" class="hint">checking local similarity data…</div>
+      <progress id="sidflowProgress" max="100" value="0" style="display:none;width:min(520px,100%);margin-top:7px"></progress>
+      <div class="row" style="margin-top:7px;gap:6px;flex-wrap:wrap">
+        <button class="mini primary" id="sidflowDownloadBtn" onclick="sidflowDownload()">Download Similarity Data</button>
+        <button class="mini danger" id="sidflowRemoveBtn" onclick="sidflowRemove()" style="display:none">Remove Similarity Data</button>
+      </div>
+      <div class="hint" style="margin-top:6px">Downloads SIDFlow's full feature export once (about 400 MB), verifies its checksum, retains only compact perceptual vectors locally, then deletes the large source file.</div>
+    </div>
     <div style="border-top:1px solid var(--line);margin-top:12px;padding-top:10px">
       <h2 style="margin-bottom:6px">BUILD INDEX FROM LOCAL USB</h2>
       <div class="row" style="flex-wrap:wrap;gap:6px">
@@ -543,16 +556,22 @@
     <div class="row" style="margin-top:10px;align-items:center;flex-wrap:wrap;gap:6px">
       <button onclick="jk('prev')">⏮</button>
       <button class="primary" onclick="jkPlayCurrent()">▶</button>
-      <button onclick="jk('stop')">⏹</button>
+      <button onclick="jkStop()" title="stop SID playback and reset to the C64 command line">⏹</button>
       <button onclick="jk('next')">⏭</button>
       <button id="jkNowStar" class="mini star" style="display:none" onclick="jkToggleNowFavourite()"
         title="add or remove the currently playing SID from Favourites">☆</button>
+      <button id="jkMoreNow" class="mini" style="display:none" onclick="jkMoreLike()"
+        title="insert similar SIDFlow matches after the current tune">♪ More like this</button>
       <label class="hint"><input type="checkbox" id="jkShuffle" onchange="jkShuffleSet()"> Shuffle</label>
+      <label class="hint sidflow-radio"><input type="checkbox" id="jkRadio" onchange="jkRadioSet()"> Radio</label>
       <button id="jkAudio" onclick="toggleAudio().then(()=>jkAudioSync())" title="stream the machine's audio to this browser">🔊 Listen here</button>
       <span id="jkNow" class="hint"></span>
       <span id="jkSong" style="display:none"></span>
     </div>
-    <div class="hint" id="jkSlInfo" style="margin-top:4px"></div>
+    <div class="row sidflow-juke-credit-row">
+      <div class="hint" id="jkSlInfo"></div>
+      <span id="jkSidflowCredit" class="sidflow-credit">Powered by SIDFlow (Chris Gleissner)</span>
+    </div>
   </div>
   <div class="panel sid-queue-panel" id="jkListPanel" style="display:none">
     <div class="sid-queue-heading">
@@ -566,6 +585,7 @@
       <select id="plSel" style="min-width:160px"><option value="">— saved play queues —</option></select>
       <button class="mini primary" onclick="plLoad()" title="replace the current play queue with the saved one">▶ Load</button>
       <button class="mini" onclick="plDelete()" title="delete the selected saved play queue">🗑</button>
+      <button class="mini" onclick="jkClearQueue()" title="clear queued tunes, turn Radio off and let the current SID finish">Clear Queue</button>
     </div>
     <div id="jkList" class="sid-queue-list" role="table" aria-label="SID play queue"></div>
   </div>

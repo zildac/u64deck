@@ -744,6 +744,15 @@ class IndexStore:
             return False
         return True
 
+    def sid_metadata_paths(self, root: str = "/") -> list[str]:
+        """Return indexed SID device paths beneath ``root``."""
+        scope, args = self._scope_sql("path", root)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT path FROM sid_metadata WHERE {scope} ORDER BY path", args
+            ).fetchall()
+        return [str(row["path"]) for row in rows]
+
     def sid_metadata_count(self, root: str = "/") -> int:
         scope, args = self._scope_sql("path", root)
         with self._lock:

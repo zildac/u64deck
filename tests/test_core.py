@@ -5,7 +5,7 @@ import re
 import time
 import threading
 from pathlib import Path
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 
 import pytest
 import httpx
@@ -150,11 +150,13 @@ def test_songlength_loader_parses_lengths_and_path_index(tmp_path: Path):
     path.write_bytes(raw)
     previous_path = server.CFG.get("songlengths_path", "")
     previous_lengths = dict(server.SONGLENGTHS)
+    previous_path_lengths = dict(server.SONGLENGTHS_BY_PATH)
     previous_index = list(server.HVSC_INDEX)
     try:
         server.CFG["songlengths_path"] = str(path)
         assert server.load_songlengths() == 1
         assert server.SONGLENGTHS["0123456789abcdef0123456789abcdef"] == [10.0, 62.5]
+        assert server.SONGLENGTHS_BY_PATH["musicians/t/test/tune.sid"] == [10.0, 62.5]
         assert server.HVSC_INDEX == [
             ("/musicians/t/test/tune.sid", "/MUSICIANS/T/Test/Tune.sid")
         ]
@@ -162,6 +164,8 @@ def test_songlength_loader_parses_lengths_and_path_index(tmp_path: Path):
         server.CFG["songlengths_path"] = previous_path
         server.SONGLENGTHS.clear()
         server.SONGLENGTHS.update(previous_lengths)
+        server.SONGLENGTHS_BY_PATH.clear()
+        server.SONGLENGTHS_BY_PATH.update(previous_path_lengths)
         server.HVSC_INDEX[:] = previous_index
 
 
@@ -1037,7 +1041,7 @@ def test_release_version_is_consistent_in_code_ui_and_changelog():
     changelog = (Path(server.ROOT) / "CHANGELOG.md").read_text(encoding="utf-8")
     assert 'id="ver"' in html
     assert '"/api/app_config"' in js
-    assert "## 1.8.0 — Public Beta 9" in changelog.split("## 1.8.0 — Public Beta 2", 1)[0]
+    assert "## 1.8.0 — Public Beta 10.4" in changelog.split("## 1.8.0 — Public Beta 2", 1)[0]
 
 
 def test_built_in_help_contains_no_release_specific_versions():
@@ -1098,7 +1102,7 @@ def test_frontend_is_split_without_a_build_tool():
 def test_release_metadata_is_centralised():
     import release
     assert server.VERSION == release.VERSION == "1.8.0"
-    assert release.RELEASE_LABEL == "Public Beta 9"
+    assert release.RELEASE_LABEL == "Public Beta 10.4"
     assert server.BUILD == release.build_id(server.ASSETS, Path(server.__file__).parent)
 
 
@@ -2061,7 +2065,7 @@ def test_public_beta_help_and_now_playing_star_are_present():
     assert "jkToggleNowFavourite" in js
     assert ".u64deck-index.sqlite3" in help_js
     assert "star beside the playback controls" in help_js
-    assert "Public Beta 9" in readme
+    assert "Public Beta 10.4" in readme
     assert ".u64deck-index.sqlite3" in readme
 
 
@@ -2280,3 +2284,817 @@ def test_assembly64_mount_run_rejects_non_disk_content():
     import pytest
     with pytest.raises(ValueError, match="disk images"):
         server._asm_deploy_bytes("Demo.prg", "mount_run", b"program")
+
+
+def _sidflow_source_db(path: Path, rows: list[tuple], *, with_payload: bool = False) -> None:
+    import sqlite3
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.executescript("""
+            CREATE TABLE tracks (
+                track_id TEXT PRIMARY KEY,
+                sid_path TEXT NOT NULL,
+                song_index INTEGER NOT NULL,
+                vector_json TEXT NULL,
+                e REAL NOT NULL,
+                m REAL NOT NULL,
+                c REAL NOT NULL,
+                p REAL NULL,
+                likes INTEGER NOT NULL DEFAULT 0,
+                dislikes INTEGER NOT NULL DEFAULT 0,
+                skips INTEGER NOT NULL DEFAULT 0,
+                plays INTEGER NOT NULL DEFAULT 0,
+                last_played TEXT NULL,
+                classified_at TEXT NULL,
+                source TEXT NULL,
+                render_engine TEXT NULL,
+                feature_schema_version TEXT NULL,
+                features_json TEXT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE neighbors (
+                profile TEXT NOT NULL,
+                seed_track_id TEXT NOT NULL,
+                neighbor_track_id TEXT NOT NULL,
+                rank INTEGER NOT NULL,
+                similarity REAL NOT NULL,
+                PRIMARY KEY(profile, seed_track_id, rank)
+            ) WITHOUT ROWID;
+        """)
+        import json
+        values = []
+        for row in rows:
+            base = tuple(row[:7])
+            if len(row) > 7 and isinstance(row[7], dict):
+                features = dict(row[7])
+            else:
+                features = {
+                    "energy": float(base[3]),
+                    "dynamicRange": float(base[4]),
+                    "bpm": float(base[5]) * 100.0,
+                    "pitchSalience": 0.0 if base[6] is None else float(base[6]),
+                }
+            if with_payload:
+                features["unused_payload"] = "x" * 12000
+            values.append((*base, json.dumps(features)))
+        conn.executemany(
+            "INSERT INTO tracks(track_id,sid_path,song_index,e,m,c,p,features_json) "
+            "VALUES(?,?,?,?,?,?,?,?)", values,
+        )
+
+
+def _sidflow_manifest(count: int, **extra) -> dict:
+    value = {
+        "schema_version": "sidcorr-1", "track_count": count,
+        "vector_dimensions": 4, "include_vectors": True,
+        "neighbor_row_count": 0, "generated_at": "2026-04-07T00:00:00Z",
+        "export_profile": "full",
+    }
+    value.update(extra)
+    return value
+
+
+def test_sidflow_manifest_schema_gate():
+    import sidflow_similarity as sf
+    assert sf.validate_manifest(_sidflow_manifest(1))["schema_version"] == "sidcorr-1"
+    with pytest.raises(ValueError, match="sidcorr-2.*not supported"):
+        sf.validate_manifest(_sidflow_manifest(1, schema_version="sidcorr-2"))
+
+
+def test_sidflow_slimming_preserves_rows_bounds_size_and_deletes_source(tmp_path: Path):
+    import sidflow_similarity as sf
+    source = tmp_path / "full.sqlite"
+    live = tmp_path / ".sidflow-similarity.sqlite"
+    rows = [
+        ("MUSICIANS/A/A.sid#1", "MUSICIANS/A/A.sid", 1, 1.0, 0.0, 0.0, None),
+        ("MUSICIANS/B/B.sid#2", "MUSICIANS/B/B.sid", 2, 0.0, 1.0, 0.0, 0.5),
+        ("MUSICIANS/C/C.sid#1", "MUSICIANS/C/C.sid", 1, 0.0, 0.0, 1.0, 0.2),
+    ]
+    _sidflow_source_db(source, rows, with_payload=True)
+    source_size = source.stat().st_size
+    result = sf.slim_and_promote(source, live, _sidflow_manifest(len(rows)))
+    assert result["tracks"] == len(rows)
+    assert not source.exists()
+    assert live.is_file() and live.stat().st_size < source_size
+    store = sf.SimilarityStore(live)
+    assert store.status()["tracks"] == len(rows)
+    assert store.lookup("musicians/b/b.sid", 2)["track_id"] == rows[1][0]
+
+
+def test_sidflow_path_normalisation_and_track_id_join():
+    import sidflow_similarity as sf
+    assert sf.normalise_hvsc_relative(
+        r"\USB0\C64Music\MUSICIANS\G\Galway_Martin\Parallax.sid",
+        "/usb0/c64music/",
+    ) == "MUSICIANS/G/Galway_Martin/Parallax.sid"
+    assert sf.normalise_hvsc_relative(
+        "/USB0/HVSC/MUSICIANS/A/Tune.sid", "/USB0/Other"
+    ) is None
+    assert sf.build_track_id("/MUSICIANS/A/Tune.sid", 3) == "MUSICIANS/A/Tune.sid#3"
+
+
+def test_sidflow_feature_ranking_and_present_filter(tmp_path: Path):
+    import sidflow_similarity as sf
+    source = tmp_path / "source.sqlite"
+    live = tmp_path / "live.sqlite"
+    rows = [
+        ("A.sid#1", "A.sid", 1, 3.0, 3.0, 3.0, None, {"bpm": 120, "energy": .8, "spectralCentroid": 1000}),
+        ("B.sid#1", "B.sid", 1, 3.0, 3.0, 3.0, None, {"bpm": 121, "energy": .79, "spectralCentroid": 1010}),
+        ("C.sid#1", "C.sid", 1, 3.0, 3.0, 3.0, None, {"bpm": 80, "energy": .2, "spectralCentroid": 400}),
+        ("D.sid#1", "D.sid", 1, 3.0, 3.0, 3.0, None, {"bpm": 82, "energy": .25, "spectralCentroid": 420}),
+    ]
+    _sidflow_source_db(source, rows)
+    sf.slim_and_promote(source, live, _sidflow_manifest(len(rows)))
+    store = sf.SimilarityStore(live)
+    ranked = store.rank("A.sid#1", limit=3)
+    assert ranked[0]["track_id"] == "B.sid#1"
+    filtered = store.rank("A.sid#1", limit=3, present_paths={"c.sid", "d.sid"})
+    assert {row["track_id"] for row in filtered} == {"C.sid#1", "D.sid#1"}
+
+
+def test_sidflow_more_like_filters_to_device_and_radio_does_not_repeat(monkeypatch):
+    class FakeStore:
+        def status(self): return {"available": True, "tracks": 3}
+        def lookup(self, rel, song):
+            return {"track_id": f"{rel}#{song}", "sid_path": rel, "song_index": song}
+        def rank(self, seed, *, limit, present_paths, exclude_track_ids):
+            excluded = {str(x).casefold() for x in exclude_track_ids}
+            candidates = [
+                {"track_id": "MUSICIANS/B/B.sid#1", "sid_path": "MUSICIANS/B/B.sid", "song_index": 1, "similarity": .99},
+                {"track_id": "MUSICIANS/C/C.sid#2", "sid_path": "MUSICIANS/C/C.sid", "song_index": 2, "similarity": .95},
+            ]
+            return [row for row in candidates if row["track_id"].casefold() not in excluded]
+    class FakeIndex:
+        def sid_metadata_paths(self, root):
+            return ["/USB0/HVSC/MUSICIANS/A/A.sid", "/USB0/HVSC/MUSICIANS/B/B.sid", "/USB0/HVSC/MUSICIANS/C/C.sid"]
+        def sid_metadata_for_paths(self, paths): return {}
+
+    previous_juke = dict(server.JUKE)
+    previous_played = set(server.JUKE_PLAYED)
+    previous_recent = list(server.JUKE_RECENT_TRACKS)
+    monkeypatch.setattr(server, "SIDFLOW_STORE", FakeStore())
+    monkeypatch.setattr(server, "_configured_hvsc_root", lambda: "/USB0/HVSC")
+    monkeypatch.setattr(server, "_index_store", lambda: FakeIndex())
+    try:
+        server.JUKE_PLAYED.clear(); server.JUKE_RECENT_TRACKS.clear()
+        server.JUKE.clear(); server.JUKE.update({
+            "items": [server._juke_lazy_item("/USB0/HVSC/MUSICIANS/A/A.sid", "A.sid")],
+            "index": 0, "playing": True, "shuffle": False, "radio": True,
+            "song": 1, "timer": None, "folder": "", "loading": False,
+            "source": "", "generation": 0,
+        })
+        assert server._sidflow_radio_topup() == 2
+        assert len(server.JUKE["items"]) == 3
+        assert [item.get("song") for item in server.JUKE["items"][1:]] == [1, 2]
+        # A second top-up sees both candidate track IDs in the current queue.
+        assert server._sidflow_radio_topup() == 0
+        assert len(server.JUKE["items"]) == 3
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous_juke)
+        server.JUKE_PLAYED.clear(); server.JUKE_PLAYED.update(previous_played)
+        server.JUKE_RECENT_TRACKS.clear(); server.JUKE_RECENT_TRACKS.extend(previous_recent)
+
+
+def test_sidflow_absent_and_unmatched_flows_are_graceful(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(server, "SIDFLOW_STORE", __import__("sidflow_similarity").SimilarityStore(tmp_path / "missing.sqlite"))
+    with pytest.raises(HTTPException, match="not installed"):
+        server._sidflow_recommendations("/USB0/HVSC/A.sid", 1)
+
+    class Available:
+        def status(self): return {"available": True}
+        def lookup(self, rel, song): return None
+    monkeypatch.setattr(server, "SIDFLOW_STORE", Available())
+    monkeypatch.setattr(server, "_configured_hvsc_root", lambda: "/USB0/HVSC")
+    with pytest.raises(HTTPException, match="not present in the SIDFlow export"):
+        server._sidflow_recommendations("/USB0/HVSC/MUSICIANS/A/Missing.sid", 1)
+
+
+def test_sidflow_ui_attribution_docs_and_archive_hygiene_are_present():
+    root = Path(server.ROOT)
+    html = (Path(server.ASSETS) / "static" / "index.html").read_text(encoding="utf-8")
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    help_js = (Path(server.ASSETS) / "static" / "help_content.js").read_text(encoding="utf-8")
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    gitignore = (root / ".gitignore").read_text(encoding="utf-8")
+    assert html.count("Powered by SIDFlow (Chris Gleissner)") >= 2
+    assert "♪ More like this" in html and 'id="jkRadio"' in html
+    assert "/api/juke/more_like" in js and "/api/juke/radio" in js
+    assert "SIDFlow" in help_js and "Chris Gleissner" in help_js
+    assert "SIDFlow" in readme and "Chris Gleissner" in readme
+    assert ".sidflow-*" in gitignore
+    assert not list(root.glob(".sidflow-*"))
+
+
+def test_sidflow_asset_plan_requires_full_feature_export(monkeypatch):
+    class Response:
+        def raise_for_status(self): pass
+        def json(self):
+            return {
+                "tag_name": "sidcorr-hvsc-full-20260407T115218Z",
+                "published_at": "2026-04-07T11:52:18Z",
+                "assets": [
+                    {"name": "sidcorr-hvsc-full-sidcorr-1.sqlite", "browser_download_url": "https://example/full.sqlite"},
+                    {"name": "sidcorr-hvsc-full-sidcorr-1.manifest.json", "browser_download_url": "https://example/full.json"},
+                    {"name": "sidcorr-hvsc-mobile-sidcorr-1.sqlite", "browser_download_url": "https://example/mobile.sqlite"},
+                    {"name": "sidcorr-hvsc-mobile-sidcorr-1.manifest.json", "browser_download_url": "https://example/mobile.json"},
+                    {"name": "SHA256SUMS", "browser_download_url": "https://example/SHA256SUMS"},
+                ],
+            }
+    class Client:
+        def get(self, url): return Response()
+
+    plan = server._sidflow_asset_plan(Client())
+    assert plan["profile"] == "full"
+    assert plan["sqlite_url"] == "https://example/full.sqlite"
+    assert plan["manifest_url"] == "https://example/full.json"
+    assert plan["checksums_url"] == "https://example/SHA256SUMS"
+
+
+def test_sidflow_slimming_retains_and_prefers_future_neighbors(tmp_path: Path):
+    import sqlite3
+    import sidflow_similarity as sf
+
+    source = tmp_path / "source.sqlite"
+    live = tmp_path / "live.sqlite"
+    rows = [
+        ("A.sid#1", "A.sid", 1, 1.0, 0.0, 0.0, None),
+        ("B.sid#1", "B.sid", 1, 0.99, 0.01, 0.0, None),
+        ("C.sid#1", "C.sid", 1, 0.0, 1.0, 0.0, None),
+    ]
+    _sidflow_source_db(source, rows)
+    with closing(sqlite3.connect(source)) as conn, conn:
+        conn.execute(
+            "INSERT INTO neighbors(profile,seed_track_id,neighbor_track_id,rank,similarity) "
+            "VALUES(?,?,?,?,?)",
+            ("default", "A.sid#1", "C.sid#1", 1, 0.777),
+        )
+    result = sf.slim_and_promote(
+        source, live, _sidflow_manifest(len(rows), neighbor_row_count=1)
+    )
+    assert result["neighbors"] == 1
+    store = sf.SimilarityStore(live)
+    ranked = store.rank("A.sid#1", limit=1)
+    assert ranked[0]["track_id"] == "C.sid#1"
+    assert ranked[0]["similarity"] == pytest.approx(0.777)
+
+
+def test_sidflow_sha256_parser_accepts_common_relative_names():
+    import sidflow_similarity as sf
+    value = "a" * 64
+    assert sf.parse_sha256sums(f"{value}  ./bundle.sqlite\n")["bundle.sqlite"] == value
+
+
+def test_sidflow_feature_extraction_missing_values_and_real_shape():
+    import sidflow_similarity as sf
+    payload = {name: index + 0.5 for index, name in enumerate(sf.FEATURE_DIMENSIONS)}
+    payload.update({f"unusedRealField{index}": index for index in range(25)})
+    payload["energy"] = "not numeric"
+    payload["rms"] = None
+    vector = sf.extract_feature_vector(payload)
+    assert len(vector) == 48
+    assert vector[sf.FEATURE_DIMENSIONS.index("energy")] == 0.0
+    assert vector[sf.FEATURE_DIMENSIONS.index("rms")] == 0.0
+    assert vector[sf.FEATURE_DIMENSIONS.index("bpm")] == pytest.approx(0.5)
+
+
+def test_sidflow_zscore_l2_pipeline_matches_precomputed_values():
+    import sidflow_similarity as sf
+    unit = sf.normalise_vector((2.0, 4.0, 8.0), (1.0, 2.0, 2.0), (1.0, 2.0, 3.0))
+    expected_raw = (1.0, 1.0, 2.0)
+    norm = sum(value * value for value in expected_raw) ** 0.5
+    assert unit == pytest.approx(tuple(value / norm for value in expected_raw))
+    assert sum(value * value for value in unit) == pytest.approx(1.0)
+
+
+def test_sidflow_path_mapping_is_case_insensitive_and_strips_c64music():
+    import sidflow_similarity as sf
+    assert sf.normalise_hvsc_relative(
+        "/usb0/hvsc/C64Music/MUSICIANS/G/Galway_Martin/Parallax.sid",
+        "/USB0/HVSC",
+    ) == "MUSICIANS/G/Galway_Martin/Parallax.sid"
+    assert sf.normalise_hvsc_relative(
+        "/USB0/OTHER/C64Music/MUSICIANS/G/Tune.sid", "/USB0/HVSC"
+    ) is None
+
+
+def test_sidflow_vector_schema_meta_and_casefold_lookup(tmp_path: Path):
+    import sqlite3
+    import sidflow_similarity as sf
+    source = tmp_path / "source.sqlite"
+    live = tmp_path / "live.sqlite"
+    rows = [
+        ("MUSICIANS/A/Tune.sid#1", "MUSICIANS/A/Tune.sid", 1, 3, 3, 3, None,
+         {"bpm": 100, "energy": .4}),
+        ("MUSICIANS/B/Other.sid#1", "MUSICIANS/B/Other.sid", 1, 3, 3, 3, None,
+         {"bpm": 140, "energy": .9}),
+    ]
+    _sidflow_source_db(source, rows)
+    sf.slim_and_promote(source, live, _sidflow_manifest(len(rows)))
+    with closing(sqlite3.connect(live)) as conn:
+        meta = dict(conn.execute("SELECT key,value FROM meta"))
+    assert meta["vector_schema_version"] == "u64deck-featvec-1"
+    assert len(__import__("json").loads(meta["feature_dimensions_json"])) == 48
+    store = sf.SimilarityStore(live)
+    assert store.lookup("musicians/a/tUNE.sid", 1)["track_id"] == "MUSICIANS/A/Tune.sid#1"
+
+
+def test_sidflow_degenerate_feature_data_warns_and_blocks_ranking(tmp_path: Path):
+    import sidflow_similarity as sf
+    source = tmp_path / "source.sqlite"
+    live = tmp_path / "live.sqlite"
+    same = {"bpm": 100, "energy": .5}
+    rows = [(f"{name}.sid#1", f"{name}.sid", 1, 3, 3, 3, None, same)
+            for name in ("A", "B", "C")]
+    _sidflow_source_db(source, rows)
+    sf.slim_and_promote(source, live, _sidflow_manifest(len(rows)))
+    store = sf.SimilarityStore(live)
+    status = store.status()
+    assert status["available"] is True
+    assert "degenerate" in status["quality_warning"]
+    with pytest.raises(ValueError, match="degenerate"):
+        store.rank("A.sid#1")
+
+
+def test_sidflow_windows_locked_build_uses_validated_ready_copy(monkeypatch, tmp_path: Path):
+    import os
+    import sidflow_similarity as sf
+    build = tmp_path / "db.building"
+    live = tmp_path / "db.sqlite"
+    with closing(__import__("sqlite3").connect(build)) as conn, conn:
+        conn.executescript("""
+            CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL) WITHOUT ROWID;
+            INSERT INTO meta VALUES('vector_schema_version','u64deck-featvec-1');
+        """)
+    real_replace = os.replace
+    calls = []
+    def flaky(source, destination):
+        calls.append(str(source))
+        if str(source).endswith(".building"):
+            raise PermissionError(5, "Access is denied", str(source), str(destination))
+        return real_replace(source, destination)
+    monkeypatch.setattr(sf.os, "replace", flaky)
+    sf.atomic_replace_database(build, live, attempts=2)
+    assert live.is_file()
+    assert any(".ready-" in value for value in calls)
+
+
+
+
+
+
+
+def test_sidflow_promotion_uses_sqlite_backup_when_all_renames_are_blocked(monkeypatch, tmp_path: Path):
+    import sidflow_similarity as sf
+    build = tmp_path / "db.building"
+    live = tmp_path / "db.sqlite"
+    with closing(__import__("sqlite3").connect(build)) as conn, conn:
+        conn.executescript("""
+            CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL) WITHOUT ROWID;
+            INSERT INTO meta VALUES('vector_schema_version','u64deck-featvec-1');
+            CREATE TABLE tracks(track_id TEXT PRIMARY KEY, sid_path TEXT, sid_path_key TEXT,
+              song_index INTEGER, e REAL, m REAL, c REAL, p REAL, feature_vector BLOB) WITHOUT ROWID;
+            CREATE TABLE neighbors(profile TEXT,seed_track_id TEXT,neighbor_track_id TEXT,
+              rank INTEGER,similarity REAL,PRIMARY KEY(profile,seed_track_id,rank)) WITHOUT ROWID;
+        """)
+    def blocked(*args, **kwargs):
+        raise PermissionError(5, "Access is denied")
+    monkeypatch.setattr(sf.os, "replace", blocked)
+    sf.atomic_replace_database(build, live, attempts=1)
+    assert live.is_file()
+    sf._validate_compact_database(live)
+
+
+def test_sidflow_sequential_imports_use_unique_build_names(monkeypatch, tmp_path: Path):
+    import sidflow_similarity as sf
+    seen = []
+    original = sf.slim_database
+
+    def recording(source, destination, manifest, progress=None):
+        seen.append(Path(destination).name)
+        return original(source, destination, manifest, progress)
+
+    monkeypatch.setattr(sf, "slim_database", recording)
+    live = tmp_path / ".sidflow-similarity.sqlite"
+    rows = [
+        ("A.sid#1", "A.sid", 1, 1, 2, 3, None, {"bpm": 100, "energy": .2}),
+        ("B.sid#1", "B.sid", 1, 2, 3, 4, None, {"bpm": 140, "energy": .8}),
+    ]
+    for index in range(2):
+        source = tmp_path / f"source-{index}.sqlite"
+        _sidflow_source_db(source, rows)
+        sf.slim_and_promote(source, live, _sidflow_manifest(len(rows)))
+    assert len(seen) == 2
+    assert seen[0] != seen[1]
+    assert all(".building-" in name for name in seen)
+    assert not list(tmp_path.glob("*.building-*"))
+
+
+def test_sidflow_stale_fixed_build_file_does_not_block_new_import(tmp_path: Path):
+    import sidflow_similarity as sf
+    live = tmp_path / ".sidflow-similarity.sqlite"
+    stale = live.with_name(live.name + ".building-deadbeef")
+    stale.write_bytes(b"locked legacy artifact")
+    source = tmp_path / "source.sqlite"
+    rows = [
+        ("A.sid#1", "A.sid", 1, 1, 2, 3, None, {"bpm": 100, "energy": .2}),
+        ("B.sid#1", "B.sid", 1, 2, 3, 4, None, {"bpm": 140, "energy": .8}),
+    ]
+    _sidflow_source_db(source, rows)
+    with stale.open("rb") as held:
+        assert held.read(1) == b"l"
+        sf.slim_and_promote(source, live, _sidflow_manifest(len(rows)))
+    assert live.is_file()
+    assert stale.is_file()
+
+
+def test_sidflow_connections_are_balanced_after_status_warm_rank_and_validate(monkeypatch, tmp_path: Path):
+    import sidflow_similarity as sf
+    source = tmp_path / "source.sqlite"
+    live = tmp_path / "live.sqlite"
+    rows = [
+        ("A.sid#1", "A.sid", 1, 1, 2, 3, None, {"bpm": 100, "energy": .2}),
+        ("B.sid#1", "B.sid", 1, 2, 3, 4, None, {"bpm": 140, "energy": .8}),
+        ("C.sid#1", "C.sid", 1, 3, 4, 5, None, {"bpm": 180, "energy": .5}),
+    ]
+    _sidflow_source_db(source, rows)
+    sf.slim_and_promote(source, live, _sidflow_manifest(len(rows)))
+
+    real_connect = sf.sqlite3.connect
+    balance = {"opened": 0, "closed": 0}
+
+    class TrackedConnection:
+        def __init__(self, conn):
+            object.__setattr__(self, "_conn", conn)
+            object.__setattr__(self, "_closed", False)
+            balance["opened"] += 1
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+        def __setattr__(self, name, value):
+            if name.startswith("_"):
+                object.__setattr__(self, name, value)
+            else:
+                setattr(self._conn, name, value)
+        def close(self):
+            if not self._closed:
+                self._conn.close()
+                object.__setattr__(self, "_closed", True)
+                balance["closed"] += 1
+
+    monkeypatch.setattr(sf.sqlite3, "connect", lambda *a, **k: TrackedConnection(real_connect(*a, **k)))
+    store = sf.SimilarityStore(live)
+    assert store.status()["available"] is True
+    assert store.warm() == len(rows)
+    assert store.rank("A.sid#1", limit=1)
+    sf._validate_compact_database(live)
+    assert balance["opened"] == balance["closed"]
+
+
+def test_sidflow_redownload_replaces_live_after_repeated_status_calls(tmp_path: Path):
+    import sidflow_similarity as sf
+    live = tmp_path / "live.sqlite"
+    rows1 = [
+        ("A.sid#1", "A.sid", 1, 1, 2, 3, None, {"bpm": 100, "energy": .2}),
+        ("B.sid#1", "B.sid", 1, 2, 3, 4, None, {"bpm": 140, "energy": .8}),
+    ]
+    source1 = tmp_path / "source1.sqlite"
+    _sidflow_source_db(source1, rows1)
+    sf.slim_and_promote(source1, live, _sidflow_manifest(len(rows1)))
+    store = sf.SimilarityStore(live)
+    for _ in range(5):
+        assert store.status()["available"] is True
+
+    rows2 = [
+        ("C.sid#1", "C.sid", 1, 1, 3, 5, None, {"bpm": 90, "energy": .3}),
+        ("D.sid#1", "D.sid", 1, 2, 4, 6, None, {"bpm": 160, "energy": .9}),
+    ]
+    source2 = tmp_path / "source2.sqlite"
+    _sidflow_source_db(source2, rows2)
+    sf.slim_and_promote(source2, live, _sidflow_manifest(len(rows2)))
+    fresh = sf.SimilarityStore(live)
+    assert fresh.lookup("C.sid", 1)["track_id"] == "C.sid#1"
+    assert fresh.lookup("A.sid", 1) is None
+
+
+def test_sidflow_ready_fallback_replaces_existing_live_after_status_calls(monkeypatch, tmp_path: Path):
+    import sidflow_similarity as sf
+    live = tmp_path / "live.sqlite"
+    first_source = tmp_path / "first.sqlite"
+    first_rows = [
+        ("A.sid#1", "A.sid", 1, 1, 2, 3, None, {"bpm": 100, "energy": .2}),
+        ("B.sid#1", "B.sid", 1, 2, 3, 4, None, {"bpm": 140, "energy": .8}),
+    ]
+    _sidflow_source_db(first_source, first_rows)
+    sf.slim_and_promote(first_source, live, _sidflow_manifest(len(first_rows)))
+    store = sf.SimilarityStore(live)
+    for _ in range(4):
+        assert store.status()["available"] is True
+    assert store.warm() == 2
+
+    second_source = tmp_path / "second.sqlite"
+    second_rows = [
+        ("C.sid#1", "C.sid", 1, 1, 3, 5, None, {"bpm": 90, "energy": .3}),
+        ("D.sid#1", "D.sid", 1, 2, 4, 6, None, {"bpm": 160, "energy": .9}),
+    ]
+    _sidflow_source_db(second_source, second_rows)
+    real_replace = sf.os.replace
+    blocked_once = {"value": False}
+
+    def force_ready_path(source, destination):
+        if ".building-" in Path(source).name and not blocked_once["value"]:
+            blocked_once["value"] = True
+            raise PermissionError(5, "Access is denied", str(source), str(destination))
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(sf.os, "replace", force_ready_path)
+    sf.slim_and_promote(
+        second_source, live, _sidflow_manifest(len(second_rows)),
+        promotion_lock=store.file_lock,
+    )
+    store.invalidate()
+    assert store.lookup("C.sid", 1)["track_id"] == "C.sid#1"
+    assert store.lookup("A.sid", 1) is None
+    assert blocked_once["value"] is True
+    assert not list(tmp_path.glob("*.ready-*"))
+
+
+def test_sidflow_stale_cleanup_warning_is_diagnostic_only(monkeypatch):
+    class LockedArtifact:
+        name = ".sidflow-similarity.sqlite.building-deadbeef"
+        def unlink(self):
+            raise PermissionError(5, "Access is denied", self.name)
+
+    previous_error = server.SIDFLOW_JOB.get("error", "")
+    previous_warned = set(server._SIDFLOW_STALE_WARNED)
+    server.SIDFLOW_JOB["error"] = ""
+    server._SIDFLOW_STALE_WARNED.clear()
+    before = len(server.DIAG_EVENTS)
+    monkeypatch.setattr(server, "_sidflow_stale_artifacts", lambda include_downloads=True: [LockedArtifact()])
+    warnings = server._sidflow_cleanup_stale_artifacts()
+    warnings_again = server._sidflow_cleanup_stale_artifacts()
+    assert warnings and warnings_again and "cleanup deferred" in warnings[0]
+    assert server.SIDFLOW_JOB["error"] == ""
+    assert len(server.DIAG_EVENTS) == before + 1
+    public = server._sidflow_public_status()
+    assert public["job"]["error"] == ""
+    server.SIDFLOW_JOB["error"] = previous_error
+    server._SIDFLOW_STALE_WARNED.clear()
+    server._SIDFLOW_STALE_WARNED.update(previous_warned)
+
+
+def test_sidflow_obsolete_local_vector_schema_requires_redownload(tmp_path: Path):
+    import sqlite3
+    import sidflow_similarity as sf
+    source = tmp_path / "source.sqlite"
+    live = tmp_path / "live.sqlite"
+    rows = [
+        ("A.sid#1", "A.sid", 1, 3, 3, 3, None, {"bpm": 100, "energy": .5}),
+        ("B.sid#1", "B.sid", 1, 3, 3, 3, None, {"bpm": 140, "energy": .9}),
+    ]
+    _sidflow_source_db(source, rows)
+    sf.slim_and_promote(source, live, _sidflow_manifest(len(rows)))
+    with closing(sqlite3.connect(live)) as conn, conn:
+        conn.execute("UPDATE meta SET value='obsolete' WHERE key='vector_schema_version'")
+    status = sf.SimilarityStore(live).status()
+    assert status["available"] is False
+    assert "re-download" in status["error"]
+
+
+
+def test_beta104_lazy_queue_lengths_resolve_by_hvsc_path_and_subsong(monkeypatch):
+    previous_lengths = dict(server.SONGLENGTHS_BY_PATH)
+    try:
+        server.SONGLENGTHS_BY_PATH.clear()
+        server.SONGLENGTHS_BY_PATH["musicians/h/hubbard_rob/delta.sid"] = [61.0, 142.5]
+        monkeypatch.setattr(server, "_configured_hvsc_root", lambda: "/USB0/HVSC")
+        item = server._juke_lazy_item(
+            "/usb0/hvsc/MUSICIANS/H/Hubbard_Rob/Delta.sid", "Delta.sid",
+            {"songs": 2, "start_song": 1, "title": "Delta", "md5": ""},
+        )
+        assert item["data"] is None and item["meta"]["md5"] == ""
+        assert server._juke_length(item, 1) == 61.0
+        assert server._juke_length(item, 2) == 142.5
+        item["song"] = 2
+        state_items = [{
+            "label": item["label"], "meta": item["meta"], "path": item["path"],
+            "song": item["song"], "similarity": None, "lazy": True,
+            "length": server._juke_length(item, item["song"]),
+        }]
+        assert state_items[0]["length"] == 142.5
+    finally:
+        server.SONGLENGTHS_BY_PATH.clear()
+        server.SONGLENGTHS_BY_PATH.update(previous_lengths)
+
+
+def test_beta104_queue_uses_full_length_heading_and_stop_ui_path():
+    static = Path(server.ASSETS) / "static"
+    html = (static / "index.html").read_text(encoding="utf-8")
+    js = (static / "app.js").read_text(encoding="utf-8")
+    assert 'role="columnheader">Length</div>' in js
+    assert 'role="columnheader">Len</div>' not in js
+    assert 'if(s==null||s==="")return"—"' in js
+    assert 'onclick="jkStop()"' in html
+    assert 'if(JK.pollBusy||JK.stopPending)return' in js
+    assert '"/api/juke/stop"' in js
+
+
+def test_command_socket_reset_uses_reset_opcode_without_coordinator():
+    sent = []
+    command = ultimate.CommandSocket.__new__(ultimate.CommandSocket)
+    command._send = lambda opcode, payload=b"": sent.append((opcode, payload))
+    command.reset()
+    assert sent == [(ultimate.CMD_RESET, b"")]
+
+
+def test_juke_stop_prefers_command_socket_and_uses_rest_as_fallback(monkeypatch):
+    previous = dict(server.JUKE)
+    calls = []
+
+    class FakeCommand:
+        def __init__(self, fail=False): self.fail = fail
+        def reset(self):
+            calls.append("cmd")
+            if self.fail:
+                raise RuntimeError("command socket unavailable")
+
+    class FakeRest:
+        def put(self, path, **kwargs):
+            calls.append(("rest", path, kwargs))
+            return {}
+
+    monkeypatch.setattr(server, "_matrix_release_all", lambda **kwargs: calls.append("release"))
+    monkeypatch.setattr(server, "rest", FakeRest())
+    try:
+        server.JUKE.update({"items": [], "index": -1, "playing": True,
+                            "stop_after_current": False, "timer": None})
+        monkeypatch.setattr(server, "cmd", FakeCommand())
+        server.juke_stop()
+        assert calls == ["cmd", "release"]
+
+        calls.clear()
+        server.JUKE["playing"] = True
+        monkeypatch.setattr(server, "cmd", FakeCommand(fail=True))
+        server.juke_stop()
+        assert calls[0:2] == ["cmd", "release"]
+        assert calls[2][0:2] == ("rest", "/v1/machine:reset")
+        assert calls[2][2]["request_timeout"] == 4.0
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+
+def test_beta103_individual_sid_play_and_queue_controls_are_explicit():
+    static = Path(server.ASSETS) / "static"
+    html = (static / "index.html").read_text(encoding="utf-8")
+    js = (static / "app.js").read_text(encoding="utf-8")
+    assert 'onclick="jkClearQueue()"' in html
+    assert 'title="clear queued tunes, turn Radio off and let the current SID finish"' in html
+    assert 'async function jkClearQueue()' in js
+    assert '"/api/juke/clear"' in js
+    assert 'if(!removeCount&&!s.radio)' in js
+    assert 'playing as a one-tune queue' in js
+    # Individual playback must no longer follow play_path with a hidden folder load.
+    play_from = js.split("async function jkPlayFrom(folder,name){", 1)[1].split(
+        "async function jkPlay(i,song)", 1
+    )[0]
+    assert '"/api/juke/play_path"' in play_from
+    assert '"/api/juke/folder"' not in play_from
+    assert 'title="play only this tune now"' in js
+    assert 'title="add only this tune to the current play queue' in js
+
+
+def test_juke_clear_disarms_radio_and_preserves_current_playback():
+    class FakeTimer:
+        def __init__(self): self.cancelled = False
+        def cancel(self): self.cancelled = True
+
+    previous = dict(server.JUKE)
+    previous_played = set(server.JUKE_PLAYED)
+    previous_recent = list(server.JUKE_RECENT_TRACKS)
+    timer = FakeTimer()
+    try:
+        items = [
+            server._juke_lazy_item("/HVSC/A.sid", "A.sid"),
+            server._juke_lazy_item("/HVSC/B.sid", "B.sid"),
+            server._juke_lazy_item("/HVSC/C.sid", "C.sid"),
+        ]
+        server.JUKE.clear(); server.JUKE.update({
+            "items": items, "index": 1, "playing": True, "shuffle": False,
+            "radio": True, "song": 1, "timer": timer, "folder": "composer",
+            "loading": False, "source": "test", "generation": 0,
+        })
+        server.JUKE_PLAYED.clear(); server.JUKE_PLAYED.add("played#1")
+        server.JUKE_RECENT_TRACKS.clear(); server.JUKE_RECENT_TRACKS.append("recent#1")
+        out = server.juke_clear()
+        assert out["cleared"] == 2 and out["kept_current"] is True
+        assert [item["label"] for item in server.JUKE["items"]] == ["B.sid"]
+        assert server.JUKE["index"] == 0 and server.JUKE["playing"] is True
+        assert server.JUKE["radio"] is False and server.JUKE["timer"] is timer
+        assert server.JUKE["stop_after_current"] is True
+        assert timer.cancelled is False
+        assert not server.JUKE_PLAYED and not server.JUKE_RECENT_TRACKS
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+        server.JUKE_PLAYED.clear(); server.JUKE_PLAYED.update(previous_played)
+        server.JUKE_RECENT_TRACKS.clear(); server.JUKE_RECENT_TRACKS.extend(previous_recent)
+
+
+
+
+
+def test_juke_clear_timer_stops_instead_of_restarting_single_sid(monkeypatch):
+    previous = dict(server.JUKE)
+    calls = []
+    monkeypatch.setattr(server, "juke_stop", lambda: calls.append("stop"))
+    monkeypatch.setattr(server, "_juke_play", lambda index: calls.append(("play", index)))
+    try:
+        server.JUKE.clear(); server.JUKE.update({
+            "items": [server._juke_lazy_item("/HVSC/A.sid", "A.sid")],
+            "index": 0, "playing": True, "shuffle": False, "radio": False,
+            "song": 1, "timer": None, "folder": "Current tune", "loading": False,
+            "source": "test", "generation": 0, "stop_after_current": True,
+        })
+        server._juke_auto_next()
+        assert calls == ["stop"]
+        assert server.JUKE["stop_after_current"] is False
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+def test_more_like_this_inserts_after_current_while_radio_appends(monkeypatch):
+    previous = dict(server.JUKE)
+    recs = [
+        server._juke_lazy_item("/HVSC/R1.sid", "R1.sid"),
+        server._juke_lazy_item("/HVSC/R2.sid", "R2.sid"),
+    ]
+    monkeypatch.setattr(server, "_sidflow_recommendations", lambda *a, **k: (
+        [dict(item) for item in recs], {"track_id": "seed.sid#1"}
+    ))
+    try:
+        base = [
+            server._juke_lazy_item("/HVSC/A.sid", "A.sid"),
+            server._juke_lazy_item("/HVSC/B.sid", "B.sid"),
+            server._juke_lazy_item("/HVSC/C.sid", "C.sid"),
+        ]
+        server.JUKE.clear(); server.JUKE.update({
+            "items": base, "index": 1, "playing": True, "shuffle": False,
+            "radio": False, "song": 1, "timer": None, "folder": "folder",
+            "loading": False, "source": "test", "generation": 0,
+        })
+        out = server._sidflow_append("/HVSC/B.sid", 1, insert_after=1)
+        assert out["inserted_at"] == 2
+        assert [item["label"] for item in server.JUKE["items"]] == [
+            "A.sid", "B.sid", "R1.sid", "R2.sid", "C.sid"
+        ]
+        assert server.JUKE["index"] == 1
+
+        base2 = [
+            server._juke_lazy_item("/HVSC/A.sid", "A.sid"),
+            server._juke_lazy_item("/HVSC/B.sid", "B.sid"),
+            server._juke_lazy_item("/HVSC/C.sid", "C.sid"),
+        ]
+        server.JUKE["items"] = base2
+        server.JUKE["index"] = 1
+        out = server._sidflow_append("/HVSC/B.sid", 1, radio=True, insert_after=1)
+        assert out["inserted_at"] == 3
+        assert [item["label"] for item in server.JUKE["items"]][-2:] == ["R1.sid", "R2.sid"]
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+def test_readme_has_canonical_screenshots_and_three_tier_quick_start():
+    readme = (Path(server.ROOT) / "README.md").read_text(encoding="utf-8")
+    screenshots = readme.index("## Screenshots")
+    quick = readme.index("## Quick start")
+    mount = readme.index("## Mount safety modes")
+    assert screenshots < quick < mount
+    for image in (
+        "docs/screen-tab.png", "docs/storage-search.png", "docs/jukebox.png",
+        "docs/favourites.png", "docs/assembly64.png",
+    ):
+        assert image in readme
+    assert '*SID Jukebox: instant search across the entire HVSC, one-click playback through the machine\'s own audio — plus "More like this" and Radio mode powered by SIDFlow similarity data (Chris Gleissner), with persistent play queues.*' in readme
+    section = readme[quick:mount]
+    tier1 = section.index("### Tier 1 — Windows, no Python")
+    tier2 = section.index("### Tier 2 — Windows from source")
+    tier3 = section.index("### Tier 3 — Anywhere else (or by hand)")
+    assert tier1 < tier2 < tier3
+    assert "https://github.com/zildac/u64deck/releases/latest" in section
+    assert "u64deck.exe" in section and "needs no Python installation" in section
+    assert "Windows SmartScreen" in section and "SHA-256" in section
+    assert "double-click `start.bat` (installs dependencies on first run" in section
+    assert "pip install -r requirements.txt\npython server.py" in section
+    assert "which u64deck **creates and updates by itself**" in section
+    assert "Always run u64deck as a normal user, and always the same way" in section
+    assert readme.index("### Standalone .exe (no Python needed)") > quick
+    assert readme.index("### Publishing / releases") > quick
+
+
+def test_sidflow_help_explains_radio_queue_and_local_privacy():
+    help_js = (Path(server.ASSETS) / "static" / "help_content.js").read_text(encoding="utf-8")
+    for text in (
+        "Selecting an individual search or browser result now creates a one-tune queue",
+        "Clear Queue always disarms Radio first",
+        "inserts the results immediately after the currently playing tune",
+        "A session-level played set prevents repeats",
+        "does not upload listening activity",
+        "Powered by SIDFlow (Chris Gleissner)",
+    ):
+        assert text in help_js

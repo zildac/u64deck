@@ -6,7 +6,7 @@ import hashlib
 from pathlib import Path
 
 VERSION = "1.8.0"
-RELEASE_LABEL = "Public Beta 9"
+RELEASE_LABEL = "Public Beta 10.4"
 
 
 def build_id(asset_root: Path, source_root: Path) -> str:

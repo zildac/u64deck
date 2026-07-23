@@ -61,10 +61,10 @@ function tab(name){
   document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("active",b.dataset.tab===name));
   document.querySelectorAll("section").forEach(s=>s.classList.toggle("active",s.id==="tab-"+name));
   if(name==="home")itemsLoad();
-  if(name==="settings"&&!SET.loaded)loadCats();
+  if(name==="settings"){if(!SET.loaded)loadCats();sidflowStatusLoad()}
   if(name==="disks"&&!FS.loaded){fsGo("/");refreshDrives()}
   if(name==="asm64")asmFormInit();
-  if(name==="sid"){jkRefresh();jkPollStart();jkSidIndexInit();
+  if(name==="sid"){jkRefresh();jkPollStart();jkSidIndexInit();sidflowStatusLoad();
     // (re)browse whenever the folder list isn't populated — a failed first
     // attempt (device busy, FTP hiccup) must not leave the browser dead
     if(!document.querySelector("#jkBDirs button:not([data-retry])")&&!JK.homing){jkHome()}}
@@ -1972,9 +1972,10 @@ async function queueLocalArm(){
 }
 
 /* ---------- SID jukebox ---------- */
-let JK={state:null,poll:null,pollBusy:false,listSignature:""};
+let JK={state:null,poll:null,pollBusy:false,stopPending:false,listSignature:""};
+const SIDFLOWUI={status:null,poll:null};
 const SIDIDX={poll:null,volumes:[],volumesLoaded:false,last:null};
-function fmtLen(s){if(s==null)return"";const m=Math.floor(s/60),x=Math.round(s%60);
+function fmtLen(s){if(s==null||s==="")return"—";const m=Math.floor(s/60),x=Math.round(s%60);
   return m+":"+String(x).padStart(2,"0")}
 function sidChipKind(meta){
   const m=meta||{},chip=String(m.chip||"").trim().toLowerCase();
@@ -1998,7 +1999,7 @@ function jkAudioSync(){
 function jkListSignature(s){
   return JSON.stringify([s.folder||"",s.source||"",!!s.loading,(s.items||[]).map(it=>[
     it.path||"",it.label||"",it.lazy?1:0,it.meta?.name||"",it.meta?.author||"",
-    it.meta?.chip||"",it.meta?.songs||1,it.length??null])]);
+    it.meta?.chip||"",it.meta?.songs||1,it.song||1,it.similarity??null,it.length??null])]);
 }
 
 function jkNowFavouriteSync(n){
@@ -2031,6 +2032,11 @@ function jkRender(s){
   }else $("#jkNow").textContent=s.playing?"":"stopped";
   jkNowFavouriteSync(n);
   $("#jkShuffle").checked=!!s.shuffle;
+  $("#jkRadio").checked=!!s.radio;
+  const moreNow=$("#jkMoreNow");
+  moreNow.style.display=n&&n.path?"inline-block":"none";
+  moreNow.disabled=!n||!n.path;
+  $("#jkSidflowCredit").classList.toggle("hint",!(s.sidflow||{}).available);
   $("#jkSlInfo").textContent=s.songlengths_loaded
     ?`Songlengths loaded (${s.songlengths_loaded} entries) — accurate auto-advance`
     :"No Songlengths.md5 configured — auto-advance uses sid_default_secs (config.json)";
@@ -2060,23 +2066,23 @@ function jkRender(s){
       const m=it.meta||{},author=String(m.author||""),released=String(m.released||"");
       const compactMeta=[singleAuthor?"":author,released].filter(Boolean).join(" · ");
       const authorCell=singleAuthor?"":`<div class="jkq-cell jkq-author" role="cell">${esc(author)}</div>`;
-      return `<div class="jkq-row" role="row" data-juke-index="${i}" onclick="jkPlay(${i})">
+      return `<div class="jkq-row" role="row" data-juke-index="${i}" onclick="jkPlay(${i},${Number(it.song||0)})">
         <div class="jkq-cell jkq-index" role="cell">${i+1}</div>
-        <div class="jkq-cell jkq-title" role="cell">${esc(m.name||it.label)}${it.lazy?' <span class="hint">· loads when played</span>':""}<div class="jkq-submeta">${esc(compactMeta)}</div></div>
+        <div class="jkq-cell jkq-title" role="cell">${esc(m.name||it.label)}${it.similarity!=null?` <span class="jkq-similarity" title="SIDFlow cosine similarity">${Math.round(Number(it.similarity)*100)}% match</span>`:""}${it.lazy?' <span class="hint">· loads when played</span>':""}<div class="jkq-submeta">${esc(compactMeta)}${it.song&&m.songs>1?` · song ${it.song}`:""}</div></div>
         ${authorCell}<div class="jkq-cell jkq-chip" role="cell">${sidChipBadge(m)}</div>
         <div class="jkq-cell jkq-released hint" role="cell">${esc(released)}</div>
         <div class="jkq-cell jkq-length" role="cell">${fmtLen(it.length)}</div>
-        <div class="jkq-cell jkq-actions" role="cell">${it.path?starButton(itemSpec("sid",m.name||it.label,it.path,"sid_play",{folder:parentPath(it.path),name:it.path.split("/").pop()})):""}
+        <div class="jkq-cell jkq-actions" role="cell">${it.path?`<button class="mini" onclick="event.stopPropagation();jkMoreLike(${i})" title="insert similar SIDFlow tunes after the current tune">♪</button>`:""}${it.path?starButton(itemSpec("sid",m.name||it.label,it.path,"sid_play",{folder:parentPath(it.path),name:it.path.split("/").pop()})):""}
           <button class="mini" onclick="event.stopPropagation();jkRemove(${i})" title="remove from play queue">✕</button></div></div>`;
     }).join("");
     $("#jkList").innerHTML=`<div class="jkq-grid ${singleAuthor?"single-author":""}" role="rowgroup">
-      <div class="jkq-row jkq-head" role="row"><div class="jkq-cell" role="columnheader">#</div><div class="jkq-cell" role="columnheader">Title</div>${authorHead}<div class="jkq-cell" role="columnheader">Chip</div><div class="jkq-cell jkq-released" role="columnheader">Released</div><div class="jkq-cell" role="columnheader">Len</div><div class="jkq-cell" role="columnheader"></div></div>${rows}</div>`;
+      <div class="jkq-row jkq-head" role="row"><div class="jkq-cell" role="columnheader">#</div><div class="jkq-cell" role="columnheader">Title</div>${authorHead}<div class="jkq-cell" role="columnheader">Chip</div><div class="jkq-cell jkq-released" role="columnheader">Released</div><div class="jkq-cell" role="columnheader">Length</div><div class="jkq-cell" role="columnheader"></div></div>${rows}</div>`;
   }
   document.querySelectorAll("#jkList [data-juke-index]").forEach(row=>row.classList.toggle("sel",+row.dataset.jukeIndex===s.index));
 }
 
 async function jkRefresh(){
-  if(JK.pollBusy)return;JK.pollBusy=true;
+  if(JK.pollBusy||JK.stopPending)return;JK.pollBusy=true;
   try{jkRender(await api("/api/juke",{timeoutMs:5000}))}catch(e){}
   finally{JK.pollBusy=false}
 }
@@ -2109,7 +2115,9 @@ async function jkBrowse(path){
     const sids=sidNames.length;
     $("#jkBCount").textContent=sids?`— ${sids} SID${sids>1?"s":""} here`:"";
     $("#jkBLoad").style.display=sids?"inline-block":"none";
-    const loadedHere=(JK.state&&String(JK.state.folder||"").toLowerCase()===JKB.path.toLowerCase());
+    const folderQueueSources=new Set(["SQLite index","Ultimate folder"]);
+    const loadedHere=(JK.state&&folderQueueSources.has(String(JK.state.source||""))&&
+      String(JK.state.folder||"").toLowerCase()===JKB.path.toLowerCase());
     $("#jkBDirs").innerHTML=(dirs.length?dirs.map(d=>{
       const path=(JKB.path==="/"?"":JKB.path)+"/"+d.name;
       const fav=itemSpec("sid_folder",d.name,path,"sid_folder",{path});
@@ -2122,8 +2130,9 @@ async function jkBrowse(path){
           const path=(JKB.path==="/"?"":JKB.path)+"/"+n;
           const fav=itemSpec("sid",n.replace(/\.sid$/i,""),path,"sid_play",{folder:JKB.path,name:n});
           return `<span style="display:inline-flex;align-items:center;margin-right:10px">
-            <a style="cursor:pointer" title="load this folder and play this tune"
-              onclick="jkPlayFrom('${jsq(JKB.path)}','${jsq(n)}')">♪ ${esc(n.replace(/\.sid$/i,""))}</a>${starButton(fav)}</span>`;
+            <a style="cursor:pointer" title="play only this tune now"
+              onclick="jkPlayFrom('${jsq(JKB.path)}','${jsq(n)}')">♪ ${esc(n.replace(/\.sid$/i,""))}</a>
+              <button class="mini" onclick="jkAdd('${jsq(JKB.path)}','${jsq(n)}')" title="add only this tune to the current play queue">＋</button>${starButton(fav)}</span>`;
         }).join("")+
         (sids>60?` …and ${sids-60} more`:"")+
         (loadedHere?' <span class="badge ok">this folder is the current play queue</span>':"")+
@@ -2188,13 +2197,13 @@ async function jkSearchGo(){
     $("#jkSearchList").innerHTML=r.results.map(h=>{
       const m=h.meta||{},title=m.name||h.name.replace(/\.sid$/i,"");
       return `<div class="hitrow" onclick="jkPlayFrom('${jsq(h.folder)}','${jsq(h.name)}')"
-         title="click to load that folder as the play queue and play this tune">
+         title="play only this tune now">
         <span style="flex:0 0 auto">▶</span>
         <span style="min-width:170px"><b>${esc(title)}</b>${m.author?`<br><span class="hint">${esc(m.author)}</span>`:""}</span>
         <span style="white-space:nowrap">${jkSidBadges(m)}</span>
         <span class="hint" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(h.rel.slice(0,h.rel.lastIndexOf("/")))}</span>
         ${starButton(itemSpec("sid",title,h.path,"sid_play",{folder:h.folder,name:h.name}))}
-        <button class="mini" onclick="event.stopPropagation();jkAdd('${jsq(h.folder)}','${jsq(h.name)}')" title="append to the current play queue without interrupting playback">＋</button>
+        <button class="mini" onclick="event.stopPropagation();jkAdd('${jsq(h.folder)}','${jsq(h.name)}')" title="add only this tune to the current play queue without interrupting playback">＋</button>
         <button class="mini" onclick="event.stopPropagation();jkBrowse('${jsq(h.folder)}')">📁 folder</button></div>`}).join("");
   }catch(e){$("#jkSearchList").innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`}}
 
@@ -2363,31 +2372,117 @@ async function jkRemove(i){
   try{jkRender(await api("/api/juke/remove",{method:"POST",
     headers:{"Content-Type":"application/json"},body:JSON.stringify({index:i})}))}
   catch(e){toast(e.message,"err")}}
+async function jkClearQueue(){
+  const s=JK.state||{},items=s.items||[];
+  const keepCurrent=!!(s.playing&&s.index>=0&&s.index<items.length);
+  const removeCount=Math.max(0,items.length-(keepCurrent?1:0));
+  if(!removeCount&&!s.radio){toast(keepCurrent?"no queued tunes behind the current SID":"play queue is already empty","ok");return}
+  if(removeCount>1&&!confirm(`Clear ${removeCount} queued tunes?\n\n${keepCurrent?"The current SID will continue playing and Radio will be turned off.":"Radio will be turned off."}`))return;
+  try{const out=await api("/api/juke/clear",{method:"POST"});jkRender(out);
+    toast(out.cleared?
+      (out.kept_current?`Cleared ${out.cleared} queued tunes — current SID will stop at its normal end`:`Play queue cleared (${out.cleared} tunes)`):
+      "Radio is off — current SID will stop at its normal end","ok")}
+  catch(e){toast(e.message,"err")}}
 async function jkPlayFrom(folder,name){
   try{
-    // 1) instant gratification: fetch + play just this tune
-    const s1=await api("/api/juke/play_path",{method:"POST",
+    const path=(folder==="/"?"":folder)+"/"+name;
+    const s=await api("/api/juke/play_path",{method:"POST",
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({path:(folder==="/"?"":folder)+"/"+name}),timeoutMs:20000});
-    jkRender(s1);
-    rememberRecent(itemSpec("sid",s1.now?.meta?.name||name,(folder==="/"?"":folder)+"/"+name,"sid_play",{folder,name}));
-    toast("♪ "+(s1.now?.meta?.name||name)+" — loading the rest of the folder…","ok");
-    // 2) background: load the full folder; server keeps this tune playing
-    const s2=await api("/api/juke/folder",{method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({path:folder}),timeoutMs:25000});
-    jkRender(s2);
-    toast(s2.items.length+" tunes in play queue"+(s2.skipped?` (${s2.skipped} skipped)`:"")+" ✓","ok");
+      body:JSON.stringify({path}),timeoutMs:20000});
+    jkRender(s);
+    rememberRecent(itemSpec("sid",s.now?.meta?.name||name,path,"sid_play",{folder,name}));
+    toast("♪ "+(s.now?.meta?.name||name)+" — playing as a one-tune queue","ok");
   }catch(e){toast(e.message,"err")}}
 async function jkPlay(i,song){try{
   jkRender(await put("/api/juke/play?index="+i+(song?"&song="+song:""),{timeoutMs:20000}))}
   catch(e){toast(e.message,"err")}}
 function jkPlayCurrent(){jkPlay(Math.max(0,(JK.state||{}).index||0))}
 function jkPlaySong(s){if(JK.state&&JK.state.index>=0)jkPlay(JK.state.index,+s)}
+async function jkStop(){
+  if(JK.stopPending)return;
+  JK.stopPending=true;
+  // Make the controls respond immediately while the low-latency reset packet
+  // is sent. Suppress the periodic refresh until the authoritative response
+  // arrives so an older playing snapshot cannot flash back into the UI.
+  if(JK.state){JK.state={...JK.state,playing:false};jkRender(JK.state)}
+  try{jkRender(await put("/api/juke/stop",{timeoutMs:6000}))}
+  catch(e){toast(e.message,"err")}
+  finally{JK.stopPending=false}
+}
 async function jk(a){try{jkRender(await put("/api/juke/"+a))}catch(e){toast(e.message,"err")}}
 async function jkShuffleSet(){try{
   jkRender(await put("/api/juke/shuffle?on="+($("#jkShuffle").checked?"true":"false")))}
   catch(e){toast(e.message,"err")}}
+
+function sidflowBytes(n){
+  n=Number(n||0);if(!n)return "0 B";const units=["B","KiB","MiB","GiB"];let i=0;
+  while(n>=1024&&i<units.length-1){n/=1024;i++}return (i? n.toFixed(n>=100?0:n>=10?1:2):String(Math.round(n)))+" "+units[i]
+}
+function sidflowStatusRender(s){
+  SIDFLOWUI.status=s;const out=$("#sidflowStatus"),bar=$("#sidflowProgress"),dl=$("#sidflowDownloadBtn"),rm=$("#sidflowRemoveBtn");
+  if(!out)return;
+  const j=s.job||{};
+  if(j.running){
+    const stage=String(j.stage||"working"),done=stage==="downloading"?Number(j.downloaded||0):Number(j.processed||0),total=stage==="downloading"?Number(j.total||0):Number(j.process_total||0);
+    out.textContent=(j.message||"Preparing SIDFlow data…")+(total?` — ${Math.round(done*100/total)}%`:": "+stage);
+    bar.style.display="block";if(total){bar.max=total;bar.value=done}else{bar.removeAttribute("value")}
+    dl.disabled=true;dl.textContent="SIDFlow download in progress…";rm.style.display="none";
+    if(!SIDFLOWUI.poll)SIDFLOWUI.poll=setInterval(sidflowStatusLoad,1000);
+    return;
+  }
+  if(SIDFLOWUI.poll){clearInterval(SIDFLOWUI.poll);SIDFLOWUI.poll=null}
+  bar.style.display="none";bar.value=0;dl.disabled=false;
+  if(s.available){
+    const schema=s.schema_version?` · ${s.schema_version}`:"",generated=s.generated_at?` · export ${s.generated_at}`:"",profile=s.export_profile?` · ${s.export_profile} profile`:"",release=s.release_tag?` · ${s.release_tag}`:"";
+    const warning=s.quality_warning?` · ⚠ ${s.quality_warning}`:"";
+    out.textContent=`Ready — ${Number(s.tracks||0).toLocaleString()} tracks · ${sidflowBytes(s.bytes)}${schema}${profile}${release}${generated}${warning}`;
+    dl.textContent="Re-download Similarity Data";rm.style.display="inline-block";
+  }else{
+    const issue=j.error||s.error||"";
+    out.textContent=issue?`Not available — ${issue}`:"Not downloaded — More like this and Radio will offer to install it.";
+    dl.textContent=s.bytes?"Re-download Similarity Data":"Download Similarity Data";rm.style.display=s.bytes?"inline-block":"none";
+  }
+}
+async function sidflowStatusLoad(){
+  try{const s=await api("/api/sidflow/status",{timeoutMs:5000});sidflowStatusRender(s);return s}catch(e){
+    if($("#sidflowStatus"))$("#sidflowStatus").textContent="SIDFlow status unavailable: "+e.message;return null}
+}
+async function sidflowDownload(skipConfirm=false){
+  if(!skipConfirm&&!confirm("Download the latest SIDFlow similarity export?\n\nThe full source may be several hundred MB, is checksum-verified, slimmed to a compact local database, and then deleted."))return false;
+  try{const s=await api("/api/sidflow/download",{method:"POST",timeoutMs:10000});sidflowStatusRender(s);toast("SIDFlow similarity download started","ok");return true}
+  catch(e){toast(e.message,"err");return false}
+}
+async function sidflowRemove(){
+  if(!confirm("Remove the local SIDFlow similarity database?\n\nThe SID Jukebox and your HVSC files are not affected."))return;
+  try{const s=await api("/api/sidflow",{method:"DELETE"});sidflowStatusRender(s);toast("SIDFlow similarity data removed","ok")}
+  catch(e){toast(e.message,"err")}
+}
+async function sidflowEnsure(){
+  const s=await sidflowStatusLoad();
+  if(s?.available&&!s?.quality_warning)return true;
+  if(s?.quality_warning){toast(s.quality_warning,"err");tab("settings");return false}
+  if(s?.job?.running){toast("SIDFlow similarity data is still being prepared","ok");tab("settings");return false}
+  if(confirm("More like this and Radio use SIDFlow similarity data by Chris Gleissner.\n\nDownload and prepare it now?")){
+    await sidflowDownload(true);tab("settings");
+  }
+  return false;
+}
+async function jkMoreLike(index=null){
+  if(!await sidflowEnsure())return;
+  const i=index==null?Number((JK.state||{}).index):Number(index);
+  if(i<0){toast("choose a tune first","err");return}
+  try{const s=await api("/api/juke/more_like",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({index:i,limit:20}),timeoutMs:10000});jkRender(s);
+    toast(`♪ ${s.added||0} SIDFlow matches inserted after the current tune — thanks Chris!`,"ok")}
+  catch(e){toast(e.message,"err")}
+}
+async function jkRadioSet(){
+  const box=$("#jkRadio"),on=!!box.checked;
+  if(on&&!await sidflowEnsure()){box.checked=false;return}
+  try{const s=await put("/api/juke/radio?on="+(on?"true":"false"),{timeoutMs:10000});jkRender(s);
+    toast(on?"📻 SIDFlow Radio is on":"SIDFlow Radio is off","ok")}
+  catch(e){box.checked=!on;toast(e.message,"err")}
+}
 
 /* ---------- quick launch library ---------- */
 async function qlRefresh(){

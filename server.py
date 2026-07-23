@@ -41,6 +41,13 @@ from index_migration import STABLE_INDEX_NAME, prepare_stable_index
 from local_indexer import (list_local_volumes, normalise_ultimate_root,
                            resolve_source, scan_local_tree, volume_identity)
 from sid_indexer import SID_HEADER_BYTES, scan_local_sid_tree
+from sidflow_similarity import (CHECKSUMS as SIDFLOW_CHECKSUMS, FULL_MANIFEST as SIDFLOW_FULL_MANIFEST,
+                                FULL_SQLITE as SIDFLOW_FULL_SQLITE, LATEST_DOWNLOAD_BASE as SIDFLOW_DOWNLOAD_BASE,
+                                LATEST_RELEASE_API as SIDFLOW_RELEASE_API, MOBILE_MANIFEST as SIDFLOW_MOBILE_MANIFEST,
+                                MOBILE_SQLITE as SIDFLOW_MOBILE_SQLITE, SCHEMA_VERSION as SIDFLOW_SCHEMA,
+                                SimilarityStore, build_track_id as sidflow_track_id,
+                                normalise_hvsc_relative, parse_sha256sums, sha256_file,
+                                slim_and_promote, validate_manifest)
 from release import VERSION, RELEASE_LABEL, build_id
 from state_io import (read_json as _read_json, warn_throttled as _warn_throttled,
                       write_json_atomic as _write_json_atomic)
@@ -3229,9 +3236,71 @@ import hashlib
 import threading as _threading
 
 JUKE = {"items": [], "index": -1, "playing": False, "shuffle": False,
-        "song": 0, "timer": None, "folder": "", "loading": False,
-        "source": "", "generation": 0}
+        "radio": False, "song": 0, "timer": None, "folder": "", "loading": False,
+        "source": "", "generation": 0, "stop_after_current": False}
+JUKE_PLAYED: set[str] = set()
+JUKE_RECENT_TRACKS = deque(maxlen=80)
+SIDFLOW_DB_PATH = ROOT / ".sidflow-similarity.sqlite"
+SIDFLOW_STORE = SimilarityStore(SIDFLOW_DB_PATH)
+SIDFLOW_PRESENT_CACHE = {"signature": None, "paths": {}}
+SIDFLOW_JOB = {
+    "running": False, "stage": "idle", "downloaded": 0, "total": 0,
+    "processed": 0, "process_total": 0, "message": "", "error": "",
+    "started": 0.0, "completed": "", "asset": "", "release": "",
+}
+SIDFLOW_LOCK = threading.RLock()
+SIDFLOW_THREAD = None
+_SIDFLOW_STALE_WARNED: set[str] = set()
+# Interrupted downloads/builds are restartable rather than resumable. Stale
+# artifacts are diagnostic-only: a locked remnant must never become the current
+# user-visible import error or block the unique build path used by a new run.
+def _sidflow_stale_artifacts(include_downloads: bool = True) -> list[Path]:
+    paths: list[Path] = []
+    if include_downloads:
+        paths.extend([
+            ROOT / ".sidflow-source.sqlite.download",
+            ROOT / ".sidflow-manifest.json.download",
+            ROOT / ".sidflow-SHA256SUMS.download",
+        ])
+    paths.extend(ROOT.glob(SIDFLOW_DB_PATH.name + ".building*"))
+    paths.extend(ROOT.glob(SIDFLOW_DB_PATH.name + ".ready-*"))
+    # Preserve order while de-duplicating on case-insensitive Windows paths.
+    seen = set()
+    out = []
+    for path in paths:
+        key = str(path).casefold()
+        if key not in seen:
+            seen.add(key); out.append(path)
+    return out
+
+
+def _sidflow_cleanup_stale_artifacts(include_downloads: bool = True) -> list[str]:
+    """Best-effort cleanup that never becomes the current import error.
+
+    Windows antivirus/indexers can retain a handle to an interrupted build. A
+    new import uses a unique build name, so cleanup is diagnostic only. Report
+    each still-locked path once until it is eventually removed.
+    """
+    warnings = []
+    for path in _sidflow_stale_artifacts(include_downloads):
+        key = str(getattr(path, "name", path)).casefold()
+        try:
+            path.unlink()
+            _SIDFLOW_STALE_WARNED.discard(key)
+        except FileNotFoundError:
+            _SIDFLOW_STALE_WARNED.discard(key)
+            continue
+        except OSError as exc:
+            message = f"SIDFlow stale artifact cleanup deferred for {path.name}: {exc}"
+            warnings.append(message)
+            if key not in _SIDFLOW_STALE_WARNED:
+                _SIDFLOW_STALE_WARNED.add(key)
+                _diag_event("warning", message)
+    return warnings
+
+_sidflow_cleanup_stale_artifacts()
 SONGLENGTHS = {}          # md5 -> [seconds per subsong]
+SONGLENGTHS_BY_PATH = {}  # casefolded HVSC-relative path -> [seconds per subsong]
 SL_STATE = {"state": "idle"}   # idle | loading | ready | empty | error
 HVSC_INDEX = []           # [(lowercase rel path, rel path)] from Songlengths
 
@@ -3262,6 +3331,212 @@ SID_INDEX_JOB = {
 _SID_INDEX_LOCK = threading.RLock()
 _SID_INDEX_PAUSE = threading.Condition(_SID_INDEX_LOCK)
 _SID_INDEX_THREAD = None
+
+
+def _sidflow_job_update(**values) -> None:
+    with SIDFLOW_LOCK:
+        SIDFLOW_JOB.update(values)
+
+
+def _sidflow_public_status() -> dict:
+    status = SIDFLOW_STORE.status()
+    with SIDFLOW_LOCK:
+        job = dict(SIDFLOW_JOB)
+    if job.get("running"):
+        elapsed = max(0.0, time.monotonic() - float(job.get("started") or 0.0))
+    else:
+        elapsed = 0.0
+    job["elapsed"] = round(elapsed, 1)
+    status.update({"job": job, "schema_required": SIDFLOW_SCHEMA,
+                   "attribution": "Powered by SIDFlow (Chris Gleissner)"})
+    return status
+
+
+def _sidflow_asset_plan(client: httpx.Client) -> dict:
+    """Resolve the latest full export containing perceptual features."""
+    assets = {}
+    tag = "latest"
+    published = ""
+    try:
+        response = client.get(SIDFLOW_RELEASE_API)
+        response.raise_for_status()
+        release = response.json()
+        tag = str(release.get("tag_name") or "latest")
+        published = str(release.get("published_at") or "")
+        assets = {
+            str(item.get("name") or ""): str(item.get("browser_download_url") or "")
+            for item in release.get("assets", []) if item.get("name")
+        }
+    except Exception:
+        # Stable latest/download URLs are the documented fallback and also
+        # avoid making the feature depend on GitHub's unauthenticated API quota.
+        assets = {}
+
+    # The current mobile profile omits features_json, which is required for
+    # musically useful recommendations. Prefer the full export until a future
+    # mobile manifest explicitly advertises the same perceptual feature payload.
+    candidates = [(SIDFLOW_FULL_SQLITE, SIDFLOW_FULL_MANIFEST, "full")]
+    for sqlite_name, manifest_name, profile in candidates:
+        if assets and sqlite_name not in assets:
+            continue
+        if assets and manifest_name not in assets:
+            continue
+        return {
+            "sqlite_name": sqlite_name,
+            "manifest_name": manifest_name,
+            "profile": profile,
+            "sqlite_url": assets.get(sqlite_name) or f"{SIDFLOW_DOWNLOAD_BASE}/{sqlite_name}",
+            "manifest_url": assets.get(manifest_name) or f"{SIDFLOW_DOWNLOAD_BASE}/{manifest_name}",
+            "checksums_url": assets.get(SIDFLOW_CHECKSUMS) or f"{SIDFLOW_DOWNLOAD_BASE}/{SIDFLOW_CHECKSUMS}",
+            "tag": tag, "published_at": published,
+        }
+    # No mobile/full pair was visible in the release listing. Fall back to the
+    # stable full names; schema validation still prevents an unsafe import.
+    return {
+        "sqlite_name": SIDFLOW_FULL_SQLITE,
+        "manifest_name": SIDFLOW_FULL_MANIFEST,
+        "profile": "full",
+        "sqlite_url": f"{SIDFLOW_DOWNLOAD_BASE}/{SIDFLOW_FULL_SQLITE}",
+        "manifest_url": f"{SIDFLOW_DOWNLOAD_BASE}/{SIDFLOW_FULL_MANIFEST}",
+        "checksums_url": f"{SIDFLOW_DOWNLOAD_BASE}/{SIDFLOW_CHECKSUMS}",
+        "tag": tag, "published_at": published,
+    }
+
+
+def _sidflow_download_file(client: httpx.Client, url: str, target: Path) -> int:
+    """Stream one release asset to disk while updating UI progress."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    downloaded = 0
+    with client.stream("GET", url) as response:
+        response.raise_for_status()
+        total = int(response.headers.get("content-length") or 0)
+        _sidflow_job_update(stage="downloading", downloaded=0, total=total,
+                            message="Downloading SIDFlow similarity export…")
+        with target.open("wb") as fh:
+            for chunk in response.iter_bytes(1024 * 1024):
+                if not chunk:
+                    continue
+                fh.write(chunk)
+                downloaded += len(chunk)
+                _sidflow_job_update(downloaded=downloaded, total=total)
+    return downloaded
+
+
+def _sidflow_import_worker() -> None:
+    download = ROOT / ".sidflow-source.sqlite.download"
+    manifest_temp = ROOT / ".sidflow-manifest.json.download"
+    checksum_temp = ROOT / ".sidflow-SHA256SUMS.download"
+    # Clean what we can, but never let a locked legacy build file poison this
+    # import. slim_and_promote always chooses a fresh unique destination.
+    _sidflow_cleanup_stale_artifacts()
+    try:
+        headers = {"User-Agent": f"u64deck/{VERSION}", "Accept": "application/vnd.github+json"}
+        with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(60.0, read=180.0),
+                          headers=headers) as client:
+            _sidflow_job_update(stage="manifest", message="Checking the latest SIDFlow export…")
+            plan = _sidflow_asset_plan(client)
+            manifest_response = client.get(plan["manifest_url"])
+            manifest_response.raise_for_status()
+            manifest_bytes = manifest_response.content
+            manifest = validate_manifest(manifest_response.json())
+            manifest.update({
+                "u64deck_source_asset": plan["sqlite_name"],
+                "u64deck_manifest_asset": plan["manifest_name"],
+                "u64deck_release_tag": plan["tag"],
+                "u64deck_release_published_at": plan["published_at"],
+                "u64deck_downloaded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            })
+            manifest_temp.write_bytes(manifest_bytes)
+            sums_response = client.get(plan["checksums_url"])
+            sums_response.raise_for_status()
+            checksum_temp.write_bytes(sums_response.content)
+            checksums = parse_sha256sums(sums_response.text)
+            expected_manifest = checksums.get(plan["manifest_name"])
+            if expected_manifest:
+                actual_manifest = hashlib.sha256(manifest_bytes).hexdigest()
+                if actual_manifest != expected_manifest:
+                    raise ValueError("SIDFlow manifest checksum verification failed")
+            expected_sqlite = checksums.get(plan["sqlite_name"])
+            if not expected_sqlite:
+                expected_sqlite = str((manifest.get("file_checksums") or {}).get("sqlite_sha256") or "").lower()
+            if len(expected_sqlite) != 64:
+                raise ValueError(f"No SHA-256 checksum was published for {plan['sqlite_name']}")
+            _sidflow_job_update(asset=plan["sqlite_name"], release=plan["tag"])
+            _sidflow_download_file(client, plan["sqlite_url"], download)
+
+        _sidflow_job_update(stage="verifying", message="Verifying SIDFlow download…")
+        if sha256_file(download) != expected_sqlite:
+            raise ValueError("SIDFlow SQLite checksum verification failed")
+
+        def progress(stage: str, current: int, total: int) -> None:
+            messages = {
+                "extracting": "Extracting SIDFlow perceptual features…",
+                "normalising": "Normalising compact SIDFlow vectors…",
+                "neighbors": "Importing SIDFlow neighbour rows…",
+            }
+            _sidflow_job_update(stage=stage, processed=current, process_total=total,
+                                message=messages.get(stage, "Building compact SIDFlow database…"))
+
+        SIDFLOW_STORE.invalidate()
+        result = slim_and_promote(
+            download, SIDFLOW_DB_PATH, manifest, progress,
+            promotion_lock=SIDFLOW_STORE.file_lock,
+        )
+        SIDFLOW_STORE.invalidate()
+        SIDFLOW_STORE.warm()
+        delete_note = ("; source cleanup will retry at restart"
+                       if result.get("source_delete_warning") else "")
+        _sidflow_job_update(running=False, stage="ready", downloaded=0, total=0,
+                            processed=result["tracks"], process_total=result["tracks"],
+                            completed=time.strftime("%Y-%m-%d %H:%M"), error="",
+                            message=f"SIDFlow ready — {result['tracks']:,} tracks{delete_note}")
+    except Exception as exc:
+        _diag_event("error", f"SIDFlow import failed: {exc}")
+        _sidflow_job_update(running=False, stage="error", error=str(exc),
+                            message=f"SIDFlow import failed: {exc}")
+    finally:
+        _sidflow_cleanup_stale_artifacts()
+
+
+@app.get("/api/sidflow/status")
+def sidflow_status():
+    return _sidflow_public_status()
+
+
+@app.post("/api/sidflow/download")
+def sidflow_download():
+    global SIDFLOW_THREAD
+    with SIDFLOW_LOCK:
+        if SIDFLOW_JOB.get("running"):
+            return _sidflow_public_status()
+        SIDFLOW_JOB.update({
+            "running": True, "stage": "starting", "downloaded": 0, "total": 0,
+            "processed": 0, "process_total": 0, "message": "Starting SIDFlow download…",
+            "error": "", "started": time.monotonic(), "completed": "", "asset": "",
+            "release": "",
+        })
+    SIDFLOW_THREAD = threading.Thread(target=_sidflow_import_worker, daemon=True,
+                                      name="sidflow-import")
+    SIDFLOW_THREAD.start()
+    return _sidflow_public_status()
+
+
+@app.delete("/api/sidflow")
+def sidflow_remove():
+    with SIDFLOW_LOCK:
+        if SIDFLOW_JOB.get("running"):
+            raise HTTPException(409, "SIDFlow data is currently downloading")
+    removed = False
+    for suffix in ("", "-wal", "-shm"):
+        path = SIDFLOW_DB_PATH.with_name(SIDFLOW_DB_PATH.name + suffix)
+        try:
+            path.unlink()
+            removed = True
+        except OSError:
+            pass
+    SIDFLOW_STORE.invalidate()
+    return {"removed": removed, **_sidflow_public_status()}
+
 
 
 def _parse_sid(data: bytes, *, compute_md5: bool = True) -> dict:
@@ -3316,6 +3591,7 @@ def load_songlengths():
     for the Ultimate's native player.
     """
     SONGLENGTHS.clear()
+    SONGLENGTHS_BY_PATH.clear()
     HVSC_INDEX.clear()
     path = CFG.get("songlengths_path") or ""
     if not path:
@@ -3344,29 +3620,47 @@ def load_songlengths():
     if raw is None:
         return 0
     text = bytes(raw).decode(errors="replace")
+    pending_rel = None
     for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
         if line.startswith(";"):
-            # "; /MUSICIANS/H/Hubbard_Rob/Sanxion.sid" — a free full index
+            # "; /MUSICIANS/H/Hubbard_Rob/Sanxion.sid" is immediately
+            # followed by that tune's digest/lengths entry. Retain the path
+            # association so lazy queue rows can show Length before the SID
+            # itself is fetched and hashed.
             rel = line[1:].strip()
             if rel.startswith("/") and rel.lower().endswith(".sid"):
                 HVSC_INDEX.append((rel.lower(), rel))
+                pending_rel = rel.lstrip("/").replace("\\", "/").casefold()
+            else:
+                pending_rel = None
             continue
         if line.startswith("["):
+            pending_rel = None
             continue
         if "=" in line:
             md5, _, spec = line.partition("=")
             times = _parse_songlength_times(spec)
             if len(md5) == 32 and times:
                 SONGLENGTHS[md5.lower()] = times
+                if pending_rel:
+                    SONGLENGTHS_BY_PATH[pending_rel] = times
+            pending_rel = None
     return len(SONGLENGTHS)
 
 
 def _juke_new_generation() -> int:
     JUKE["generation"] = int(JUKE.get("generation", 0)) + 1
     return JUKE["generation"]
+
+
+def _juke_reset_similarity_session(*, disable_radio: bool = True) -> None:
+    JUKE_PLAYED.clear()
+    JUKE_RECENT_TRACKS.clear()
+    if disable_radio:
+        JUKE["radio"] = False
 
 
 def _juke_cancel_timer():
@@ -3381,22 +3675,50 @@ def _juke_state():
     if 0 <= JUKE["index"] < len(JUKE["items"]):
         it = JUKE["items"][JUKE["index"]]
         now = {"label": it["label"], "meta": it["meta"], "song": JUKE["song"],
-               "path": it.get("path", ""),
+               "path": it.get("path", ""), "similarity": it.get("similarity"),
                "length": _juke_length(it, JUKE["song"])}
+    sidflow = SIDFLOW_STORE.status()
     return {"items": [{"label": i["label"], "meta": i["meta"],
                        "path": i.get("path", ""),
+                       "song": int(i.get("song") or i["meta"].get("start_song", 1) or 1),
+                       "similarity": i.get("similarity"),
                        "lazy": i.get("data") is None,
-                       "length": _juke_length(i, i["meta"].get("start_song", 1))}
+                       "length": _juke_length(i, int(i.get("song") or i["meta"].get("start_song", 1) or 1))}
                       for i in JUKE["items"]],
             "index": JUKE["index"], "playing": JUKE["playing"],
-            "shuffle": JUKE["shuffle"], "now": now, "folder": JUKE["folder"],
+            "shuffle": JUKE["shuffle"], "radio": bool(JUKE.get("radio")),
+            "now": now, "folder": JUKE["folder"],
             "loading": bool(JUKE.get("loading")),
             "source": JUKE.get("source", ""),
+            "sidflow": {"available": bool(sidflow.get("available")),
+                        "tracks": int(sidflow.get("tracks") or 0)},
             "songlengths_loaded": len(SONGLENGTHS)}
 
 
+def _juke_songlengths(it: dict):
+    """Resolve lengths by digest first, then by the HVSC path catalogue.
+
+    Lazy indexed queue entries intentionally have not fetched the full SID and
+    therefore may not have a digest yet. Songlengths.md5 also carries the
+    canonical HVSC path immediately before each digest, allowing the queue to
+    show its duration without loading the tune from the Ultimate.
+    """
+    meta = it.get("meta") or {}
+    digest = str(meta.get("md5") or "").casefold()
+    if digest:
+        times = SONGLENGTHS.get(digest)
+        if times:
+            return times
+    path = str(it.get("path") or "")
+    root = _configured_hvsc_root()
+    rel = normalise_hvsc_relative(path, root) if path and root else None
+    if rel:
+        return SONGLENGTHS_BY_PATH.get(rel.lstrip("/").replace("\\", "/").casefold())
+    return None
+
+
 def _juke_length(it, song: int):
-    times = SONGLENGTHS.get(it["meta"].get("md5", ""))
+    times = _juke_songlengths(it)
     if times and 1 <= song <= len(times):
         return round(times[song - 1], 1)
     return None
@@ -3453,6 +3775,166 @@ def _sid_metadata_get(store, path: str) -> dict | None:
         return None
 
 
+def _sidflow_track_context(path: str, song: int) -> tuple[dict | None, str]:
+    if not path:
+        return None, "local uploads do not have an HVSC path"
+    root = _configured_hvsc_root()
+    if not root:
+        return None, "the HVSC root has not been detected"
+    rel = normalise_hvsc_relative(path, root)
+    if rel is None:
+        return None, "the tune is outside the configured HVSC collection"
+    match = SIDFLOW_STORE.lookup(rel, max(1, int(song or 1)))
+    if not match:
+        return None, "this tune/subsong is not present in the SIDFlow export"
+    match["device_path"] = path
+    return match, ""
+
+
+def _sidflow_present_paths() -> dict[str, str]:
+    """HVSC-relative lowercase path -> exact device path from the SID index."""
+    root = _configured_hvsc_root()
+    if not root:
+        return {}
+    store = _index_store()
+    try:
+        stat = store.path.stat()
+        metadata_count = int(store.sid_metadata_count(root))
+        signature = (root.casefold(), stat.st_mtime_ns, stat.st_size, metadata_count)
+    except Exception:
+        signature = (root.casefold(), 0, 0, 0)
+    if SIDFLOW_PRESENT_CACHE.get("signature") == signature:
+        return dict(SIDFLOW_PRESENT_CACHE.get("paths") or {})
+    paths = []
+    getter = getattr(store, "sid_metadata_paths", None)
+    if callable(getter):
+        try:
+            paths = getter(root)
+        except Exception:
+            paths = []
+    if not paths:
+        try:
+            paths = [row["path"] for row in store.files_below(root, ".sid")]
+        except Exception:
+            paths = []
+    out = {}
+    for path in paths:
+        rel = normalise_hvsc_relative(path, root)
+        if rel:
+            out.setdefault(rel.casefold(), path)
+    SIDFLOW_PRESENT_CACHE.update({"signature": signature, "paths": dict(out)})
+    return out
+
+
+def _sidflow_item_track_id(item: dict, song: int | None = None) -> str | None:
+    path = str(item.get("path") or "")
+    if not path:
+        return None
+    root = _configured_hvsc_root()
+    rel = normalise_hvsc_relative(path, root) if root else None
+    if rel is None:
+        return None
+    selected = int(song or item.get("song") or item.get("meta", {}).get("start_song", 1) or 1)
+    try:
+        match = SIDFLOW_STORE.lookup(rel, selected)
+    except Exception:
+        match = None
+    return str(match.get("track_id")) if match else sidflow_track_id(rel, selected)
+
+
+def _sidflow_recommendations(path: str, song: int, limit: int = 20) -> tuple[list[dict], dict]:
+    status = SIDFLOW_STORE.status()
+    if not status.get("available"):
+        detail = status.get("error") or "SIDFlow similarity data is not installed"
+        raise HTTPException(409, detail)
+    if status.get("quality_warning"):
+        raise HTTPException(409, status["quality_warning"])
+    seed, reason = _sidflow_track_context(path, song)
+    if not seed:
+        raise HTTPException(404, reason)
+    present = _sidflow_present_paths()
+    if not present:
+        raise HTTPException(409, "the SID index has no mapped HVSC tunes; refresh the SID index first")
+    excluded = set(JUKE_PLAYED)
+    excluded.update(JUKE_RECENT_TRACKS)
+    for item in JUKE.get("items", []):
+        track = _sidflow_item_track_id(item)
+        if track:
+            excluded.add(track)
+    ranked = SIDFLOW_STORE.rank(
+        seed["track_id"], limit=max(1, min(int(limit or 20), 100)),
+        present_paths=set(present), exclude_track_ids=excluded,
+    )
+    device_paths = [present[row["sid_path"].casefold()] for row in ranked
+                    if row["sid_path"].casefold() in present]
+    metadata = _sid_metadata_for_paths(_index_store(), device_paths)
+    items = []
+    for row in ranked:
+        device_path = present.get(row["sid_path"].casefold())
+        if not device_path:
+            continue
+        name = device_path.rsplit("/", 1)[-1]
+        item = _juke_lazy_item(device_path, name,
+                               metadata.get(device_path.casefold()))
+        item["song"] = int(row["song_index"])
+        item["similarity"] = round(float(row["similarity"]), 4)
+        item["sidflow_track_id"] = row["track_id"]
+        items.append(item)
+    return items, seed
+
+
+def _sidflow_append(path: str, song: int, limit: int = 20, *, radio: bool = False,
+                    insert_after: int | None = None) -> dict:
+    items, seed = _sidflow_recommendations(path, song, limit)
+    if not items:
+        raise HTTPException(404, "SIDFlow found no unseen matching tunes present on this Ultimate")
+
+    # Manual recommendations belong immediately after the tune the user is
+    # listening to, not at the bottom of an unrelated composer/folder queue.
+    # Radio remains an end-of-queue top-up so it never jumps ahead of explicit
+    # choices already waiting to play.
+    if radio or insert_after is None:
+        insert_at = len(JUKE["items"])
+    else:
+        insert_at = max(0, min(int(insert_after) + 1, len(JUKE["items"])))
+    JUKE["items"][insert_at:insert_at] = items
+    JUKE["stop_after_current"] = False
+    if JUKE.get("index", -1) >= insert_at:
+        JUKE["index"] += len(items)
+
+    if JUKE.get("folder") not in ("SIDFlow Radio", "SIDFlow recommendations"):
+        JUKE["folder"] = "SIDFlow Radio" if radio else "SIDFlow recommendations"
+    JUKE["source"] = "SIDFlow similarity"
+    _juke_new_generation()
+    out = _juke_state()
+    out.update({"added": len(items), "inserted_at": insert_at,
+                "seed_track_id": seed["track_id"],
+                "powered_by": "SIDFlow (Chris Gleissner)"})
+    return out
+
+
+def _sidflow_radio_topup() -> int:
+    if not JUKE.get("radio") or not JUKE.get("playing"):
+        return 0
+    index = int(JUKE.get("index", -1))
+    if index < 0 or index >= len(JUKE.get("items", [])):
+        return 0
+    if len(JUKE["items"]) - index > 5:
+        return 0
+    current = JUKE["items"][index]
+    try:
+        before = len(JUKE["items"])
+        _sidflow_append(str(current.get("path") or ""), int(JUKE.get("song") or 1), 20,
+                        radio=True)
+        return len(JUKE["items"]) - before
+    except HTTPException as exc:
+        _diag_event("warning", f"SIDFlow Radio top-up paused: {exc.detail}")
+        if index >= len(JUKE["items"]) - 1:
+            JUKE["radio"] = False
+        return 0
+
+
+
 def _juke_lazy_item(path: str, name: str | None = None,
                     metadata: dict | None = None) -> dict:
     name = name or str(path).rsplit("/", 1)[-1]
@@ -3497,14 +3979,20 @@ def _juke_play(index: int, song: int = 0):
         raise HTTPException(400, "jukebox is empty")
     index = index % len(JUKE["items"])
     it = _juke_materialise(JUKE["items"][index])
-    song = song or it["meta"].get("start_song", 1)
+    song = song or int(it.get("song") or it["meta"].get("start_song", 1) or 1)
     try:
         _run_cart_safe(lambda: _post_sid_upload(
             it["label"], it["data"], songnr=song
         ))
     except (UltimateError, httpx.HTTPError) as e:
         err(e)
-    JUKE.update({"index": index, "song": song, "playing": True})
+    JUKE.update({"index": index, "song": song, "playing": True,
+                 "stop_after_current": False})
+    track_id = _sidflow_item_track_id(it, song)
+    if track_id:
+        JUKE_PLAYED.add(track_id.casefold())
+        JUKE_RECENT_TRACKS.append(track_id.casefold())
+    _sidflow_radio_topup()
     _juke_cancel_timer()
     length = _juke_length(it, song)
     if length is None:
@@ -3532,7 +4020,10 @@ def _juke_next_index():
 
 def _juke_auto_next():
     try:
-        if JUKE["playing"] and JUKE["items"]:
+        if JUKE.get("stop_after_current"):
+            JUKE["stop_after_current"] = False
+            juke_stop()
+        elif JUKE["playing"] and JUKE["items"]:
             _juke_play(_juke_next_index())
     except Exception:
         pass
@@ -3606,6 +4097,7 @@ def playlists_load_one(payload: dict = Body(...)):
         raise HTTPException(400, "the saved play queue is empty")
     _juke_cancel_timer()
     _juke_new_generation()
+    _juke_reset_similarity_session()
     JUKE.update({"items": items, "index": -1, "playing": False, "song": 0,
                  "folder": name, "loading": False, "source": "saved play queue"})
     out = _juke_state()
@@ -3641,6 +4133,7 @@ def juke_play_path(payload: dict = Body(...)):
         raise HTTPException(400, f"{name} is not a valid SID")
     _juke_cancel_timer()
     _juke_new_generation()
+    _juke_reset_similarity_session()
     JUKE.update({"items": [{"label": name, "data": data, "meta": meta,
                             "path": path}],
                  "index": -1, "playing": False, "song": 0,
@@ -3666,6 +4159,7 @@ def juke_add_path(payload: dict = Body(...)):
     _juke_new_generation()
     metadata = _sid_metadata_get(_index_store(), path)
     JUKE["items"].append(_juke_lazy_item(path, name, metadata))
+    JUKE["stop_after_current"] = False
     folder = path.rsplit("/", 1)[0] or "/"
     if JUKE["folder"] and JUKE["folder"] != folder:
         JUKE["folder"] = "custom picks"
@@ -3691,6 +4185,38 @@ def juke_remove(payload: dict = Body(...)):
     elif JUKE["index"] > i:
         JUKE["index"] -= 1
     return _juke_state()
+
+
+@app.post("/api/juke/clear")
+def juke_clear():
+    """Clear the pending play queue without abruptly silencing a live SID.
+
+    When a tune is currently playing it remains as the sole queue item and the
+    auto-advance timer is cancelled, so the Ultimate finishes that tune and
+    then stops naturally. Radio is always disarmed before the queue changes;
+    otherwise its top-up worker would immediately refill an empty queue.
+    """
+    items = JUKE.get("items", [])
+    current_index = int(JUKE.get("index", -1))
+    keep_current = bool(JUKE.get("playing") and 0 <= current_index < len(items))
+    current = items[current_index] if keep_current else None
+    removed = len(items) - (1 if keep_current else 0)
+
+    if current is None:
+        _juke_cancel_timer()
+    _juke_new_generation()
+    _juke_reset_similarity_session(disable_radio=True)
+    if current is not None:
+        JUKE.update({"items": [current], "index": 0, "playing": True,
+                     "folder": "Current tune", "loading": False,
+                     "stop_after_current": True})
+    else:
+        JUKE.update({"items": [], "index": -1, "playing": False, "song": 0,
+                     "folder": "", "loading": False, "source": "",
+                     "stop_after_current": False})
+    out = _juke_state()
+    out.update({"cleared": removed, "kept_current": keep_current})
+    return out
 
 
 @app.post("/api/juke/folder")
@@ -3739,9 +4265,12 @@ def juke_folder(payload: dict = Body(...)):
             _juke_cancel_timer()
             keep = False
     _juke_new_generation()
+    if not keep:
+        _juke_reset_similarity_session()
     JUKE.update({"items": items, "index": new_index,
                  "playing": bool(keep and new_index >= 0),
-                 "folder": folder, "loading": False, "source": source})
+                 "folder": folder, "loading": False, "source": source,
+                 "stop_after_current": False})
     out = _juke_state()
     out["skipped"] = 0
     out["lazy"] = True
@@ -3752,6 +4281,7 @@ def juke_folder(payload: dict = Body(...)):
 async def juke_upload(files: list[UploadFile] = File(...)):
     _juke_cancel_timer()
     _juke_new_generation()
+    _juke_reset_similarity_session()
     JUKE.update({"items": [], "index": -1, "playing": False, "song": 0,
                  "folder": "(local files)", "loading": False,
                  "source": "local upload"})
@@ -4551,17 +5081,71 @@ def juke_prev():
 def juke_stop():
     _juke_cancel_timer()
     JUKE["playing"] = False
+    JUKE["stop_after_current"] = False
+
+    # Stop SID audio as quickly as possible. The command-socket reset is a
+    # tiny independent packet and intentionally bypasses ordinary REST/status
+    # coordination; REST remains the compatibility fallback. Release any
+    # injected matrix keys after the reset so a held remote key cannot survive.
+    reset_sent = False
+    try:
+        if cmd is not None:
+            cmd.reset()
+            reset_sent = True
+    except Exception:
+        reset_sent = False
     try:
         _matrix_release_all(silent=True)
-        rest.put("/v1/machine:reset")
     except Exception:
         pass
+    if not reset_sent:
+        try:
+            rest.put("/v1/machine:reset", request_timeout=4.0)
+        except Exception:
+            pass
     return _juke_state()
 
 
 @app.put("/api/juke/shuffle")
 def juke_shuffle(on: bool = Query(...)):
     JUKE["shuffle"] = bool(on)
+    return _juke_state()
+
+
+@app.post("/api/juke/more_like")
+def juke_more_like(payload: dict = Body(...)):
+    index = int(payload.get("index", JUKE.get("index", -1)))
+    if not (0 <= index < len(JUKE.get("items", []))):
+        raise HTTPException(400, "choose a SID from the play queue first")
+    item = JUKE["items"][index]
+    song = int(payload.get("song") or item.get("song") or
+               item.get("meta", {}).get("start_song", 1) or 1)
+    current_index = int(JUKE.get("index", -1))
+    insert_after = current_index if 0 <= current_index < len(JUKE["items"]) else index
+    return _sidflow_append(str(item.get("path") or ""), song,
+                           int(payload.get("limit") or 20), radio=False,
+                           insert_after=insert_after)
+
+
+@app.put("/api/juke/radio")
+def juke_radio(on: bool = Query(...)):
+    enabled = bool(on)
+    if enabled:
+        status = SIDFLOW_STORE.status()
+        if not status.get("available"):
+            raise HTTPException(409, "SIDFlow similarity data is not installed")
+        JUKE_PLAYED.clear()
+        JUKE_RECENT_TRACKS.clear()
+        if 0 <= JUKE.get("index", -1) < len(JUKE.get("items", [])):
+            current = JUKE["items"][JUKE["index"]]
+            track = _sidflow_item_track_id(current, JUKE.get("song") or 1)
+            if track:
+                JUKE_PLAYED.add(track.casefold())
+                JUKE_RECENT_TRACKS.append(track.casefold())
+    JUKE["radio"] = enabled
+    if enabled:
+        JUKE["stop_after_current"] = False
+        _sidflow_radio_topup()
     return _juke_state()
 
 
@@ -4711,6 +5295,7 @@ def diagnostics_export(payload: dict = Body(default={})):
         "stream": stream_stats(),
         "index": fs_index_status(),
         "sid_index": juke_index_status(),
+        "sidflow": _sidflow_public_status(),
         "cache": cache_stats(),
         "events": list(DIAG_EVENTS),
     }

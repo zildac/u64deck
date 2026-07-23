@@ -1,6 +1,6 @@
 # u64deck
 
-**v1.8.0 — Public Beta 9**
+**v1.8.0 — Public Beta 10.4**
 
 
 A lightweight, self-hosted control deck for the **Ultimate 64** (and, minus the
@@ -28,10 +28,15 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
   cracktros, games and the Ultimate menu. Older firmware and unsupported
   hardware fall back automatically to the established KERNAL keyboard buffer.
 - **Accurate native SID durations** — when HVSC `Songlengths.md5` is loaded,
-  u64deck generates the compact per-SID `.ssl` duration data expected by the
-  Ultimate and includes that as the optional second attachment for uploaded SID
-  playback, so the native SID-player screen can show the documented subtune
-  length instead of its generic five-minute estimate.
+  u64deck pre-populates the Jukebox **Length** column from the queued HVSC path
+  and subtune, then generates the compact per-SID `.ssl` duration data expected
+  by the Ultimate so its native SID-player screen also shows the documented
+  length instead of the generic five-minute estimate.
+- **SIDFlow-powered recommendations and Radio** — download SIDFlow's verified
+  full portable export once, slim its perceptual fingerprints into compact
+  normalised 48-dimensional vectors, then use **♪ More like this** or Radio mode
+  to discover unseen HVSC tunes already present on the Ultimate. Powered by
+  **SIDFlow (Chris Gleissner)**.
 - **Audio mirror** — the U64 audio stream, played in the browser.
 - **Unambiguous stream state** — stopping or losing video replaces the last
   frame with a C64-style VIDEO NOT CONNECTED panel, while the audio badge shows
@@ -83,7 +88,7 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
 *Recursive storage search that looks inside disk images — finding a PRG buried in a Compunet demo disk, across 60,000 indexed folders, in seconds.*
 
 ![SID Jukebox](docs/jukebox.png)
-*SID Jukebox: instant search across the entire HVSC with composer/chip metadata, one-click playback through the machine's own audio, and persistent play queues.*
+*SID Jukebox: instant search across the entire HVSC, one-click playback through the machine's own audio — plus "More like this" and Radio mode powered by SIDFlow similarity data (Chris Gleissner), with persistent play queues.*
 
 ![Favourites](docs/favourites.png)
 *Favourites and recent items — star anything (folders, disks, files inside images, SID tunes, Assembly64 releases) for one-click access.*
@@ -91,12 +96,25 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
 ![Assembly64](docs/assembly64.png)
 *Assembly64 search: fresh scene releases, filterable by category, rating and recency — deploy straight onto the machine with Mount & Run.*
 
+![Settings](docs/settings.png)
+*Full firmware settings access — every category editable from the browser — plus index management and the SIDFlow similarity data panel.*
+
 ## Quick start
+
+### Tier 1 — Windows, no Python
+
+Download `u64deck.exe` from <https://github.com/zildac/u64deck/releases/latest>, put it in a folder of its own, double-click it, open http://localhost:8064 and hit **Select Ultimate…** in the header — it sweeps your local subnet(s) and lists every Ultimate it finds; click **Use** to connect. No IP required.
+
+The executable is fully self-contained and needs no Python installation. It creates and uses `config.json` and the SQLite index beside itself, exactly like the source version. Windows SmartScreen may warn on first run of an unsigned exe; the release page publishes the file's SHA-256 for verification.
+
+### Tier 2 — Windows from source
 
 **Windows:** double-click `start.bat` (installs dependencies on first run,
 then starts the server), open http://localhost:8064 and hit **Select Ultimate…**
 in the header — it sweeps your local subnet(s) and lists every Ultimate it
 finds; click **Use** to connect. No IP required.
+
+### Tier 3 — Anywhere else (or by hand)
 
 Anywhere else (or by hand):
 
@@ -113,6 +131,8 @@ your settings. `config.example.json` documents the available keys
 (`u64_host`, `password` for the U64 network password, `ftp_user`/
 `ftp_password`, `local_ip`, `stream_transport`, multicast groups,
 `assembly64.client_id`).
+
+Always run u64deck as a normal user, and always the same way — mixing elevated ('Run as administrator') and normal launches leaves files with mismatched ownership and causes access-denied errors; if you've mixed them, start fresh in a new folder.
 
 ## Mount safety modes
 
@@ -160,6 +180,36 @@ If migration fails, u64deck keeps using the currently selected legacy database
 and reports the error in **Settings → Search Index & Cache**. Do not delete old
 index files until the merged counts have been checked.
 
+## SIDFlow recommendations and Radio
+
+The SID Jukebox can use the portable similarity export published by
+**SIDFlow**, created by **Chris Gleissner**. Open **Settings → Search Index &
+Cache → SIDFlow Similarity Data** to download it. u64deck fetches the manifest
+first, requires schema `sidcorr-1`, verifies `SHA256SUMS`, and downloads the
+full feature export. The source is about 400 MB and is needed only once: u64deck
+extracts the documented perceptual fields, corpus-normalises them into compact
+48-dimensional unit vectors in `.sidflow-similarity.sqlite`, then deletes the
+large source file. The retained database is normally well under 40 MB. The
+mobile profile is not used because its current form omits `features_json`.
+
+Selecting an individual SID from Search or the folder browser creates a one-tune
+queue and plays it immediately. Use **＋** to append only that tune, or explicitly
+choose **♫ Play This Folder** to load every SID in the current folder.
+
+Use **♪ More like this** beside Now Playing or on a Play Queue row to insert up
+to 20 closest matches immediately after the current tune. The active subsong is
+preserved. **Radio** leaves the current queue intact and tops it up near its end
+using the most recently played tune while preventing repeats within the current
+radio session. **Clear Queue** turns Radio off and removes queued tunes while
+allowing a SID already playing to finish naturally; saved play queues,
+favourites and the similarity database remain untouched. Local uploads,
+non-HVSC tunes and paths that no longer match the installed HVSC version fail
+gracefully with a one-line explanation and normal playback is unchanged when no
+similarity database is installed.
+
+Attribution: recommendation data and similarity analysis are provided by
+**SIDFlow (Chris Gleissner)** and the public `sidflow-data` releases.
+
 ## Help and diagnostics
 
 Use the text **Help** button in the top bar for searchable documentation, usage
@@ -191,7 +241,7 @@ The repo includes a PyInstaller spec and a GitHub Actions workflow
 1. Push this folder to a GitHub repo.
 2. The **build-exe** action runs on every push — grab `u64deck.exe` from the
    workflow's artifacts (Actions tab → latest run → *u64deck-windows*).
-3. Tag a release (`git tag v1.8.0-beta.9 && git push --tags`) and the exe is attached
+3. Tag a release (`git tag v1.8.0-beta.10.4 && git push --tags`) and the exe is attached
    to the GitHub Release automatically.
 
 Double-click the exe: it starts the server, opens your browser, and you hit
@@ -356,7 +406,9 @@ point it at an Ultimate storage folder (or the **Open SID Jukebox** button in th
 STORAGE browser plays the folder you're looking at), or load local .sid
 files. The play queue shows title/author/released parsed from the PSID/RSID
 headers; click any tune to play, ⏮ ⏭ ⏹ and shuffle do what they say, and
-multi-tune SIDs get a subsong selector. The queue expands to fill the remaining
+multi-tune SIDs get a subsong selector. The **Length** column is populated as
+soon as tunes enter the queue by matching their HVSC path and selected subsong
+against Songlengths.md5; an unknown duration is shown as —. The queue expands to fill the remaining
 Jukebox height and keeps its headings visible while only the rows scroll. When
 all indexed entries share one author, that author appears once in the queue
 heading instead of being repeated in every row; mixed-author queues retain the
@@ -370,8 +422,9 @@ HVSC's `Songlengths.md5` configured (`songlengths_path` in `config.json`),
 u64deck generates a tiny per-SID `.ssl` duration array and attaches that when it
 uploads a SID, allowing the Ultimate's own SID-player screen to show the
 documented length for the selected subtune. The complete Songlengths database
-is never uploaded to the device. Each tune plays for its documented length in
-u64deck;
+is never uploaded to the device. Queue lengths are resolved from the path
+catalogue before lazy tunes are fetched, then confirmed by digest once a tune is
+played. Each tune plays for its documented length in u64deck;
 without Songlengths, `sid_default_secs`
 (default 180) applies (0 = loop forever). If your HVSC lives on the device, you don't even need to set it:
 on first jukebox use u64deck **auto-detects the HVSC root** (a folder
@@ -386,7 +439,8 @@ automatically.
 metadata scan, HVSC's own Songlengths.md5 provides a filename/path index.
 After a metadata scan, SQLite also searches header title, author, release and
 path fields. Multi-word queries AND together ("hubbard sanxion"). ▶ Play on a
-hit loads that tune's folder as the play queue and starts it.
+hit creates a one-tune play queue and starts it; use **＋** to append a tune or
+**Play This Folder** when the complete folder is intended.
 
 **Chip and Format filters**: the Chip selector filters 6581, 8580, Either,
 Mixed/Multi-SID and Unknown declarations. Format filters PSID or RSID. A text
@@ -437,9 +491,9 @@ the local or Ultimate SID metadata refresh to reconcile header metadata.
 **🎲 Random Dive**: chooses a random `.sid` from the case-insensitive SQLite
 storage index beneath the current path. For HVSC paths it can fall back to the
 Songlengths index after mapping the configured collection root. The selected
-SID starts immediately and its containing folder becomes a lazy Play Queue:
-only a tune that is actually played is fetched, avoiding a burst of FTP work
-while the Ultimate's native SID player is active. Errors distinguish an
+SID starts immediately as a one-tune Play Queue. The complete file is fetched
+only when it is actually played, avoiding a burst of FTP work while the
+Ultimate's native SID player is active. Errors distinguish an
 unindexed folder, a folder with no SIDs and an unresolved HVSC mapping.
 
 ## Search
@@ -514,6 +568,14 @@ the swap bar drives the rest — device storage never touched.
 Mid-demo the ritual is: software asks for disk N → click **N** (or ▶) in the
 swap bar → click the screen → press the key it's waiting for. Done.
 
+## Acknowledgements
+
+**SIDFlow-powered recommendations are made possible by Chris Gleissner**, who
+created SIDFlow, published the portable similarity export and explicitly
+invited u64deck to use it for selecting and playing similar songs. u64deck's
+**♪ More like this** and **Radio** features consume the public `sidflow-data`
+release locally; no ratings or listening data are uploaded back to SIDFlow.
+
 ## Security notes (honest ones too)
 
 The Ultimate's own services — REST, FTP, the port-64 socket, even the
@@ -537,10 +599,11 @@ The **browser → u64deck** hop, however, is ours to secure:
 
 ## Known limitations (honest ones)
 
-- **Keyboard = keyboard buffer.** The U64 exposes typed-character injection,
-  not key-matrix state, so anything that reads the matrix directly (most
-  games) won't see remote input, and keys can't be held down. That's a
-  hardware/firmware boundary every remote tool shares.
+- **Interactive keyboard support depends on firmware and hardware.** u64deck
+  probes `/v1/machine:input` for CIA1 matrix-level press/release input. When the
+  endpoint is absent or unsupported, it falls back to the KERNAL keyboard
+  buffer; bulk text and LOAD/RUN automation deliberately continue to use that
+  efficient buffer path.
 - **Run (DMA) is single-file.** Multi-load games/demos need their disk —
   that's what Mount & Load is for.
 - **Mount & Load timing** is a fixed ~2.8 s wait for BASIC after reset. If you
@@ -560,6 +623,7 @@ d64.py             D64/D71/D81 directory parser + file extractor
 index_store.py     SQLite filesystem and disk-image catalogue
 local_indexer.py   read-only local USB scanner and path mapper
 sid_indexer.py     read-only local SID-header metadata scanner
+sidflow_similarity.py  SIDFlow schema validation, slimming and cosine ranking
 device_coordinator.py  priority scheduling for Ultimate operations
 static/index.html  the whole UI
 config.json        host + ports + Assembly64 endpoint templates

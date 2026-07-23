@@ -80,9 +80,9 @@ h2{font-size:13px;letter-spacing:.12em;color:var(--dim);font-weight:600;margin:0
 .sid-queue-tools{gap:6px;margin:4px 0 8px;align-items:center;flex:0 0 auto}
 .sid-queue-list{flex:1 1 auto;min-height:0;overflow:auto;border-top:1px solid rgba(39,44,76,.55)}
 .jkq-grid{min-width:760px}
-.jkq-row{display:grid;grid-template-columns:44px minmax(240px,1fr) minmax(145px,.52fr) 92px minmax(150px,.48fr) 62px 82px;
+.jkq-row{display:grid;grid-template-columns:44px minmax(240px,1fr) minmax(145px,.52fr) 92px minmax(150px,.48fr) 62px 126px;
   align-items:center;border-bottom:1px solid rgba(39,44,76,.5);min-height:31px}
-.jkq-grid.single-author .jkq-row{grid-template-columns:44px minmax(280px,1fr) 92px minmax(160px,.5fr) 62px 82px}
+.jkq-grid.single-author .jkq-row{grid-template-columns:44px minmax(280px,1fr) 92px minmax(160px,.5fr) 62px 126px}
 .jkq-row[role="row"]{cursor:pointer}
 .jkq-row[role="row"]:hover{background:rgba(139,147,255,.14)}
 .jkq-row.sel{background:rgba(139,147,255,.20);box-shadow:inset 3px 0 0 var(--acc)}
@@ -97,7 +97,7 @@ h2{font-size:13px;letter-spacing:.12em;color:var(--dim);font-weight:600;margin:0
 .jkq-actions .mini{padding:2px 7px;font-size:12px;border-radius:5px}
 @media(max-width:1050px){
   .jkq-grid{min-width:0}
-  .jkq-row,.jkq-grid.single-author .jkq-row{grid-template-columns:38px minmax(0,1fr) 88px 58px 78px}
+  .jkq-row,.jkq-grid.single-author .jkq-row{grid-template-columns:38px minmax(0,1fr) 88px 58px 112px}
   .jkq-author,.jkq-released{display:none}
   .jkq-submeta{display:block}
 }
@@ -283,3 +283,10 @@ pre.raw{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
 .swap-decision{margin-top:7px;white-space:normal;overflow-wrap:anywhere}
 @media(max-width:760px){.drive-summary-strip{align-items:flex-start;flex-direction:column;gap:5px}
   .drive-summary-content{gap:6px}.drive-summary-item{max-width:calc(100vw - 70px)}}
+.sidflow-credit{font-size:11px;color:var(--acc);white-space:nowrap}
+.sidflow-radio{padding:3px 7px;border:1px solid rgba(139,147,255,.35);border-radius:999px}
+.sidflow-radio:has(input:checked){background:rgba(139,147,255,.16);color:var(--text);border-color:var(--acc)}
+.sidflow-settings progress{accent-color:var(--acc)}
+.jkq-similarity{color:var(--acc);font-size:11px;margin-left:6px}
+.sidflow-juke-credit-row{margin-top:4px;align-items:baseline;gap:10px;flex-wrap:wrap}
+.sidflow-juke-credit-row #jkSlInfo,.sidflow-juke-credit-row .sidflow-credit{line-height:1.25}

@@ -253,6 +253,17 @@ class CommandSocket:
         with self._lock:
             self.close_nolock()
 
+    def reset(self):
+        """Reset the C64 immediately over the low-latency command socket.
+
+        This deliberately bypasses the shared REST/FTP operation coordinator.
+        A reset is a four-byte, user-initiated emergency-style command and must
+        not sit behind an in-flight status request when the user presses Stop.
+        The command socket's own lock still serialises it safely with keyboard
+        and stream commands.
+        """
+        self._send(CMD_RESET)
+
     def type_petscii(self, data: bytes, chunk: int = 8, delay: float = 0.02):
         """Inject PETSCII bytes into the KERNAL keyboard buffer in order.
 
