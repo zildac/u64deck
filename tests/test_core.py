@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import copy
 import io
 import json
 import re
@@ -17,6 +19,7 @@ import server
 import ultimate
 from d64 import DiskImage
 from index_store import IndexStore
+from network_awareness import LinkObservation
 from sid_indexer import scan_local_sid_tree
 
 
@@ -139,6 +142,51 @@ def test_sid_upload_omits_optional_songlength_part_when_unavailable():
     assert captured["files"] == [
         ("file", ("Tune.sid", b"SID", "application/octet-stream")),
     ]
+
+
+def test_rest_timeout_replacement_waits_for_inflight_request(monkeypatch):
+    request_started = threading.Event()
+    release_request = threading.Event()
+    old_closed = threading.Event()
+    created = []
+
+    class BlockingClient:
+        def get(self, path, params=None):
+            request_started.set()
+            assert release_request.wait(2.0)
+            request = httpx.Request("GET", "http://u64" + path)
+            return httpx.Response(200, json={"ok": True}, request=request)
+        def close(self):
+            old_closed.set()
+
+    class ReplacementClient:
+        def close(self):
+            pass
+
+    def client_factory(*args, **kwargs):
+        client = BlockingClient() if not created else ReplacementClient()
+        created.append(client)
+        return client
+
+    monkeypatch.setattr(ultimate.httpx, "Client", client_factory)
+    rest = ultimate.UltimateREST("u64")
+    result = {}
+    reader = threading.Thread(
+        target=lambda: result.update(rest.get_json("/v1/info")), daemon=True)
+    reader.start()
+    assert request_started.wait(1.0)
+
+    reconfigure = threading.Thread(target=lambda: rest.set_timeout(45.0), daemon=True)
+    reconfigure.start()
+    time.sleep(0.05)
+    assert not old_closed.is_set()
+
+    release_request.set()
+    reader.join(1.0)
+    reconfigure.join(1.0)
+    assert result == {"ok": True}
+    assert old_closed.is_set()
+    assert rest.client is created[1]
 
 
 def test_songlength_loader_parses_lengths_and_path_index(tmp_path: Path):
@@ -1034,14 +1082,14 @@ def test_swap_autobuild_understands_wrapped_and_of_total_names():
 
 
 def test_release_version_is_consistent_in_code_ui_and_changelog():
-    assert server.VERSION == "1.8.0"
+    assert server.VERSION == "1.9.0"
     static = Path(server.ASSETS) / "static"
     html = (static / "index.html").read_text(encoding="utf-8")
     js = (static / "app.js").read_text(encoding="utf-8")
     changelog = (Path(server.ROOT) / "CHANGELOG.md").read_text(encoding="utf-8")
     assert 'id="ver"' in html
     assert '"/api/app_config"' in js
-    assert "## 1.8.0 — Public Beta 10.4" in changelog.split("## 1.8.0 — Public Beta 2", 1)[0]
+    assert "## 1.9.0 — Release Candidate 10" in changelog.split("## 1.9.0 — Release Candidate 5", 1)[0]
 
 
 def test_built_in_help_contains_no_release_specific_versions():
@@ -1073,6 +1121,243 @@ def test_header_identity_and_device_details_share_an_aligned_status_block():
     assert ".ready-line{color:var(--dim);font-size:14px" in css
 
 
+def test_mount_run_busy_status_is_local_and_does_not_touch_device(monkeypatch):
+    calls = []
+
+    class Snapshot:
+        active_priority = "interactive"
+        active_reason = "mounting and booting disk"
+
+    class FakeCoordinator:
+        def snapshot(self): return Snapshot()
+        @contextmanager
+        def operation(self, *args, **kwargs):
+            pytest.fail("busy /api/info must not wait on the device coordinator")
+            yield
+
+    class FakeRest:
+        def info(self):
+            calls.append("info")
+            pytest.fail("busy /api/info must not query the Ultimate")
+
+    original_cfg = dict(server.CFG)
+    original_mounts = {key: dict(value) for key, value in server.MOUNT_STATE.items()}
+    try:
+        server.CFG["u64_host"] = "192.0.2.64"
+        server.MOUNT_STATE["a"] = {"mode": "unlinked", "path": "/USB0/Demo.d64",
+                                   "name": "Demo.d64", "mounted_at": 1.0}
+        server.MOUNT_STATE["b"] = {}
+        monkeypatch.setattr(server, "DEVICE_OP", FakeCoordinator())
+        monkeypatch.setattr(server, "rest", FakeRest())
+        payload = server.info()
+        assert payload == {
+            "u64deck_busy": True,
+            "u64deck_busy_reason": "mount_run",
+            "u64deck_busy_label": "BUSY — loading program…",
+            "u64deck_retry_ms": 2000,
+            "u64deck_mounts": {
+                "a": {"mode": "unlinked", "path": "/USB0/Demo.d64",
+                      "name": "Demo.d64", "mounted_at": 1.0},
+                "b": {},
+            },
+        }
+        assert calls == []
+    finally:
+        server.CFG.clear(); server.CFG.update(original_cfg)
+        server.MOUNT_STATE.clear(); server.MOUNT_STATE.update(original_mounts)
+
+
+def test_drive_status_uses_confirmed_mount_snapshot_while_mount_run_is_busy(monkeypatch):
+    calls = []
+
+    class Snapshot:
+        active_priority = "interactive"
+        active_reason = "mounting and booting disk"
+
+    class FakeCoordinator:
+        def snapshot(self): return Snapshot()
+
+    class FakeRest:
+        def get_json(self, path):
+            calls.append(path)
+            pytest.fail("busy /api/drives must not query the Ultimate")
+
+    original_mounts = {key: dict(value) for key, value in server.MOUNT_STATE.items()}
+    try:
+        server.MOUNT_STATE["a"] = {"mode": "readonly", "name": "Upload.d64",
+                                   "path": "", "mounted_at": 2.0}
+        server.MOUNT_STATE["b"] = {}
+        monkeypatch.setattr(server, "DEVICE_OP", FakeCoordinator())
+        monkeypatch.setattr(server, "rest", FakeRest())
+        payload = server.drives()
+        assert payload["u64deck_busy"] is True
+        assert payload["u64deck_mounts"]["a"]["name"] == "Upload.d64"
+        assert payload["u64deck_mounts"]["a"]["mode"] == "readonly"
+        assert calls == []
+    finally:
+        server.MOUNT_STATE.clear(); server.MOUNT_STATE.update(original_mounts)
+
+
+def test_drive_status_waits_for_backend_switch_before_capturing_rest(monkeypatch):
+    coordinator = server.DeviceOperationCoordinator()
+    switch_active = threading.Event()
+    release_switch = threading.Event()
+    old_calls = []
+    result = {}
+
+    class OldRest:
+        def get_json(self, path):
+            old_calls.append(path)
+            raise RuntimeError("Ultimate REST client is closed")
+        def close(self): pass
+
+    class NewRest:
+        def get_json(self, path):
+            return {"drives": [{"a": {"enabled": True, "image_file": "Fresh.d64"}}]}
+
+    original_mounts = {key: dict(value) for key, value in server.MOUNT_STATE.items()}
+    old_rest = OldRest()
+    new_rest = NewRest()
+    try:
+        server.MOUNT_STATE["a"] = {}
+        server.MOUNT_STATE["b"] = {}
+        monkeypatch.setattr(server, "DEVICE_OP", coordinator)
+        monkeypatch.setattr(server, "rest", old_rest)
+        monkeypatch.setattr(server, "_reconcile_swap_from_drives", lambda out: {})
+
+        def switch_backend():
+            with coordinator.operation("interactive", "switching Ultimate device"):
+                switch_active.set()
+                assert release_switch.wait(2.0)
+                monkeypatch.setattr(server, "rest", new_rest)
+                old_rest.close()
+
+        switcher = threading.Thread(target=switch_backend, daemon=True)
+        switcher.start()
+        assert switch_active.wait(1.0)
+
+        poller = threading.Thread(target=lambda: result.setdefault("payload", server.drives()), daemon=True)
+        poller.start()
+        time.sleep(0.05)
+        assert old_calls == []
+        release_switch.set()
+        switcher.join(1.0)
+        poller.join(1.0)
+
+        assert result["payload"]["u64deck_operation_busy"] is True
+        assert result["payload"]["u64deck_drives_unavailable"] is True
+        assert "switching Ultimate device" in result["payload"]["u64deck_drives_message"]
+        assert old_calls == []
+    finally:
+        server.MOUNT_STATE.clear(); server.MOUNT_STATE.update(original_mounts)
+
+
+def test_drive_status_retries_current_backend_after_closed_client_handover(monkeypatch):
+    calls = []
+
+    class FakeCoordinator:
+        def snapshot(self):
+            class Snapshot:
+                active_priority = None
+                active_reason = ""
+            return Snapshot()
+        @contextmanager
+        def operation(self, *args, **kwargs):
+            yield
+
+    class NewRest:
+        def get_json(self, path):
+            calls.append(("new", path))
+            return {"drives": []}
+
+    new_rest = NewRest()
+
+    class OldRest:
+        def get_json(self, path):
+            calls.append(("old", path))
+            monkeypatch.setattr(server, "rest", new_rest)
+            raise RuntimeError("Ultimate REST client is closed")
+
+    monkeypatch.setattr(server, "DEVICE_OP", FakeCoordinator())
+    monkeypatch.setattr(server, "rest", OldRest())
+    monkeypatch.setattr(server, "_reconcile_swap_from_drives", lambda out: {})
+    payload = server.drives()
+
+    assert payload["drives"] == []
+    assert calls == [("old", "/v1/drives"), ("new", "/v1/drives")]
+
+
+def test_drive_status_returns_controlled_snapshot_when_client_is_closed(monkeypatch):
+    class FakeCoordinator:
+        def snapshot(self):
+            class Snapshot:
+                active_priority = None
+                active_reason = ""
+            return Snapshot()
+        @contextmanager
+        def operation(self, *args, **kwargs):
+            yield
+
+    class ClosedRest:
+        def get_json(self, path):
+            raise RuntimeError("Ultimate REST client is closed")
+
+    original_mounts = {key: dict(value) for key, value in server.MOUNT_STATE.items()}
+    try:
+        server.MOUNT_STATE["a"] = {"name": "Known.d64", "mode": "unlinked"}
+        server.MOUNT_STATE["b"] = {}
+        monkeypatch.setattr(server, "DEVICE_OP", FakeCoordinator())
+        monkeypatch.setattr(server, "rest", ClosedRest())
+        payload = server.drives()
+
+        assert payload["u64deck_drives_unavailable"] is True
+        assert payload["u64deck_retry_ms"] == 1000
+        assert payload["u64deck_mounts"]["a"]["name"] == "Known.d64"
+        assert "temporarily unavailable" in payload["u64deck_drives_message"]
+    finally:
+        server.MOUNT_STATE.clear(); server.MOUNT_STATE.update(original_mounts)
+
+
+def test_frontend_handles_transient_drive_handover_without_error_text():
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    assert "u64deck_drives_unavailable" in js
+    assert "DRIVE_STATUS_RETRY_TIMER" in js
+    assert "Drive status temporarily unavailable — retrying…" in js
+
+
+def test_frontend_renders_expected_mount_run_busy_state_and_retries():
+    static = Path(server.ASSETS) / "static"
+    js = (static / "app.js").read_text(encoding="utf-8")
+    css = (static / "app.css").read_text(encoding="utf-8")
+    assert "if(i?.u64deck_busy)" in js
+    assert 'i.u64deck_busy_label||"BUSY — loading program…"' in js
+    assert "u64deck_retry_ms" in js
+    assert "applyBusyMountSnapshot(i.u64deck_mounts)" in js
+    assert "Loading program — device status will refresh when complete." in js
+    assert 'class="device-busy"' in js
+    assert "#devinfo .device-busy{color:var(--warn)}" in css
+    assert ".drive-busy-note{color:var(--warn)}" in css
+
+
+def test_all_mount_run_frontend_paths_refresh_status_when_finished():
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    device = js.split("async function mountRunDevice(path){", 1)[1].split(
+        "async function localMountRun()", 1
+    )[0]
+    upload = js.split("async function localMountRun(){", 1)[1].split(
+        "async function mountDevice", 1
+    )[0]
+    assembly = js.split("async function asmDeploy(item,filename,action){", 1)[1].split(
+        "/* ---------- disk swap ---------- */", 1
+    )[0]
+    assert "beginMountRunStatusWatch()" in device
+    assert "finally{finishMountRunStatusWatch()}" in device
+    assert "beginMountRunStatusWatch()" in upload
+    assert "finally{finishMountRunStatusWatch()}" in upload
+    assert 'if(action==="mount_run")beginMountRunStatusWatch()' in assembly
+    assert 'finally{if(action==="mount_run")finishMountRunStatusWatch()}' in assembly
+
+
 
 def test_experimental_telnet_remote_is_removed_and_matrix_keyboard_is_present():
     static = Path(server.ASSETS) / "static"
@@ -1101,8 +1386,8 @@ def test_frontend_is_split_without_a_build_tool():
 
 def test_release_metadata_is_centralised():
     import release
-    assert server.VERSION == release.VERSION == "1.8.0"
-    assert release.RELEASE_LABEL == "Public Beta 10.4"
+    assert server.VERSION == release.VERSION == "1.9.0"
+    assert release.RELEASE_LABEL == "Release Candidate 13"
     assert server.BUILD == release.build_id(server.ASSETS, Path(server.__file__).parent)
 
 
@@ -2055,7 +2340,7 @@ def test_juke_state_exposes_current_sid_path_for_now_playing_favourite():
         server.JUKE.update(previous)
 
 
-def test_public_beta_help_and_now_playing_star_are_present():
+def test_release_help_and_now_playing_star_are_present():
     static = Path(server.ASSETS) / "static"
     html = (static / "index.html").read_text(encoding="utf-8")
     js = (static / "app.js").read_text(encoding="utf-8")
@@ -2065,8 +2350,11 @@ def test_public_beta_help_and_now_playing_star_are_present():
     assert "jkToggleNowFavourite" in js
     assert ".u64deck-index.sqlite3" in help_js
     assert "star beside the playback controls" in help_js
-    assert "Public Beta 10.4" in readme
+    assert "v1.9.0 — Release Candidate 13" in readme
     assert ".u64deck-index.sqlite3" in readme
+    assert "Install every release into a **new, empty folder**" in readme
+    assert "Do not copy `*-wal`" in readme
+    assert "user_items.json" in readme and "playlists.json" in readme
 
 
 def test_machine_input_capability_probe_caches_supported_and_fallback_paths():
@@ -2903,38 +3191,35 @@ def test_command_socket_reset_uses_reset_opcode_without_coordinator():
     assert sent == [(ultimate.CMD_RESET, b"")]
 
 
-def test_juke_stop_prefers_command_socket_and_uses_rest_as_fallback(monkeypatch):
+def test_juke_stop_legacy_uses_rest_first_and_skips_command_socket(monkeypatch):
     previous = dict(server.JUKE)
     calls = []
+    host = "192.0.2.17"
 
     class FakeCommand:
-        def __init__(self, fail=False): self.fail = fail
-        def reset(self):
-            calls.append("cmd")
-            if self.fail:
-                raise RuntimeError("command socket unavailable")
+        def reset_fresh(self): calls.append("fresh-reset")
 
     class FakeRest:
+        def __init__(self): self.host = host
         def put(self, path, **kwargs):
             calls.append(("rest", path, kwargs))
             return {}
 
-    monkeypatch.setattr(server, "_matrix_release_all", lambda **kwargs: calls.append("release"))
+    monkeypatch.setattr(
+        server, "_matrix_release_all",
+        lambda **kwargs: calls.append(("release", kwargs)),
+    )
     monkeypatch.setattr(server, "rest", FakeRest())
+    monkeypatch.setitem(server.INPUT_CAPABILITIES, host, {"available": False})
     try:
         server.JUKE.update({"items": [], "index": -1, "playing": True,
                             "stop_after_current": False, "timer": None})
         monkeypatch.setattr(server, "cmd", FakeCommand())
         server.juke_stop()
-        assert calls == ["cmd", "release"]
-
-        calls.clear()
-        server.JUKE["playing"] = True
-        monkeypatch.setattr(server, "cmd", FakeCommand(fail=True))
-        server.juke_stop()
-        assert calls[0:2] == ["cmd", "release"]
-        assert calls[2][0:2] == ("rest", "/v1/machine:reset")
-        assert calls[2][2]["request_timeout"] == 4.0
+        assert calls[0][0:2] == ("rest", "/v1/machine:reset")
+        assert calls[0][2]["request_timeout"] == 4.0
+        assert calls[1] == ("release", {"silent": True, "cached_only": True})
+        assert "fresh-reset" not in calls
     finally:
         server.JUKE.clear(); server.JUKE.update(previous)
 
@@ -3060,16 +3345,16 @@ def test_more_like_this_inserts_after_current_while_radio_appends(monkeypatch):
 
 
 def test_readme_has_canonical_screenshots_and_three_tier_quick_start():
+    import gallery_check
     readme = (Path(server.ROOT) / "README.md").read_text(encoding="utf-8")
     screenshots = readme.index("## Screenshots")
     quick = readme.index("## Quick start")
     mount = readme.index("## Mount safety modes")
     assert screenshots < quick < mount
-    for image in (
-        "docs/screen-tab.png", "docs/storage-search.png", "docs/jukebox.png",
-        "docs/favourites.png", "docs/assembly64.png",
-    ):
+    for image in gallery_check.CANONICAL_IMAGES:
         assert image in readme
+    assert gallery_check.gallery_images() == list(gallery_check.CANONICAL_IMAGES)
+    assert len(gallery_check.CANONICAL_IMAGES) == 13
     assert '*SID Jukebox: instant search across the entire HVSC, one-click playback through the machine\'s own audio — plus "More like this" and Radio mode powered by SIDFlow similarity data (Chris Gleissner), with persistent play queues.*' in readme
     section = readme[quick:mount]
     tier1 = section.index("### Tier 1 — Windows, no Python")
@@ -3092,9 +3377,2083 @@ def test_sidflow_help_explains_radio_queue_and_local_privacy():
     for text in (
         "Selecting an individual search or browser result now creates a one-tune queue",
         "Clear Queue always disarms Radio first",
+        "cancel pending SID completion/auto-advance callbacks",
         "inserts the results immediately after the currently playing tune",
         "A session-level played set prevents repeats",
         "does not upload listening activity",
         "Powered by SIDFlow (Chris Gleissner)",
     ):
         assert text in help_js
+
+# --- Beta 11 Ethernet / Wi-Fi interface awareness ----------------------
+
+def test_link_mac_classification_is_positive_only():
+    from network_awareness import classify_mac
+    assert classify_mac("02:15:41:aa:bb:cc") == "ethernet"
+    assert classify_mac("24:0A:C4:11:22:33") == "wifi"
+    assert classify_mac("00:11:22:33:44:55") == "unknown"
+    assert classify_mac("") == "unknown"
+
+
+def test_off_link_mac_lookup_never_trusts_gateway_or_calls_resolver():
+    import ipaddress
+    from network_awareness import LinkDetector
+    calls = []
+    detector = LinkDetector()
+    result = detector.detect(
+        "198.51.100.64",
+        networks=[ipaddress.ip_network("192.168.249.0/24")],
+        resolver=lambda *a, **k: calls.append(True) or "02:15:41:aa:bb:cc",
+    )
+    assert result.link_type == "unknown"
+    assert result.method == "off-link"
+    assert calls == []
+
+
+def test_latency_fallback_labels_only_a_clear_dual_address_race():
+    from network_awareness import latency_race
+
+    async def wide(ip):
+        return {"192.0.2.10": 20.0, "192.0.2.20": 200.0}[ip]
+
+    labelled = asyncio.run(latency_race(["192.0.2.10", "192.0.2.20"], sampler=wide))
+    assert labelled["192.0.2.10"].link_type == "ethernet"
+    assert labelled["192.0.2.20"].link_type == "wifi"
+
+    async def close(ip):
+        return {"192.0.2.10": 20.0, "192.0.2.20": 30.0}[ip]
+
+    inconclusive = asyncio.run(latency_race(["192.0.2.10", "192.0.2.20"], sampler=close))
+    assert {row.link_type for row in inconclusive.values()} == {"unknown"}
+    single = asyncio.run(latency_race(["192.0.2.10"], sampler=wide))
+    assert single["192.0.2.10"].method == "latency-not-run"
+
+
+def test_contradictory_dual_mac_classification_is_demoted_and_raced():
+    from network_awareness import LinkObservation, classify_address_group
+
+    class SameDetector:
+        def detect(self, ip):
+            return LinkObservation(ip, "ethernet", "02:15:41:00:00:01", "wired-prefix")
+
+    async def sample(ip):
+        return 20.0 if ip.endswith(".10") else 200.0
+
+    out = asyncio.run(classify_address_group(
+        ["192.0.2.10", "192.0.2.20"], SameDetector(), latency_sampler=sample))
+    assert out["192.0.2.10"].method == "latency-race"
+    assert out["192.0.2.10"].link_type == "ethernet"
+    assert out["192.0.2.20"].link_type == "wifi"
+
+
+def test_discovery_dedupes_same_unique_id_and_prefers_ethernet():
+    import discovery
+    from network_awareness import LinkObservation
+
+    class Detector:
+        def detect(self, ip):
+            if ip.endswith(".124"):
+                return LinkObservation(ip, "ethernet", "02:15:41:aa:bb:cc", "wired-prefix")
+            return LinkObservation(ip, "wifi", "24:0A:C4:11:22:33", "espressif-oui")
+
+    info = {
+        "product": "Ultimate 64", "firmware_version": "3.15",
+        "hostname": "Ultimate-64-F06606", "unique_id": "Ultimate-64-F06606",
+    }
+    hits = [
+        {"ip": "192.168.249.124", "product": "Ultimate 64", "firmware": "3.15",
+         "hostname": info["hostname"], "unique_id": info["unique_id"], "core": "1.4B", "info": dict(info)},
+        {"ip": "192.168.249.201", "product": "Ultimate 64", "firmware": "3.15",
+         "hostname": info["hostname"], "unique_id": info["unique_id"], "core": "1.4B", "info": dict(info)},
+    ]
+    known = {}
+    rows = asyncio.run(discovery._group_hits(hits, known, Detector()))
+    assert len(rows) == 1
+    assert rows[0]["preferred_ip"] == "192.168.249.124"
+    assert [a["link_type"] for a in rows[0]["addresses"]] == ["ethernet", "wifi"]
+    assert len(next(iter(known.values()))["addresses"]) == 2
+
+
+def test_oui_refresh_is_additive_and_rejects_incomplete_data(tmp_path: Path):
+    from espressif_ouis import BUNDLED_ESPRESSIF_OUIS, WIRED_PREFIX
+    from network_awareness import refresh_oui_cache
+
+    class Response:
+        def __init__(self, text, status=200):
+            self.text = text; self.status_code = status
+            self.headers = {"etag": '"test"', "last-modified": "today"}
+
+    class Client:
+        def __init__(self, response): self.response = response
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def get(self, *args, **kwargs): return self.response
+
+    path = tmp_path / "ouis.json"
+    small = refresh_oui_cache(path, now=1000, client_factory=lambda: Client(Response("AA:BB:CC Espressif")))
+    assert small == set(BUNDLED_ESPRESSIF_OUIS)
+    assert not path.exists()
+
+    lines = [f"{prefix} Espressif Inc" for prefix in sorted(BUNDLED_ESPRESSIF_OUIS)]
+    lines.append("AA:BB:CC Espressif Systems")
+    merged = refresh_oui_cache(path, now=2000, client_factory=lambda: Client(Response("\n".join(lines))))
+    assert "AA:BB:CC" in merged
+    assert set(BUNDLED_ESPRESSIF_OUIS) <= merged
+    assert WIRED_PREFIX not in merged
+
+
+def test_oui_refresh_timeout_is_silent_and_keeps_bundled_set(tmp_path: Path):
+    from espressif_ouis import BUNDLED_ESPRESSIF_OUIS
+    from network_awareness import refresh_oui_cache
+
+    class Broken:
+        def __enter__(self): raise TimeoutError("offline")
+        def __exit__(self, *args): return False
+
+    assert refresh_oui_cache(tmp_path / "ouis.json", client_factory=Broken) == set(BUNDLED_ESPRESSIF_OUIS)
+
+
+def test_rest_timeout_scales_only_for_positive_wifi():
+    class FakeREST:
+        def __init__(self): self.values = []
+        def set_timeout(self, value): self.values.append(value)
+
+    fake = FakeREST()
+    assert server._configure_rest_timeout(fake, "wifi") == server.WIFI_REST_TIMEOUT
+    assert fake.values[-1] == 45.0
+    assert server._configure_rest_timeout(fake, "ethernet") == server.DEFAULT_REST_TIMEOUT
+    assert fake.values[-1] == 8.0
+    assert server._configure_rest_timeout(fake, "unknown") == server.DEFAULT_REST_TIMEOUT
+    assert fake.values[-1] == 8.0
+
+
+def test_wifi_gates_only_stream_start_and_rest_features_remain_available(monkeypatch):
+    class FakeREST:
+        def get_json(self, path): return {"path": path}
+
+    previous = server.rest
+    server.rest = FakeREST()
+    monkeypatch.setattr(server, "_current_link_payload", lambda **kwargs: {"link_type": "wifi"})
+    try:
+        with pytest.raises(HTTPException) as exc:
+            server.stream_ctl("video", "start")
+        assert exc.value.status_code == 409
+        assert server.configs()["path"] == "/v1/configs"
+    finally:
+        server.rest = previous
+
+
+def test_frontend_wifi_gating_and_unknown_no_frame_hint_are_present():
+    static = Path(server.ASSETS) / "static"
+    html = (static / "index.html").read_text(encoding="utf-8")
+    js = (static / "app.js").read_text(encoding="utf-8")
+    for control in ("btnVideo", "btnAudio", "btnRecord", "btnFullscreen"):
+        assert f'id="{control}"' in html
+    assert 'id="streamLinkStatus"' in html
+    assert 'id="wifiSwitchInline"' in html
+    assert "STREAMING NOT AVAILABLE OVER WI-FI" in js
+    assert "No video frames received. If this Ultimate is connected over Wi-Fi" in js
+    assert 'LINK_STATUS.link_type==="wifi"?45000:15000' in js
+
+
+def test_interface_awareness_help_readme_and_expanded_screenshot_gallery():
+    readme = (Path(server.ROOT) / "README.md").read_text(encoding="utf-8")
+    help_js = (Path(server.ASSETS) / "static" / "help_content.js").read_text(encoding="utf-8")
+    assert "docs/settings.png" in readme
+    assert "docs/device-finder.png" in readme
+    assert "docs/wifi-ethernet-header.png" in readme
+    assert "docs/wifi-streaming-gated.png" in readme
+    assert "docs/mount-and-run.png" in readme
+    assert "docs/busy-loading.png" in readme
+    assert "docs/disk-swap.png" in readme
+    assert "Full firmware settings access — every category editable from the browser" in readme
+    assert "## Interface-aware Ultimate discovery" in readme
+    assert "STREAMING NOT AVAILABLE OVER WI-FI" in readme
+    assert "groups the two addresses into one row and recommends Ethernet" in help_js
+    assert "all other REST features remain available" in help_js
+    assert "guidance rather than a diagnosis" in help_js
+
+
+def test_help_covers_finder_mount_state_quick_launch_and_major_workflows():
+    help_js = (Path(server.ASSETS) / "static" / "help_content.js").read_text(encoding="utf-8")
+    for text in (
+        'title:"Find Ultimate Devices"',
+        "Previously verified addresses on the current local subnet are checked first",
+        "an address must answer during this scan before it can be displayed",
+        "updates as soon as the Ultimate confirms the mount",
+        "confirmed filename remains visible with an amber loading note",
+        'title:"Quick Launch"',
+        "right-click a Quick Launch button to remove",
+        "Results remain in the left pane",
+        "These controls affect the device; they are separate from u64deck's local",
+        "Mount &amp; Run shows BUSY",
+    ):
+        assert text.lower() in help_js.lower()
+
+
+# --- Public Beta 15: readmem readiness gates and conservative swap additions ---
+
+
+def _http_response(status: int, *, content: bytes = b"", json_data=None,
+                   content_type: str = "application/octet-stream"):
+    request = httpx.Request("GET", "http://u64/v1/machine:readmem")
+    if json_data is not None:
+        return httpx.Response(status, json=json_data, request=request)
+    return httpx.Response(status, content=content,
+                          headers={"content-type": content_type}, request=request)
+
+
+def test_read_memory_uses_hex_address_and_returns_binary():
+    captured = {}
+
+    class FakeClient:
+        def get(self, path, params=None):
+            captured.update(path=path, params=params)
+            return _http_response(200, content=b"\x00\x01")
+
+    client = ultimate.UltimateREST.__new__(ultimate.UltimateREST)
+    client.coordinator = None
+    client.client = FakeClient()
+    assert client.read_memory(0x00CC, 2) == b"\x00\x01"
+    assert captured == {
+        "path": "/v1/machine:readmem",
+        "params": {"address": "00CC", "length": "2"},
+    }
+
+
+def test_read_memory_404_is_capability_fallback():
+    class FakeClient:
+        def get(self, path, params=None):
+            return _http_response(404)
+
+    client = ultimate.UltimateREST.__new__(ultimate.UltimateREST)
+    client.coordinator = None
+    client.client = FakeClient()
+    assert client.read_memory("$00CC", 1) is None
+
+
+def test_read_memory_tolerates_json_list_and_hex_payloads():
+    class FakeClient:
+        def __init__(self, payload): self.payload = payload
+        def get(self, path, params=None):
+            return _http_response(200, json_data=self.payload)
+
+    client = ultimate.UltimateREST.__new__(ultimate.UltimateREST)
+    client.coordinator = None
+    client.client = FakeClient({"data": [0, 255]})
+    assert client.read_memory("00CC", 2) == b"\x00\xff"
+    client.client = FakeClient({"data": "00 ff"})
+    assert client.read_memory("00CC", 2) == b"\x00\xff"
+
+
+def _gate_with(sequence, monkeypatch, *, timeout=120.0, grace=0.0):
+    reads = list(sequence)
+    now = [0.0]
+    events = []
+
+    def reader():
+        return reads.pop(0) if reads else 1
+
+    def sleeper(seconds):
+        now[0] += seconds
+
+    monkeypatch.setattr(server, "_diag_event",
+                        lambda level, message, **extra: events.append((level, message)))
+    result = server._basic_ready_gate(
+        "test", timeout=timeout, poll=0.5, grace=grace,
+        reader=reader, sleeper=sleeper, clock=lambda: now[0],
+    )
+    return result, events
+
+
+def test_basic_ready_gate_debounces_and_logs_completion(monkeypatch):
+    result, events = _gate_with([1, 0, 1, 0, 0], monkeypatch)
+    assert result == "ready"
+    assert len(events) == 1
+    assert "Mount & Run gate 'test': ready" in events[0][1]
+    assert "last $CC read: 0" in events[0][1]
+
+
+def test_basic_ready_gate_timeout_and_unsupported_are_logged(monkeypatch):
+    result, events = _gate_with([1] * 10, monkeypatch, timeout=2.0)
+    assert result == "timeout"
+    assert "gate 'test': timeout" in events[0][1]
+    result, events = _gate_with([None], monkeypatch)
+    assert result == "unsupported"
+    assert "last $CC read: unsupported" in events[0][1]
+
+
+def test_readmem_support_cache_is_per_device(monkeypatch):
+    previous = server.rest
+    server._READMEM_SUPPORT.clear()
+
+    class FakeRest:
+        def __init__(self, host, result):
+            self.host = host
+            self.result = result
+            self.reads = 0
+        def read_memory(self, address, length):
+            self.reads += 1
+            return self.result
+
+    try:
+        unsupported = FakeRest("192.0.2.10", None)
+        server.rest = unsupported
+        assert server._read_basic_ready_flag() is None
+        assert server._read_basic_ready_flag() is None
+        assert unsupported.reads == 1
+
+        supported = FakeRest("192.0.2.11", b"\x00")
+        server.rest = supported
+        assert server._read_basic_ready_flag() == 0
+        assert supported.reads == 1
+    finally:
+        server.rest = previous
+        server._READMEM_SUPPORT.clear()
+
+
+def _mount_boot_harness(monkeypatch, gate_results):
+    typed = []
+    gates = list(gate_results)
+    matrix_events = []
+    monkeypatch.setattr(server, "_matrix_release_all", lambda **kwargs: None)
+    monkeypatch.setattr(server, "_matrix_send",
+                        lambda *args, **kwargs: matrix_events.append((args, kwargs)))
+    monkeypatch.setattr(server, "_boot_settle", lambda: None)
+    monkeypatch.setattr(server, "_remember_mount", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_bus_id_for", lambda drive: 8)
+    monkeypatch.setattr(server, "_basic_ready_gate",
+                        lambda stage, **kwargs: gates.pop(0))
+    monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+
+    class FakeRest:
+        host = "192.0.2.64"
+        def mount_path(self, *args, **kwargs): pass
+        def mount_attachment(self, *args, **kwargs): pass
+        def put(self, *args, **kwargs): pass
+
+    class FakeCmd:
+        def type_petscii(self, data, **kwargs):
+            typed.append(bytes(data))
+
+    monkeypatch.setattr(server, "rest", FakeRest())
+    monkeypatch.setattr(server, "cmd", FakeCmd())
+    out = server._mount_and_boot("a", "unlinked", device_path="/Usb0/demo.d64")
+    return typed, matrix_events, out
+
+
+def test_mount_and_run_ready_path_types_exact_buffer_commands(monkeypatch):
+    typed, matrix_events, out = _mount_boot_harness(monkeypatch, ["ready", "ready"])
+    assert typed == [b'LOAD"*",8,1\r', b"RUN\r"]
+    assert matrix_events == []
+    assert out == {"errors": [], "typed": 'LOAD"*",8,1 + RUN'}
+
+
+def test_mount_and_run_ready_path_uses_cia1_matrix_for_run(monkeypatch):
+    diagnostics = []
+    monkeypatch.setattr(server, "_input_status",
+                        lambda *args, **kwargs: {"available": True})
+    monkeypatch.setattr(server, "_diag_event",
+                        lambda level, message, **kwargs: diagnostics.append((level, message)))
+
+    typed, matrix_events, out = _mount_boot_harness(monkeypatch, ["ready", "ready"])
+
+    assert typed == [b'LOAD"*",8,1\r']
+    assert matrix_events == [((server._RUN_MATRIX_EVENTS,), {"client": server.rest})]
+    assert out == {"errors": [], "typed": 'LOAD"*",8,1 + RUN'}
+    assert ("info", "Mount & Run RUN delivery: CIA1 matrix") in diagnostics
+
+
+def test_mount_and_run_matrix_failure_does_not_duplicate_via_buffer(monkeypatch):
+    typed = []
+    monkeypatch.setattr(server, "_input_status",
+                        lambda *args, **kwargs: {"available": True})
+    monkeypatch.setattr(server, "_matrix_send",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(
+                            httpx.ReadTimeout("ambiguous matrix timeout")))
+    monkeypatch.setattr(server, "_warn_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+
+    class FakeCmd:
+        def type_petscii(self, data, **kwargs):
+            typed.append(bytes(data))
+
+    monkeypatch.setattr(server, "cmd", FakeCmd())
+    delivered, note = server._dispatch_run_after_gate()
+
+    assert delivered is False
+    assert typed == []
+    assert "RUN not resent" in note
+
+
+def test_mount_and_run_boot_timeout_types_nothing(monkeypatch):
+    typed, matrix_events, out = _mount_boot_harness(monkeypatch, ["timeout"])
+    assert typed == [] and matrix_events == []
+    assert out["typed"] == ""
+    assert out["note"] == "machine not ready — LOAD not typed"
+
+
+def test_mount_and_run_load_timeout_withholds_run(monkeypatch):
+    typed, matrix_events, out = _mount_boot_harness(monkeypatch, ["ready", "timeout"])
+    assert typed == [b'LOAD"*",8,1\r'] and matrix_events == []
+    assert out["typed"] == 'LOAD"*",8,1'
+    assert out["note"] == "load still running — RUN not sent"
+
+
+def test_mount_and_run_unsupported_readmem_keeps_beta11_delays(monkeypatch):
+    monkeypatch.setattr(server, "_input_status",
+                        lambda *args, **kwargs: {"available": True})
+    typed, matrix_events, out = _mount_boot_harness(monkeypatch, ["unsupported"])
+    assert typed == [b'LOAD"*",8,1\r', b"RUN\r"]
+    assert matrix_events == []
+    assert out == {"errors": [], "typed": 'LOAD"*",8,1 + RUN'}
+
+
+def test_swap_groups_compound_numbered_tokens_without_changing_plain_signature():
+    siblings = ["EdgeOfDisgrace_1b.d64", "EdgeOfDisgrace_0.d64",
+                "EdgeOfDisgrace_1a.d64", "Other_1a.d64"]
+    assert server._swap_group_candidates("EdgeOfDisgrace_0.d64", siblings) == [
+        "EdgeOfDisgrace_0.d64", "EdgeOfDisgrace_1a.d64", "EdgeOfDisgrace_1b.d64",
+    ]
+    family, _token = server._swap_signature("Uncensored_1.d64")
+    assert family == (".d64", "numbered", "uncensored", "number")
+
+
+def test_swap_groups_safe_bare_wrapped_tokens():
+    assert server._swap_group_candidates(
+        "WeAreDemo(A).d64", ["WeAreDemo(B).d64", "WeAreDemo(A).d64"]
+    ) == ["WeAreDemo(A).d64", "WeAreDemo(B).d64"]
+    assert server._swap_group_candidates(
+        "Game(1).d64", ["Game(2).d64", "Game(1).d64"]
+    ) == ["Game(1).d64", "Game(2).d64"]
+
+
+def test_swap_vetoes_alternate_dump_and_glued_digit_shapes():
+    assert server._swap_group_candidates(
+        "Game(a).d64", ["Game.d64", "Game(a).d64", "Game(b).d64"]
+    ) == ["Game(a).d64"]
+    assert server._swap_group_candidates(
+        "Game[a].d64", ["Game[a].d64", "Game[b].d64"]
+    ) == ["Game[a].d64"]
+    assert server._swap_group_candidates(
+        "Turrican1.d64", ["Turrican1.d64", "Turrican2.d64"]
+    ) == ["Turrican1.d64"]
+
+
+def test_swap_groups_titleless_markers_but_never_mixes_marker_families():
+    assert server._swap_group_candidates(
+        "side1.d64", ["side2.d64", "side1.d64"]
+    ) == ["side1.d64", "side2.d64"]
+    assert server._swap_group_candidates(
+        "side1.d64", ["side1.d64", "disk2.d64"]
+    ) == ["side1.d64"]
+
+
+def test_scanner_displays_hostname_before_unique_id():
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    hostname_branch = '${d.hostname?" · "+esc(d.hostname):(d.unique_id?" · "+esc(d.unique_id):"")}'
+    assert hostname_branch in js
+    assert '${d.unique_id?" · "+esc(d.unique_id):(d.hostname?" · "+esc(d.hostname):"")}' not in js
+
+
+# --- Public Beta 15: verified-only discovery and reliable Jukebox Stop ---
+
+
+def _discovery_hit(ip: str, *, unique_id: str = "101090",
+                   hostname: str = "Ultimate-64-F06606") -> dict:
+    info = {
+        "product": "Ultimate 64",
+        "firmware_version": "3.15",
+        "hostname": hostname,
+        "unique_id": unique_id,
+    }
+    return {
+        "ip": ip, "product": "Ultimate 64", "firmware": "3.15",
+        "hostname": hostname, "unique_id": unique_id, "core": "1.4B",
+        "info": info,
+    }
+
+
+def _transport_result(ip: str, *, unique_id: str = "101090",
+                      hostname: str = "Ultimate-64-F06606",
+                      stage: str = "direct-subnet") -> dict:
+    return {
+        "ip": ip,
+        "stage": stage,
+        "status": "ultimate",
+        "elapsed_ms": 25.0,
+        "found_after_ms": 100.0,
+        "payload": {
+            "product": "Ultimate 64",
+            "firmware_version": "3.15",
+            "hostname": hostname,
+            "unique_id": unique_id,
+            "core_version": "1.4B",
+        },
+    }
+
+
+class _MappedLinkDetector:
+    def __init__(self, mapping):
+        self.mapping = mapping
+
+    def detect(self, ip, *, force=False, **_kwargs):
+        from network_awareness import LinkObservation
+        link, mac, method = self.mapping[ip]
+        return LinkObservation(ip, link, mac, method)
+
+
+def test_discovery_returns_only_addresses_verified_in_current_scan():
+    import discovery
+
+    known = {
+        "uid:101090": {
+            "identity": "uid:101090", "unique_id": "101090",
+            "hostname": "Ultimate-64-F06606", "product": "Ultimate 64",
+            "addresses": {
+                "192.168.249.143": {
+                    "ip": "192.168.249.143", "link_type": "wifi",
+                    "mac": "24:0A:C4:9F:77:C8", "last_seen": "old-wifi",
+                },
+                "192.168.249.144": {
+                    "ip": "192.168.249.144", "link_type": "ethernet",
+                    "mac": "02:15:41:F0:66:06", "last_seen": "old-ethernet",
+                },
+            },
+        }
+    }
+    detector = _MappedLinkDetector({
+        "192.168.249.144": ("ethernet", "02:15:41:F0:66:06", "wired-prefix"),
+    })
+    events = []
+    devices = asyncio.run(discovery._group_hits(
+        [_discovery_hit("192.168.249.144")], known, detector, events=events))
+
+    assert [row["ip"] for row in devices[0]["addresses"]] == ["192.168.249.144"]
+    assert devices[0]["preferred_ip"] == "192.168.249.144"
+    assert known["uid:101090"]["addresses"]["192.168.249.143"]["last_seen"] == "old-wifi"
+    assert any("192.168.249.143" in event and "no response" in event for event in events)
+
+
+def test_discovery_dhcp_replacement_removes_superseded_ips_by_mac():
+    import discovery
+
+    known = {
+        "uid:101090": {
+            "identity": "uid:101090", "unique_id": "101090",
+            "hostname": "Ultimate-64-F06606", "product": "Ultimate 64",
+            "addresses": {
+                "192.168.249.124": {
+                    "ip": "192.168.249.124", "link_type": "ethernet",
+                    "mac": "02:15:41:F0:66:06", "last_seen": "old",
+                },
+                "192.168.249.129": {
+                    "ip": "192.168.249.129", "link_type": "wifi",
+                    "mac": "24:0A:C4:9F:77:C8", "last_seen": "old",
+                },
+            },
+        }
+    }
+    detector = _MappedLinkDetector({
+        "192.168.249.143": ("wifi", "24:0A:C4:9F:77:C8", "espressif-oui"),
+        "192.168.249.144": ("ethernet", "02:15:41:F0:66:06", "wired-prefix"),
+    })
+    events = []
+    devices = asyncio.run(discovery._group_hits([
+        _discovery_hit("192.168.249.143"),
+        _discovery_hit("192.168.249.144"),
+    ], known, detector, events=events))
+
+    assert [row["ip"] for row in devices[0]["addresses"]] == [
+        "192.168.249.144", "192.168.249.143",
+    ]
+    assert set(known["uid:101090"]["addresses"]) == {
+        "192.168.249.143", "192.168.249.144",
+    }
+    assert sum("Discovery address replaced" in event for event in events) == 2
+
+
+def test_discovery_remembered_addresses_are_probe_candidates_not_results(monkeypatch):
+    import discovery
+
+    stages = []
+    monkeypatch.setattr(discovery, "local_subnets", lambda: ["192.0.2."])
+
+    def scan_direct(ips, workers, connect_timeout, response_timeout, overall_started, stage, port=80):
+        stages.append((list(ips), workers, connect_timeout, response_timeout, stage, port))
+        return []
+
+    monkeypatch.setattr(discovery.discovery_transport, "scan_direct", scan_direct)
+    known = {"uid:1": {"addresses": {"192.0.2.44": {"ip": "192.0.2.44"}}}}
+    result = asyncio.run(discovery.discover(known_devices=known))
+
+    assert stages[0][0] == ["192.0.2.44"]
+    assert stages[0][4] == "cached-first"
+    assert "192.0.2.44" not in stages[1][0]
+    assert sum(len(stage[0]) for stage in stages) == 254
+    assert result["devices"] == []
+    assert result["candidate_count"] == 254
+
+def test_discovery_updates_saved_host_only_to_verified_active_identity(monkeypatch):
+    original = dict(server.CFG)
+    original_live = {key: set(value) for key, value in server.DISCOVERY_LIVE_ADDRESSES.items()}
+    diagnostics = []
+
+    async def fake_discover(*args, **kwargs):
+        return {
+            "devices": [{
+                "identity": "uid:101090", "preferred_ip": "192.168.249.144",
+                "addresses": [{"ip": "192.168.249.144", "link_type": "ethernet"}],
+            }],
+            "diagnostics": ["Discovery scan: test"], "subnets": [],
+        }
+
+    try:
+        server.CFG.clear(); server.CFG.update(original)
+        server.CFG["u64_host"] = "192.168.249.124"
+        server.CFG["active_device_identity"] = "uid:101090"
+        monkeypatch.setattr(server.discovery, "discover", fake_discover)
+        monkeypatch.setattr(server, "save_config", lambda: None)
+        monkeypatch.setattr(server, "_diag_event",
+                            lambda level, message, **extra: diagnostics.append(message))
+        asyncio.run(server._run_discovery())
+        assert server.CFG["u64_host"] == "192.168.249.144"
+        assert server.DISCOVERY_LIVE_ADDRESSES == {"uid:101090": {"192.168.249.144"}}
+        assert any("Preferred address updated" in message for message in diagnostics)
+    finally:
+        server.CFG.clear(); server.CFG.update(original)
+        server.DISCOVERY_LIVE_ADDRESSES.clear()
+        server.DISCOVERY_LIVE_ADDRESSES.update(original_live)
+
+
+def test_clear_discovered_devices_preserves_unrelated_settings_and_rescans(monkeypatch):
+    original = dict(server.CFG)
+    calls = []
+
+    async def fake_scan(subnet="", port=80):
+        calls.append((subnet, port))
+        return {"devices": [], "subnets": ["192.168.1.0/24"], "diagnostics": []}
+
+    try:
+        server.CFG.clear(); server.CFG.update({
+            **original,
+            "u64_host": "192.168.249.144",
+            "known_devices": {"uid:1": {"addresses": {"192.168.249.144": {}}}},
+            "active_device_identity": "uid:1",
+            "input_method_preferences": {"uid:1": "legacy"},
+            "sid_local_source": "F:\\HVSC",
+            "http_port": 8064,
+        })
+        monkeypatch.setattr(server, "_disconnect_discovery_session",
+                            lambda: calls.append("disconnect"))
+        monkeypatch.setattr(server, "save_config", lambda: calls.append("save"))
+        monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+        monkeypatch.setattr(server, "_run_discovery", fake_scan)
+        result = asyncio.run(server.api_discover_clear("192.168.249.", 80))
+
+        assert server.CFG["known_devices"] == {}
+        assert server.CFG["active_device_identity"] == ""
+        assert server.CFG["u64_host"] == ""
+        assert "input_method_preferences" not in server.CFG
+        assert server.CFG["sid_local_source"] == "F:\\HVSC"
+        assert server.CFG["http_port"] == 8064
+        assert calls == ["disconnect", "save", ("192.168.249.", 80)]
+        assert result["cleared"] is True
+    finally:
+        server.CFG.clear(); server.CFG.update(original)
+
+
+def test_disconnect_waits_for_active_status_before_closing_client(monkeypatch):
+    coordinator = server.DeviceOperationCoordinator()
+    status_active = threading.Event()
+    release_status = threading.Event()
+    rest_closed = threading.Event()
+    cmd_closed = threading.Event()
+    original_stream_state = dict(server.STREAM_STATE)
+
+    class OldRest:
+        host = "192.0.2.64"
+        def close(self):
+            rest_closed.set()
+
+    class OldCmd:
+        def close(self):
+            cmd_closed.set()
+
+    class EmptyRest:
+        host = ""
+
+    monkeypatch.setattr(server, "DEVICE_OP", coordinator)
+    monkeypatch.setattr(server, "rest", OldRest())
+    monkeypatch.setattr(server, "cmd", OldCmd())
+    monkeypatch.setattr(server, "devfs", object())
+    monkeypatch.setattr(server, "UltimateREST",
+                        lambda *args, **kwargs: EmptyRest())
+    monkeypatch.setattr(server, "CommandSocket",
+                        lambda *args, **kwargs: object())
+    monkeypatch.setattr(server, "DeviceFS",
+                        lambda *args, **kwargs: object())
+    monkeypatch.setattr(server, "_matrix_release_all",
+                        lambda *args, **kwargs: False)
+    server.STREAM_STATE.update({"video": False, "audio": False})
+
+    def hold_status():
+        with coordinator.operation("status", "polling /api/info"):
+            status_active.set()
+            assert release_status.wait(2.0)
+
+    holder = threading.Thread(target=hold_status, daemon=True)
+    holder.start()
+    assert status_active.wait(1.0)
+
+    disconnect = threading.Thread(
+        target=server._disconnect_discovery_session, daemon=True)
+    disconnect.start()
+    time.sleep(0.05)
+    assert not rest_closed.is_set()
+    assert not cmd_closed.is_set()
+
+    release_status.set()
+    holder.join(1.0)
+    disconnect.join(1.0)
+    assert rest_closed.is_set()
+    assert cmd_closed.is_set()
+    assert isinstance(server.rest, EmptyRest)
+    server.STREAM_STATE.clear(); server.STREAM_STATE.update(original_stream_state)
+
+
+def test_discovery_ui_has_nuclear_clear_and_verified_only_wording():
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    assert "Clear discovered devices" in js
+    assert "/api/discover/clear" in js
+    assert "Only interfaces verified during this scan are shown" in js
+    assert "Other settings will not be changed" in js
+
+
+def test_command_socket_fresh_reset_discards_idle_socket(monkeypatch):
+    closed = []
+    sent = []
+
+    class FakeSocket:
+        def close(self): closed.append(self)
+        def sendall(self, payload): sent.append(bytes(payload))
+        def setsockopt(self, *args): pass
+
+    old_socket = FakeSocket()
+    new_socket = FakeSocket()
+    monkeypatch.setattr(ultimate.socket, "create_connection",
+                        lambda address, timeout=4: new_socket)
+    command = ultimate.CommandSocket("192.0.2.64")
+    command._sock = old_socket
+    command.reset_fresh()
+
+    assert closed == [old_socket]
+    assert sent == [b"\x04\xff\x00\x00"]
+    assert command._sock is new_socket
+
+
+def test_juke_stop_cia1_uses_fresh_reset_once_and_skips_rest(monkeypatch):
+    previous = dict(server.JUKE)
+    calls = []
+    host = "192.0.2.18"
+
+    class FakeCommand:
+        def reset(self): calls.append("old-reset")
+        def reset_fresh(self): calls.append("fresh-reset")
+
+    class FakeRest:
+        def __init__(self): self.host = host
+        def put(self, *args, **kwargs): calls.append("rest")
+
+    try:
+        server.JUKE.update({"items": [], "index": -1, "playing": True,
+                            "stop_after_current": False, "timer": None})
+        monkeypatch.setattr(server, "cmd", FakeCommand())
+        monkeypatch.setattr(server, "rest", FakeRest())
+        monkeypatch.setitem(server.INPUT_CAPABILITIES, host, {"available": True})
+        monkeypatch.setattr(server, "_matrix_release_all",
+                            lambda **kwargs: calls.append(("release", kwargs)))
+        monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+        server.juke_stop()
+        assert calls == [
+            "fresh-reset",
+            ("release", {"silent": True, "cached_only": True}),
+        ]
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+def test_juke_stop_cia1_fresh_failure_releases_matrix_then_uses_rest(monkeypatch):
+    previous = dict(server.JUKE)
+    calls = []
+    host = "192.0.2.19"
+
+    class FakeCommand:
+        def reset_fresh(self):
+            calls.append("fresh-reset")
+            raise RuntimeError("stale socket")
+
+    class FakeRest:
+        def __init__(self): self.host = host
+        def put(self, path, **kwargs):
+            calls.append(("rest", path, kwargs))
+            return {}
+
+    try:
+        server.JUKE.update({"items": [], "index": -1, "playing": True,
+                            "stop_after_current": False, "timer": None})
+        monkeypatch.setattr(server, "cmd", FakeCommand())
+        monkeypatch.setattr(server, "rest", FakeRest())
+        monkeypatch.setitem(server.INPUT_CAPABILITIES, host, {"available": True})
+        monkeypatch.setattr(server, "_matrix_release_all",
+                            lambda **kwargs: calls.append(("release", kwargs)))
+        monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+        server.juke_stop()
+        assert calls[0:2] == [
+            "fresh-reset",
+            ("release", {"silent": True, "cached_only": True}),
+        ]
+        assert calls[2][0:2] == ("rest", "/v1/machine:reset")
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+def test_juke_stop_legacy_rest_failure_falls_back_to_fresh_command(monkeypatch):
+    previous = dict(server.JUKE)
+    calls = []
+    host = "192.0.2.20"
+
+    class FakeCommand:
+        def reset_fresh(self): calls.append("fresh-reset")
+
+    class FakeRest:
+        def __init__(self): self.host = host
+        def put(self, path, **kwargs):
+            calls.append(("rest", path, kwargs))
+            raise RuntimeError("REST busy")
+
+    try:
+        server.JUKE.update({"items": [], "index": -1, "playing": True,
+                            "stop_after_current": False, "timer": None})
+        monkeypatch.setattr(server, "cmd", FakeCommand())
+        monkeypatch.setattr(server, "rest", FakeRest())
+        monkeypatch.setitem(server.INPUT_CAPABILITIES, host, {"available": False})
+        monkeypatch.setattr(server, "_matrix_release_all",
+                            lambda **kwargs: calls.append(("release", kwargs)))
+        monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+        server.juke_stop()
+        assert calls[0][0:2] == ("rest", "/v1/machine:reset")
+        assert calls[1] == ("release", {"silent": True, "cached_only": True})
+        assert calls[2] == "fresh-reset"
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+def test_juke_stop_missing_capability_cache_defaults_to_rest_without_probe(monkeypatch):
+    previous = dict(server.JUKE)
+    calls = []
+    host = "192.0.2.21"
+
+    class FakeCommand:
+        def reset_fresh(self): calls.append("fresh-reset")
+
+    class FakeRest:
+        def __init__(self): self.host = host
+        def put(self, path, **kwargs): calls.append(("rest", path, kwargs))
+
+    server.INPUT_CAPABILITIES.pop(host, None)
+    try:
+        server.JUKE.update({"items": [], "index": -1, "playing": True,
+                            "stop_after_current": False, "timer": None})
+        monkeypatch.setattr(server, "cmd", FakeCommand())
+        monkeypatch.setattr(server, "rest", FakeRest())
+        monkeypatch.setattr(server, "_input_status",
+                            lambda *args, **kwargs: pytest.fail("Stop must not probe"))
+        monkeypatch.setattr(server, "_matrix_release_all",
+                            lambda **kwargs: calls.append(("release", kwargs)))
+        monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+        server.juke_stop()
+        assert calls[0][0:2] == ("rest", "/v1/machine:reset")
+        assert "fresh-reset" not in calls
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+def test_connected_link_payload_never_offers_unverified_historical_address(monkeypatch):
+    from network_awareness import LinkObservation
+
+    original_cfg = dict(server.CFG)
+    original_live = {key: set(value) for key, value in server.DISCOVERY_LIVE_ADDRESSES.items()}
+    try:
+        server.CFG.clear(); server.CFG.update({
+            **original_cfg,
+            "known_devices": {
+                "uid:101090": {
+                    "identity": "uid:101090", "identity_source": "unique_id",
+                    "unique_id": "101090", "hostname": "Ultimate-64-F06606",
+                    "product": "Ultimate 64", "firmware": "3.15",
+                    "addresses": {
+                        "192.168.249.143": {
+                            "ip": "192.168.249.143", "link_type": "wifi",
+                            "mac": "24:0A:C4:9F:77:C8", "last_seen": "wifi-old",
+                        },
+                        "192.168.249.144": {
+                            "ip": "192.168.249.144", "link_type": "ethernet",
+                            "mac": "02:15:41:F0:66:06", "last_seen": "ethernet-old",
+                        },
+                    },
+                }
+            },
+            "active_device_identity": "uid:101090",
+            "u64_host": "192.168.249.144",
+        })
+        server.DISCOVERY_LIVE_ADDRESSES.clear()
+        server.DISCOVERY_LIVE_ADDRESSES["uid:101090"] = {"192.168.249.144"}
+        monkeypatch.setattr(server.LINK_DETECTOR, "detect", lambda ip, force=False:
+                            LinkObservation(ip, "ethernet", "02:15:41:F0:66:06", "wired-prefix"))
+        payload = server._link_payload("192.168.249.144", persist=False)
+
+        assert [row["ip"] for row in payload["addresses"]] == ["192.168.249.144"]
+        assert payload["ethernet_ip"] == "192.168.249.144"
+        assert payload["wifi_ip"] == ""
+        addresses = server.CFG["known_devices"]["uid:101090"]["addresses"]
+        assert addresses["192.168.249.143"]["last_seen"] == "wifi-old"
+        assert addresses["192.168.249.144"]["last_seen"] == "ethernet-old"
+    finally:
+        server.CFG.clear(); server.CFG.update(original_cfg)
+        server.DISCOVERY_LIVE_ADDRESSES.clear()
+        server.DISCOVERY_LIVE_ADDRESSES.update(original_live)
+
+
+def test_rc3_machine_takeover_disarms_jukebox_timer_and_generation(monkeypatch):
+    class FakeTimer:
+        def __init__(self):
+            self.cancelled = False
+        def cancel(self):
+            self.cancelled = True
+
+    previous = dict(server.JUKE)
+    timer = FakeTimer()
+    diagnostics = []
+    monkeypatch.setattr(server, "_diag_event",
+                        lambda level, message: diagnostics.append((level, message)))
+    try:
+        server.JUKE.clear(); server.JUKE.update({
+            "items": [server._juke_lazy_item("/HVSC/A.sid", "A.sid")],
+            "index": 0, "playing": True, "shuffle": False, "radio": True,
+            "song": 1, "timer": timer, "folder": "Current tune",
+            "loading": False, "source": "test", "generation": 41,
+            "stop_after_current": True,
+        })
+        generation = server._juke_disarm_machine_takeover("Mount & Run")
+        assert generation == 42
+        assert timer.cancelled is True
+        assert server.JUKE["timer"] is None
+        assert server.JUKE["playing"] is False
+        assert server.JUKE["stop_after_current"] is False
+        assert server.JUKE["radio"] is False
+        assert diagnostics == [("info", "SID Jukebox disarmed for Mount & Run")]
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+def test_rc3_stale_jukebox_callback_cannot_stop_or_restart_machine(monkeypatch):
+    previous = dict(server.JUKE)
+    calls = []
+    monkeypatch.setattr(server, "juke_stop", lambda: calls.append("stop"))
+    monkeypatch.setattr(
+        server, "_juke_play",
+        lambda index, **kwargs: calls.append(("play", index, kwargs)),
+    )
+    try:
+        server.JUKE.clear(); server.JUKE.update({
+            "items": [server._juke_lazy_item("/HVSC/A.sid", "A.sid")],
+            "index": 0, "playing": True, "shuffle": False, "radio": False,
+            "song": 1, "timer": None, "folder": "Current tune",
+            "loading": False, "source": "test", "generation": 8,
+            "stop_after_current": True,
+        })
+        server._juke_auto_next(7)
+        assert calls == []
+        assert server.JUKE["stop_after_current"] is True
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+def test_rc3_mount_and_run_invalidates_due_sid_completion_callback(monkeypatch):
+    class FakeTimer:
+        def __init__(self):
+            self.cancelled = False
+        def cancel(self):
+            self.cancelled = True
+
+    previous = dict(server.JUKE)
+    timer = FakeTimer()
+    calls = []
+    monkeypatch.setattr(server, "juke_stop", lambda: calls.append("stop"))
+    monkeypatch.setattr(
+        server, "_juke_play",
+        lambda index, **kwargs: calls.append(("play", index, kwargs)),
+    )
+    try:
+        server.JUKE.clear(); server.JUKE.update({
+            "items": [server._juke_lazy_item("/HVSC/A.sid", "A.sid")],
+            "index": 0, "playing": True, "shuffle": False, "radio": False,
+            "song": 1, "timer": timer, "folder": "Current tune",
+            "loading": False, "source": "test", "generation": 15,
+            "stop_after_current": True,
+        })
+        typed, matrix_events, out = _mount_boot_harness(monkeypatch, ["unsupported"])
+        server._juke_auto_next(15)
+        assert timer.cancelled is True
+        assert server.JUKE["generation"] == 16
+        assert server.JUKE["playing"] is False
+        assert server.JUKE["stop_after_current"] is False
+        assert calls == []
+        assert typed == [b'LOAD"*",8,1\r', b"RUN\r"]
+        assert matrix_events == []
+        assert out == {"errors": [], "typed": 'LOAD"*",8,1 + RUN'}
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+def test_rc3_non_jukebox_runner_disarms_pending_sid_callback(monkeypatch):
+    class FakeTimer:
+        def __init__(self):
+            self.cancelled = False
+        def cancel(self):
+            self.cancelled = True
+
+    previous = dict(server.JUKE)
+    timer = FakeTimer()
+    calls = []
+    monkeypatch.setattr(server, "_cart_configured", lambda: "")
+    monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+    try:
+        server.JUKE.clear(); server.JUKE.update({
+            "items": [server._juke_lazy_item("/HVSC/A.sid", "A.sid")],
+            "index": 0, "playing": True, "shuffle": False, "radio": True,
+            "song": 1, "timer": timer, "folder": "Current tune",
+            "loading": False, "source": "test", "generation": 21,
+            "stop_after_current": True,
+        })
+        result = server._run_cart_safe(lambda: calls.append("run") or {"ok": True})
+        assert result == {"ok": True}
+        assert calls == ["run"]
+        assert timer.cancelled is True
+        assert server.JUKE["generation"] == 22
+        assert server.JUKE["playing"] is False
+        assert server.JUKE["stop_after_current"] is False
+        assert server.JUKE["radio"] is False
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+
+def test_rc4_successful_sid_upload_marks_current_device_for_reboot(monkeypatch):
+    previous_rest = server.rest
+    previous_required = set(server.SID_RUNNER_REBOOT_REQUIRED)
+
+    class FakeRest:
+        host = "192.0.2.64"
+        def post_sid(self, *args, **kwargs):
+            return {"ok": True}
+
+    try:
+        server.SID_RUNNER_REBOOT_REQUIRED.clear()
+        server.rest = FakeRest()
+        monkeypatch.setattr(server, "_sid_ssl_payload", lambda data: None)
+        out = server._post_sid_upload("Tune.sid", b"PSID" + b"\0" * 200)
+        assert out == {"ok": True}
+        assert server._sid_runner_reboot_required(server.rest) is True
+    finally:
+        server.rest = previous_rest
+        server.SID_RUNNER_REBOOT_REQUIRED.clear()
+        server.SID_RUNNER_REBOOT_REQUIRED.update(previous_required)
+
+
+def test_rc4_failed_sid_upload_does_not_mark_reboot_required(monkeypatch):
+    previous_rest = server.rest
+    previous_required = set(server.SID_RUNNER_REBOOT_REQUIRED)
+
+    class FakeRest:
+        host = "192.0.2.65"
+        def post_sid(self, *args, **kwargs):
+            raise ultimate.UltimateError("upload failed")
+
+    try:
+        server.SID_RUNNER_REBOOT_REQUIRED.clear()
+        server.rest = FakeRest()
+        monkeypatch.setattr(server, "_sid_ssl_payload", lambda data: None)
+        with pytest.raises(ultimate.UltimateError, match="upload failed"):
+            server._post_sid_upload("Tune.sid", b"PSID" + b"\0" * 200)
+        assert server._sid_runner_reboot_required(server.rest) is False
+    finally:
+        server.rest = previous_rest
+        server.SID_RUNNER_REBOOT_REQUIRED.clear()
+        server.SID_RUNNER_REBOOT_REQUIRED.update(previous_required)
+
+
+def test_rc4_mount_and_run_reboots_after_sid_before_mount(monkeypatch):
+    previous_rest, previous_cmd = server.rest, server.cmd
+    previous_required = set(server.SID_RUNNER_REBOOT_REQUIRED)
+    events = []
+
+    class FakeRest:
+        host = "192.0.2.66"
+        def put(self, path, **kwargs):
+            events.append(("put", path))
+            return {"ok": True}
+        def probe_info(self, request_timeout=1.5):
+            events.append(("probe", request_timeout))
+            return {"product": "Ultimate"}
+        def mount_path(self, drive, path, mode=None):
+            events.append(("mount", drive, path, mode))
+        def mount_attachment(self, *args, **kwargs):
+            raise AssertionError("unexpected attachment mount")
+
+    class FakeCmd:
+        def close(self):
+            events.append(("cmd-close",))
+        def type_petscii(self, data, **kwargs):
+            events.append(("type", bytes(data)))
+
+    try:
+        server.SID_RUNNER_REBOOT_REQUIRED.clear()
+        server.rest, server.cmd = FakeRest(), FakeCmd()
+        server._sid_runner_mark_reboot_required(server.rest)
+        monkeypatch.setattr(server, "_matrix_release_all", lambda **kwargs: None)
+        monkeypatch.setattr(server, "_juke_disarm_machine_takeover", lambda reason: 1)
+        monkeypatch.setattr(server, "_remember_mount", lambda *args, **kwargs: events.append(("remember",)))
+        monkeypatch.setattr(server, "_boot_settle", lambda: events.append(("settle",)))
+        monkeypatch.setattr(server, "_bus_id_for", lambda drive: 8)
+        monkeypatch.setattr(server, "_basic_ready_gate", lambda stage, **kwargs: "unsupported")
+        monkeypatch.setattr(server.time, "sleep", lambda seconds: events.append(("sleep", seconds)))
+        monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+
+        out = server._mount_and_boot("a", "unlinked", device_path="/Usb0/demo.d64")
+
+        reboot_at = events.index(("put", "/v1/machine:reboot"))
+        mount_at = events.index(("mount", "a", "/Usb0/demo.d64", "unlinked"))
+        reset_at = events.index(("put", "/v1/machine:reset"))
+        assert reboot_at < mount_at < reset_at
+        assert ("cmd-close",) in events
+        assert any(item[0] == "probe" for item in events)
+        assert server._sid_runner_reboot_required(server.rest) is False
+        assert out == {"errors": [], "typed": 'LOAD"*",8,1 + RUN'}
+    finally:
+        server.rest, server.cmd = previous_rest, previous_cmd
+        server.SID_RUNNER_REBOOT_REQUIRED.clear()
+        server.SID_RUNNER_REBOOT_REQUIRED.update(previous_required)
+
+
+def test_rc4_failed_recovery_reboot_aborts_before_mount_and_stays_armed(monkeypatch):
+    previous_rest, previous_cmd = server.rest, server.cmd
+    previous_required = set(server.SID_RUNNER_REBOOT_REQUIRED)
+    events = []
+
+    class FakeRest:
+        host = "192.0.2.67"
+        def put(self, path, **kwargs):
+            events.append(path)
+            if path == "/v1/machine:reboot":
+                raise ultimate.UltimateError("reboot failed")
+        def mount_path(self, *args, **kwargs):
+            events.append("mounted")
+
+    class FakeCmd:
+        def close(self):
+            events.append("closed")
+
+    try:
+        server.SID_RUNNER_REBOOT_REQUIRED.clear()
+        server.rest, server.cmd = FakeRest(), FakeCmd()
+        server._sid_runner_mark_reboot_required(server.rest)
+        monkeypatch.setattr(server, "_matrix_release_all", lambda **kwargs: None)
+        monkeypatch.setattr(server, "_juke_disarm_machine_takeover", lambda reason: 1)
+        monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+        with pytest.raises(ultimate.UltimateError, match="reboot failed"):
+            server._mount_and_boot("a", "unlinked", device_path="/Usb0/demo.d64")
+        assert "mounted" not in events
+        assert server._sid_runner_reboot_required(server.rest) is True
+    finally:
+        server.rest, server.cmd = previous_rest, previous_cmd
+        server.SID_RUNNER_REBOOT_REQUIRED.clear()
+        server.SID_RUNNER_REBOOT_REQUIRED.update(previous_required)
+
+
+def test_rc4_ordinary_mount_and_run_does_not_reboot(monkeypatch):
+    previous_required = set(server.SID_RUNNER_REBOOT_REQUIRED)
+    try:
+        server.SID_RUNNER_REBOOT_REQUIRED.clear()
+        typed, matrix_events, out = _mount_boot_harness(monkeypatch, ["unsupported"])
+        assert typed == [b'LOAD"*",8,1\r', b"RUN\r"]
+        assert matrix_events == []
+        assert out == {"errors": [], "typed": 'LOAD"*",8,1 + RUN'}
+    finally:
+        server.SID_RUNNER_REBOOT_REQUIRED.clear()
+        server.SID_RUNNER_REBOOT_REQUIRED.update(previous_required)
+
+
+def test_rc4_explicit_reboot_clears_sid_recovery_flag(monkeypatch):
+    previous_rest, previous_cmd = server.rest, server.cmd
+    previous_required = set(server.SID_RUNNER_REBOOT_REQUIRED)
+
+    class FakeRest:
+        host = "192.0.2.68"
+        def put(self, path, **kwargs):
+            assert path == "/v1/machine:reboot"
+            return {"ok": True}
+
+    class FakeCmd:
+        def close(self):
+            pass
+
+    try:
+        server.SID_RUNNER_REBOOT_REQUIRED.clear()
+        server.rest, server.cmd = FakeRest(), FakeCmd()
+        server._sid_runner_mark_reboot_required(server.rest)
+        monkeypatch.setattr(server, "_juke_disarm_machine_takeover", lambda reason: 1)
+        monkeypatch.setattr(server, "_matrix_release_all", lambda **kwargs: None)
+        monkeypatch.setattr(server, "_send_boot_prekey", lambda **kwargs: None)
+        assert server.machine("reboot") == {"ok": True}
+        assert server._sid_runner_reboot_required(server.rest) is False
+    finally:
+        server.rest, server.cmd = previous_rest, previous_cmd
+        server.SID_RUNNER_REBOOT_REQUIRED.clear()
+        server.SID_RUNNER_REBOOT_REQUIRED.update(previous_required)
+
+
+def test_rc4_mount_and_run_while_sid_is_playing_reboots_before_mount(monkeypatch):
+    previous_rest, previous_cmd = server.rest, server.cmd
+    previous_required = set(server.SID_RUNNER_REBOOT_REQUIRED)
+    previous_juke = dict(server.JUKE)
+    events = []
+
+    class FakeTimer:
+        def __init__(self):
+            self.cancelled = False
+        def cancel(self):
+            self.cancelled = True
+
+    class FakeRest:
+        host = "192.0.2.69"
+        def put(self, path, **kwargs):
+            events.append(("put", path))
+            return {"ok": True}
+        def probe_info(self, request_timeout=1.5):
+            events.append(("probe", request_timeout))
+            return {"product": "Ultimate"}
+        def mount_path(self, drive, path, mode=None):
+            events.append(("mount", drive, path, mode))
+        def mount_attachment(self, *args, **kwargs):
+            raise AssertionError("unexpected attachment mount")
+
+    class FakeCmd:
+        def close(self):
+            events.append(("cmd-close",))
+        def type_petscii(self, data, **kwargs):
+            events.append(("type", bytes(data)))
+
+    timer = FakeTimer()
+    try:
+        server.SID_RUNNER_REBOOT_REQUIRED.clear()
+        server.rest, server.cmd = FakeRest(), FakeCmd()
+        server._sid_runner_mark_reboot_required(server.rest)
+        server.JUKE.clear(); server.JUKE.update({
+            "items": [server._juke_lazy_item("/HVSC/Live.sid", "Live.sid")],
+            "index": 0, "playing": True, "shuffle": False, "radio": True,
+            "song": 1, "timer": timer, "folder": "Current tune",
+            "loading": False, "source": "test", "generation": 31,
+            "stop_after_current": False,
+        })
+        monkeypatch.setattr(server, "_matrix_release_all", lambda **kwargs: None)
+        monkeypatch.setattr(server, "_remember_mount", lambda *args, **kwargs: None)
+        monkeypatch.setattr(server, "_boot_settle", lambda: events.append(("settle",)))
+        monkeypatch.setattr(server, "_bus_id_for", lambda drive: 8)
+        monkeypatch.setattr(server, "_basic_ready_gate", lambda stage, **kwargs: "unsupported")
+        monkeypatch.setattr(server.time, "sleep", lambda seconds: events.append(("sleep", seconds)))
+        monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+
+        out = server._mount_and_boot("a", "unlinked", device_path="/Usb0/live-test.d64")
+
+        reboot_at = events.index(("put", "/v1/machine:reboot"))
+        mount_at = events.index(("mount", "a", "/Usb0/live-test.d64", "unlinked"))
+        assert reboot_at < mount_at
+        assert timer.cancelled is True
+        assert server.JUKE["playing"] is False
+        assert server.JUKE["radio"] is False
+        assert server.JUKE["generation"] == 32
+        assert server._sid_runner_reboot_required(server.rest) is False
+        assert out == {"errors": [], "typed": 'LOAD"*",8,1 + RUN'}
+    finally:
+        server.rest, server.cmd = previous_rest, previous_cmd
+        server.SID_RUNNER_REBOOT_REQUIRED.clear()
+        server.SID_RUNNER_REBOOT_REQUIRED.update(previous_required)
+        server.JUKE.clear(); server.JUKE.update(previous_juke)
+
+# --- v1.9.0 Release Candidate 11: responsive Finder hand-off ---
+
+def test_rc11_discovery_files_remain_frozen():
+    root = Path(server.ROOT)
+    assert hashlib.sha256((root / "discovery.py").read_bytes()).hexdigest() == (
+        "635599ea8c31bfca0f9c8f6b5cc99cdff6ccfd6551a8df4d1c141708a8c89d25")
+    assert hashlib.sha256((root / "discovery_transport.py").read_bytes()).hexdigest() == (
+        "fb9c85791ea60a37c0931a01409845b7787f664be1db04ee9d16185df75d826d")
+
+
+def test_rc11_connect_reuses_verified_discovery_and_skips_blocking_probes(monkeypatch):
+    original_cfg = dict(server.CFG)
+    original_live = {key: set(value) for key, value in server.DISCOVERY_LIVE_ADDRESSES.items()}
+    original_caps = dict(server.INPUT_CAPABILITIES)
+    calls = []
+
+    class FakeRest:
+        def __init__(self, host, password, coordinator=None): self.host = host
+        def info(self): calls.append("info"); raise AssertionError("verified Finder result must be reused")
+        def stream_stop(self, name): calls.append(("stop", name))
+        def close(self): calls.append("close-rest")
+        def set_timeout(self, timeout): calls.append(("timeout", timeout))
+
+    class FakeCmd:
+        def __init__(self, host, coordinator=None): self.host = host
+        def close(self): calls.append("close-cmd")
+
+    class FakeFS:
+        def __init__(self, *args, **kwargs): pass
+
+    class FakeCoordinator:
+        @contextmanager
+        def operation(self, *args, **kwargs): yield
+
+    old_rest = FakeRest("192.0.2.10", "")
+    old_cmd = FakeCmd("192.0.2.10")
+    try:
+        server.CFG.clear(); server.CFG.update(original_cfg)
+        server.CFG["u64_host"] = "192.0.2.10"
+        server.CFG["known_devices"] = {
+            "uid:1": {
+                "identity": "uid:1", "identity_source": "unique_id",
+                "unique_id": "1", "hostname": "Ultimate", "product": "Ultimate 64",
+                "firmware": "3.15", "core": "1.4B",
+                "addresses": {
+                    "192.0.2.10": {"ip": "192.0.2.10", "link_type": "wifi"},
+                    "192.0.2.11": {"ip": "192.0.2.11", "link_type": "ethernet",
+                                     "method": "wired-prefix", "mac": "02:15:41:00:00:01"},
+                },
+            }
+        }
+        server.DISCOVERY_LIVE_ADDRESSES.clear(); server.DISCOVERY_LIVE_ADDRESSES["uid:1"] = {"192.0.2.10", "192.0.2.11"}
+        server.INPUT_CAPABILITIES.clear(); server.INPUT_CAPABILITIES["192.0.2.10"] = {
+            "available": True, "pending": False, "mode": "matrix", "status": 200,
+            "label": "CIA1 keyboard matrix", "host": "192.0.2.10",
+        }
+        monkeypatch.setattr(server, "UltimateREST", FakeRest)
+        monkeypatch.setattr(server, "CommandSocket", FakeCmd)
+        monkeypatch.setattr(server, "DeviceFS", FakeFS)
+        monkeypatch.setattr(server, "DEVICE_OP", FakeCoordinator())
+        monkeypatch.setattr(server, "rest", old_rest)
+        monkeypatch.setattr(server, "cmd", old_cmd)
+        monkeypatch.setattr(server, "devfs", FakeFS())
+        monkeypatch.setattr(server.LINK_DETECTOR, "detect", lambda host, force=False: LinkObservation(host, "ethernet", "02:15:41:00:00:01", "wired-prefix"))
+        monkeypatch.setattr(server, "save_config", lambda: None)
+        monkeypatch.setattr(server, "_matrix_release_all", lambda **kwargs: calls.append("release"))
+        result = server.api_connect({"host": "192.0.2.11"})
+        assert result["connected"] is True
+        assert result["reused_discovery"] is True
+        assert result["input"]["available"] is True
+        assert result["input"]["host"] == "192.0.2.10"
+        assert "info" not in calls
+        assert "release" not in calls
+    finally:
+        server.CFG.clear(); server.CFG.update(original_cfg)
+        server.DISCOVERY_LIVE_ADDRESSES.clear(); server.DISCOVERY_LIVE_ADDRESSES.update(original_live)
+        server.INPUT_CAPABILITIES.clear(); server.INPUT_CAPABILITIES.update(original_caps)
+
+
+def test_rc11_manual_connect_still_verifies(monkeypatch):
+    calls = []
+    class FakeRest:
+        def __init__(self, host, password, coordinator=None): self.host = host
+        def info(self): calls.append("info"); return {"product": "Ultimate 64", "unique_id": "manual"}
+        def close(self): pass
+        def set_timeout(self, timeout): pass
+    class FakeCmd:
+        def __init__(self, host, coordinator=None): self.host = host
+        def close(self): pass
+    class FakeFS:
+        def __init__(self, *args, **kwargs): pass
+    class FakeCoordinator:
+        @contextmanager
+        def operation(self, *args, **kwargs): yield
+    monkeypatch.setattr(server, "UltimateREST", FakeRest)
+    monkeypatch.setattr(server, "CommandSocket", FakeCmd)
+    monkeypatch.setattr(server, "DeviceFS", FakeFS)
+    monkeypatch.setattr(server, "DEVICE_OP", FakeCoordinator())
+    monkeypatch.setattr(server, "rest", None)
+    monkeypatch.setattr(server, "cmd", None)
+    monkeypatch.setattr(server, "save_config", lambda: None)
+    monkeypatch.setattr(server.LINK_DETECTOR, "detect", lambda host, force=False: LinkObservation(host, "unknown", "", "unknown"))
+    result = server.api_connect({"host": "198.51.100.64"})
+    assert result["connected"] is True
+    assert result["reused_discovery"] is False
+    assert calls == ["info"]
+
+
+def test_rc11_frontend_does_not_refresh_after_finder_and_has_explicit_selection():
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    finder_tail = js[js.index("async function runDiscover()"):js.index("async function clearDiscoveredDevices()")]
+    assert "loadInfo();refreshDrives();" not in finder_tail
+    assert "Use selected address" in js
+    assert "disc-choice" in js and "selected" in js
+    assert "const hadState=MATRIX_HELD.size>0" in js
+    assert "INFO_IN_FLIGHT" in js and "DRIVES_IN_FLIGHT" in js
+
+
+# --- v1.9.0 Release Candidate 10: shared proven discovery transport ---
+
+
+def test_discovery_constants_match_proven_direct_get_design():
+    import discovery
+
+    assert discovery.CONNECT_TIMEOUT == 1.5
+    assert discovery.RESPONSE_TIMEOUT == 3.25
+    assert discovery.CACHED_CONCURRENCY == 4
+    assert discovery.SCAN_CONCURRENCY == 64
+    source = Path(discovery.__file__).read_text(encoding="utf-8")
+    assert "discovery_transport.scan_direct" in source
+    assert "httpx.AsyncClient" not in source
+    assert "classify_address_group" not in source
+    assert "_port_open" not in source
+    assert "VERIFY_RETRY_TIMEOUT" not in source
+    transport_source = Path(discovery.discovery_transport.__file__).read_text(encoding="utf-8")
+    assert "socket.create_connection" in transport_source
+    assert "urllib.request" not in transport_source
+
+
+def test_supplied_discovery_diagnostic_imports_production_transport():
+    source = (Path(server.ROOT) / "discovery_diagnostic.py").read_text(encoding="utf-8")
+    assert "import discovery_transport" in source
+    assert "urllib.request" not in source
+    assert "ThreadPoolExecutor" not in source
+
+
+def test_shared_transport_requests_each_address_exactly_once(monkeypatch):
+    import discovery_transport
+
+    calls = []
+
+    def get_info(ip, connect_timeout, response_timeout, overall_started, stage, port=80):
+        calls.append((ip, connect_timeout, response_timeout, stage, port))
+        return {"ip": ip, "stage": stage, "status": "timeout", "elapsed_ms": 1.0}
+
+    monkeypatch.setattr(discovery_transport, "get_info", get_info)
+    ips = ["192.0.2.1", "192.0.2.2", "192.0.2.3"]
+    rows = discovery_transport.scan_direct(
+        ips, 2, 1.5, 3.25, time.perf_counter(), "direct-subnet", 80)
+
+    assert sorted(ip for ip, _connect, _response, _stage, _port in calls) == ips
+    assert all(connect == 1.5 for _ip, connect, _response, _stage, _port in calls)
+    assert all(response == 3.25 for _ip, _connect, response, _stage, _port in calls)
+    assert all(stage == "direct-subnet" for _ip, _connect, _response, stage, _port in calls)
+    assert len(rows) == 3
+
+
+def test_split_timeout_transport_applies_response_budget_only_after_connect(monkeypatch):
+    import discovery_transport
+
+    raw = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Connection: close\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: 86\r\n\r\n"
+        b'{"product":"Ultimate 64","hostname":"Unit","unique_id":"101090","errors":[]}'
+    )
+    # Keep the advertised length accurate for the test body.
+    body = raw.split(b"\r\n\r\n", 1)[1]
+    raw = raw.replace(b"Content-Length: 86", f"Content-Length: {len(body)}".encode())
+
+    class FakeSocket:
+        def __init__(self):
+            self.response_timeouts = []
+            self.sent = []
+            self.chunks = [raw, b""]
+
+        def settimeout(self, value):
+            self.response_timeouts.append(value)
+
+        def sendall(self, value):
+            self.sent.append(value)
+
+        def recv(self, _size):
+            return self.chunks.pop(0)
+
+        def close(self):
+            pass
+
+    fake = FakeSocket()
+    connects = []
+
+    def create_connection(address, timeout):
+        connects.append((address, timeout))
+        return fake
+
+    monkeypatch.setattr(discovery_transport.socket, "create_connection", create_connection)
+    row = discovery_transport.get_info(
+        "192.0.2.64", 1.5, 3.25, time.perf_counter(), "direct-subnet", 80)
+
+    assert connects == [(('192.0.2.64', 80), 1.5)]
+    assert fake.response_timeouts == [3.25]
+    assert b"GET /v1/info HTTP/1.1" in fake.sent[0]
+    assert row["status"] == "ultimate"
+    assert row["payload"]["unique_id"] == "101090"
+    assert "connect_ms" in row
+    assert "time_to_first_byte_ms" in row
+
+
+def test_split_timeout_transport_distinguishes_connect_and_response_timeouts(monkeypatch):
+    import discovery_transport
+
+    def connect_timeout(_address, timeout):
+        assert timeout == 1.5
+        raise discovery_transport.socket.timeout("timed out")
+
+    monkeypatch.setattr(discovery_transport.socket, "create_connection", connect_timeout)
+    row = discovery_transport.get_info(
+        "192.0.2.1", 1.5, 3.25, time.perf_counter(), "direct-subnet")
+    assert row["status"] == "connect_timeout"
+
+    class SlowResponseSocket:
+        def settimeout(self, value):
+            assert value == 3.25
+
+        def sendall(self, _value):
+            pass
+
+        def recv(self, _size):
+            raise discovery_transport.socket.timeout("timed out")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        discovery_transport.socket,
+        "create_connection",
+        lambda _address, timeout: SlowResponseSocket(),
+    )
+    row = discovery_transport.get_info(
+        "192.0.2.64", 1.5, 3.25, time.perf_counter(), "direct-subnet")
+    assert row["status"] == "response_timeout"
+    assert "connect_ms" in row
+
+
+def test_cached_addresses_use_shared_transport_first_and_are_not_repeated(monkeypatch):
+    import discovery
+
+    ethernet = "192.0.2.10"
+    wifi = "192.0.2.20"
+    stages = []
+    progress = []
+    monkeypatch.setattr(discovery, "local_subnets", lambda: ["192.0.2."])
+
+    def scan_direct(ips, workers, connect_timeout, response_timeout, overall_started, stage, port=80):
+        ips = list(ips)
+        stages.append((ips, workers, connect_timeout, response_timeout, stage, port))
+        return [
+            _transport_result(ip, stage=stage)
+            for ip in ips if ip in {ethernet, wifi}
+        ]
+
+    monkeypatch.setattr(discovery.discovery_transport, "scan_direct", scan_direct)
+    detector = _MappedLinkDetector({
+        ethernet: ("ethernet", "02:15:41:F0:66:06", "wired-prefix"),
+        wifi: ("wifi", "24:0A:C4:9F:77:C8", "espressif-oui"),
+    })
+
+    result = asyncio.run(discovery.discover(
+        candidate_ips=[ethernet, wifi], detector=detector,
+        progress_callback=lambda row: progress.append(row)))
+
+    assert stages[0][0] == [ethernet, wifi]
+    assert stages[0][1:] == (4, 1.5, 3.25, "cached-first", 80)
+    assert ethernet not in stages[1][0]
+    assert wifi not in stages[1][0]
+    assert stages[1][1:] == (64, 1.5, 3.25, "direct-subnet", 80)
+    assert sum(len(stage[0]) for stage in stages) == 254
+    assert progress[0]["complete"] is False
+    assert progress[0]["cached_verified_count"] == 2
+    assert progress[-1]["complete"] is True
+    assert result["verified_count"] == 2
+    assert result["devices"][0]["preferred_ip"] == ethernet
+
+
+def test_off_subnet_cached_address_is_skipped(monkeypatch):
+    import discovery
+
+    stages = []
+    monkeypatch.setattr(discovery, "local_subnets", lambda: ["192.0.2."])
+
+    def scan_direct(ips, workers, connect_timeout, response_timeout, overall_started, stage, port=80):
+        stages.append((list(ips), stage))
+        return []
+
+    monkeypatch.setattr(discovery.discovery_transport, "scan_direct", scan_direct)
+    result = asyncio.run(discovery.discover(
+        candidate_ips=["198.51.100.44"], detector=_MappedLinkDetector({})))
+
+    assert stages[0] == ([], "cached-first")
+    assert "198.51.100.44" not in stages[1][0]
+    assert result["cached_candidate_count"] == 0
+    assert result["candidate_count"] == 254
+
+
+def test_fresh_shared_transport_scan_groups_interfaces_and_prefers_ethernet(monkeypatch):
+    import discovery
+
+    ethernet = "192.0.2.10"
+    wifi = "192.0.2.20"
+    stages = []
+    monkeypatch.setattr(discovery, "local_subnets", lambda: ["192.0.2."])
+
+    def scan_direct(ips, workers, connect_timeout, response_timeout, overall_started, stage, port=80):
+        ips = list(ips)
+        stages.append((ips, workers, connect_timeout, response_timeout, stage, port))
+        return [
+            _transport_result(ip, stage=stage)
+            for ip in ips if ip in {ethernet, wifi}
+        ]
+
+    monkeypatch.setattr(discovery.discovery_transport, "scan_direct", scan_direct)
+    detector = _MappedLinkDetector({
+        ethernet: ("ethernet", "02:15:41:F0:66:06", "wired-prefix"),
+        wifi: ("wifi", "24:0A:C4:9F:77:C8", "espressif-oui"),
+    })
+
+    result = asyncio.run(discovery.discover(detector=detector))
+
+    assert stages[0][0] == []
+    assert len(stages[1][0]) == 254
+    assert stages[1][1:] == (64, 1.5, 3.25, "direct-subnet", 80)
+    assert len(set(stages[1][0])) == 254
+    assert result["verified_count"] == 2
+    assert len(result["devices"]) == 1
+    device = result["devices"][0]
+    assert device["preferred_ip"] == ethernet
+    assert [(row["ip"], row["link_type"]) for row in device["addresses"]] == [
+        (ethernet, "ethernet"), (wifi, "wifi"),
+    ]
+
+
+def test_discovery_classification_issues_no_latency_rest_requests(monkeypatch):
+    import discovery
+
+    ethernet = "192.0.2.10"
+    wifi = "192.0.2.20"
+    monkeypatch.setattr(discovery, "local_subnets", lambda: ["192.0.2."])
+
+    def scan_direct(ips, workers, connect_timeout, response_timeout, overall_started, stage, port=80):
+        return [
+            _transport_result(ip, stage=stage)
+            for ip in ips if ip in {ethernet, wifi}
+        ]
+
+    class CountingDetector(_MappedLinkDetector):
+        def __init__(self, mapping):
+            super().__init__(mapping)
+            self.calls = []
+
+        def detect(self, ip, *, force=False, **kwargs):
+            self.calls.append((ip, force))
+            return super().detect(ip, force=force, **kwargs)
+
+    monkeypatch.setattr(discovery.discovery_transport, "scan_direct", scan_direct)
+    detector = CountingDetector({
+        ethernet: ("ethernet", "02:15:41:F0:66:06", "wired-prefix"),
+        wifi: ("wifi", "24:0A:C4:9F:77:C8", "espressif-oui"),
+    })
+    result = asyncio.run(discovery.discover(detector=detector))
+
+    assert result["verified_count"] == 2
+    assert sorted(detector.calls) == sorted([(ethernet, True), (wifi, True)])
+
+
+def test_stale_cached_ethernet_is_not_promoted(monkeypatch):
+    import discovery
+
+    ethernet = "192.0.2.10"
+    wifi = "192.0.2.20"
+    monkeypatch.setattr(discovery, "local_subnets", lambda: ["192.0.2."])
+
+    def scan_direct(ips, workers, connect_timeout, response_timeout, overall_started, stage, port=80):
+        return [
+            _transport_result(ip, stage=stage)
+            for ip in ips if ip == wifi
+        ]
+
+    monkeypatch.setattr(discovery.discovery_transport, "scan_direct", scan_direct)
+    known = {
+        "uid:101090": {
+            "identity": "uid:101090", "unique_id": "101090",
+            "hostname": "Ultimate-64-F06606", "product": "Ultimate 64",
+            "addresses": {
+                ethernet: {"ip": ethernet, "link_type": "ethernet",
+                           "mac": "02:15:41:F0:66:06", "last_seen": "old"},
+                wifi: {"ip": wifi, "link_type": "wifi",
+                       "mac": "24:0A:C4:9F:77:C8", "last_seen": "old"},
+            },
+        }
+    }
+    detector = _MappedLinkDetector({
+        wifi: ("wifi", "24:0A:C4:9F:77:C8", "espressif-oui"),
+    })
+
+    result = asyncio.run(discovery.discover(
+        candidate_ips=[ethernet, wifi], known_devices=known, detector=detector))
+
+    assert result["verified_count"] == 1
+    assert result["devices"][0]["preferred_ip"] == wifi
+    assert [row["ip"] for row in result["devices"][0]["addresses"]] == [wifi]
+    assert known["uid:101090"]["addresses"][ethernet]["last_seen"] == "old"
+
+def test_discovery_server_pauses_status_and_drives_polling(monkeypatch):
+    original_host = server.CFG.get("u64_host")
+    original_mount = copy.deepcopy(server.MOUNT_STATE)
+    server.CFG["u64_host"] = "192.0.2.64"
+    server.DISCOVERY_ACTIVE.set()
+    try:
+        info = server.info()
+        drives = server.drives()
+        assert info["u64deck_discovery_busy"] is True
+        assert drives["u64deck_discovery_busy"] is True
+        assert drives["u64deck_drives_unavailable"] is True
+        assert "paused" in drives["u64deck_drives_message"].lower()
+    finally:
+        server.DISCOVERY_ACTIVE.clear()
+        server.CFG["u64_host"] = original_host
+        server.MOUNT_STATE.clear(); server.MOUNT_STATE.update(original_mount)
+
+
+def test_discovery_scan_gate_rejects_overlap(monkeypatch):
+    server.DISCOVERY_SCAN_LOCK.acquire()
+    try:
+        with pytest.raises(server.HTTPException) as exc:
+            asyncio.run(server._run_discovery())
+        assert exc.value.status_code == 409
+    finally:
+        server.DISCOVERY_SCAN_LOCK.release()
+        server.DISCOVERY_ACTIVE.clear()
+
+
+def test_discovery_frontend_pauses_polling_and_uses_bounded_window():
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    assert "let DISCOVERY_SCAN_ACTIVE=false;" in js
+    assert "if(DISCOVERY_SCAN_ACTIVE||uiInteractive()||INFO_IN_FLIGHT)return;" in js
+    assert 'api("/api/discover"+' in js and "{timeoutMs:30000}" in js
+    assert 'api("/api/discover/clear"+' in js and 'method:"POST",timeoutMs:30000' in js
+    assert 'let DEVICE_REQUEST_TIMEOUT_MS=15000;' in js
+
+
+def test_rc8_discovery_documentation_covers_identity_and_rest_etiquette():
+    readme = (Path(server.ROOT) / "README.md").read_text(encoding="utf-8")
+    help_js = (Path(server.ASSETS) / "static" / "help_content.js").read_text(encoding="utf-8")
+    for text in (
+        "Interface-aware Ultimate discovery",
+        "Cached-first discovery",
+        "REST service etiquette",
+        "U64 Manager",
+        "Assembly64",
+        "exactly one direct `GET /v1/info` request",
+    ):
+        assert text in readme
+    assert "one direct <code>GET /v1/info</code> request" in help_js
+    assert "Routine status and Mounted Drives polling pause" in help_js
+
+
+# --- v1.9.0 Release Candidate 12: split dual-interface routing ---
+
+def _rc12_known_device():
+    return {
+        "uid:101090": {
+            "identity": "uid:101090", "identity_source": "unique_id",
+            "unique_id": "101090", "hostname": "Ultimate-64-F06606",
+            "product": "Ultimate 64", "firmware": "3.15", "core": "1.4B",
+            "addresses": {
+                "192.0.2.170": {"ip": "192.0.2.170", "link_type": "wifi",
+                                  "method": "esp32-oui", "mac": "24:0A:C4:00:00:01"},
+                "192.0.2.171": {"ip": "192.0.2.171", "link_type": "ethernet",
+                                  "method": "wired-prefix", "mac": "02:15:41:00:00:01"},
+            },
+        }
+    }
+
+
+def test_rc12_control_host_uses_only_live_verified_wifi():
+    previous_cfg = dict(server.CFG)
+    previous_live = {key: set(value) for key, value in server.DISCOVERY_LIVE_ADDRESSES.items()}
+    try:
+        server.CFG["known_devices"] = _rc12_known_device()
+        server.DISCOVERY_LIVE_ADDRESSES.clear()
+        server.DISCOVERY_LIVE_ADDRESSES["uid:101090"] = {"192.0.2.171"}
+        assert server._verified_control_host_for_selected("192.0.2.171") == "192.0.2.171"
+        server.DISCOVERY_LIVE_ADDRESSES["uid:101090"].add("192.0.2.170")
+        assert server._verified_control_host_for_selected("192.0.2.171") == "192.0.2.170"
+        assert server._verified_control_host_for_selected("192.0.2.170") == "192.0.2.170"
+    finally:
+        server.CFG.clear(); server.CFG.update(previous_cfg)
+        server.DISCOVERY_LIVE_ADDRESSES.clear(); server.DISCOVERY_LIVE_ADDRESSES.update(previous_live)
+
+
+def test_rc12_connect_keeps_ethernet_for_command_and_routes_rest_via_wifi(monkeypatch):
+    previous_cfg = dict(server.CFG)
+    previous_live = {key: set(value) for key, value in server.DISCOVERY_LIVE_ADDRESSES.items()}
+    previous_rest, previous_cmd, previous_devfs = server.rest, server.cmd, server.devfs
+    made = {"rest": [], "cmd": [], "fs": []}
+
+    class FakeRest:
+        def __init__(self, host, password, coordinator=None):
+            self.host = host; made["rest"].append(host)
+        def info(self): raise AssertionError("Finder result should be reused")
+        def close(self): pass
+        def set_timeout(self, timeout): self.timeout = timeout
+    class FakeCmd:
+        def __init__(self, host, coordinator=None): self.host = host; made["cmd"].append(host)
+        def close(self): pass
+    class FakeFS:
+        def __init__(self, host, *args, **kwargs): self.host = host; made["fs"].append(host)
+        def close(self): pass
+    class FakeCoordinator:
+        @contextmanager
+        def operation(self, *args, **kwargs): yield
+
+    try:
+        server.CFG["u64_host"] = ""
+        server.CFG["rest_control_host"] = ""
+        server.CFG["known_devices"] = _rc12_known_device()
+        server.DISCOVERY_LIVE_ADDRESSES.clear()
+        server.DISCOVERY_LIVE_ADDRESSES["uid:101090"] = {"192.0.2.170", "192.0.2.171"}
+        monkeypatch.setattr(server, "UltimateREST", FakeRest)
+        monkeypatch.setattr(server, "CommandSocket", FakeCmd)
+        monkeypatch.setattr(server, "DeviceFS", FakeFS)
+        monkeypatch.setattr(server, "DEVICE_OP", FakeCoordinator())
+        monkeypatch.setattr(server, "rest", FakeRest("", ""))
+        monkeypatch.setattr(server, "cmd", FakeCmd(""))
+        monkeypatch.setattr(server, "devfs", FakeFS(""))
+        monkeypatch.setattr(server.LINK_DETECTOR, "detect", lambda host, force=False: LinkObservation(host, "ethernet", "02:15:41:00:00:01", "wired-prefix"))
+        monkeypatch.setattr(server, "save_config", lambda: None)
+        monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+        result = server.api_connect({"host": "192.0.2.171"})
+        assert result["connected"] is True
+        assert result["host"] == "192.0.2.171"
+        assert result["control_host"] == "192.0.2.170"
+        assert result["rest_via_alternate"] is True
+        assert server.rest.host == "192.0.2.170"
+        assert server.cmd.host == "192.0.2.171"
+        assert server.devfs.host == "192.0.2.171"
+        assert server.CFG["u64_host"] == "192.0.2.171"
+        assert server.CFG["rest_control_host"] == "192.0.2.170"
+        assert result["link"]["rest_route_label"] == "REST via Wi-Fi"
+    finally:
+        server.CFG.clear(); server.CFG.update(previous_cfg)
+        server.DISCOVERY_LIVE_ADDRESSES.clear(); server.DISCOVERY_LIVE_ADDRESSES.update(previous_live)
+        server.rest, server.cmd, server.devfs = previous_rest, previous_cmd, previous_devfs
+
+
+def test_rc12_split_stream_uses_ethernet_command_socket_first(monkeypatch):
+    previous_cfg = dict(server.CFG)
+    previous_rest, previous_cmd = server.rest, server.cmd
+    previous_state = dict(server.STREAM_STATE)
+    calls = []
+    class FakeRest:
+        host = "192.0.2.170"
+        def stream_start(self, name, dest): calls.append(("rest-start", name, dest))
+        def stream_stop(self, name): calls.append(("rest-stop", name))
+    class FakeCmd:
+        host = "192.0.2.171"
+        def stream_on(self, stream_id, dest): calls.append(("socket-start", stream_id, dest))
+        def stream_off(self, stream_id): calls.append(("socket-stop", stream_id))
+    class FakeRecv:
+        def set_multicast(self, *args): pass
+    try:
+        server.CFG["u64_host"] = "192.0.2.171"
+        server.CFG["stream_transport"] = "unicast"
+        server.rest, server.cmd = FakeRest(), FakeCmd()
+        monkeypatch.setattr(server, "video", FakeRecv())
+        monkeypatch.setattr(server, "_local_ip", lambda: "192.0.2.50")
+        monkeypatch.setattr(server, "_current_link_payload", lambda: {"link_type": "ethernet"})
+        server._stream_ctl("video", True)
+        assert calls == [("socket-start", 0, "192.0.2.50:11000")]
+        assert server.STREAM_LAST["video"]["via"] == "socket"
+    finally:
+        server.CFG.clear(); server.CFG.update(previous_cfg)
+        server.rest, server.cmd = previous_rest, previous_cmd
+        server.STREAM_STATE.clear(); server.STREAM_STATE.update(previous_state)
+
+
+def test_rc12_ui_explains_split_route():
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    assert "REST via Wi-Fi" in js
+    assert "REST control via "+"" in js
+
+
+# --- v1.9.0 Release Candidate 13: split SID play/stop routing ---
+
+def test_rc13_split_juke_stop_parks_cartridge_and_uses_wifi_rest_first(monkeypatch):
+    previous_cfg = dict(server.CFG)
+    previous_juke = dict(server.JUKE)
+    previous_rest, previous_cmd = server.rest, server.cmd
+    previous_required = set(server.SID_RUNNER_REBOOT_REQUIRED)
+    calls = []
+    ethernet = "192.0.2.171"
+    wifi = "192.0.2.170"
+    cartridge = "/Flash/RetroReplay.crt"
+
+    class FakeRest:
+        host = wifi
+
+        def get_json(self, path):
+            calls.append(("get", path))
+            return {server._CART_CAT: {server._CART_ITEM: cartridge}}
+
+        def put(self, path, **kwargs):
+            calls.append(("put", path, kwargs))
+            return {}
+
+    class FakeCommand:
+        def reset_fresh(self):
+            calls.append("fresh-reset")
+
+    try:
+        server.CFG.update({
+            "u64_host": ethernet,
+            "rest_control_host": wifi,
+            "cart_safe_run": True,
+        })
+        server.JUKE.update({"items": [], "index": -1, "playing": True,
+                            "stop_after_current": False, "timer": None})
+        server.SID_RUNNER_REBOOT_REQUIRED.clear()
+        server.SID_RUNNER_REBOOT_REQUIRED.add(wifi)
+        monkeypatch.setattr(server, "rest", FakeRest())
+        monkeypatch.setattr(server, "cmd", FakeCommand())
+        monkeypatch.setattr(server, "_matrix_release_all",
+                            lambda **kwargs: calls.append(("release", kwargs)))
+        monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+        monkeypatch.setattr(server, "_warn_event", lambda *args, **kwargs: None)
+
+        out = server.juke_stop()
+
+        assert calls == [
+            ("get", f"/v1/configs/{server._CART_CAT}"),
+            ("put", f"/v1/configs/{server._CART_CAT}/{server._CART_ITEM}",
+             {"value": "", "request_timeout": 4.0}),
+            ("put", "/v1/machine:reset", {"request_timeout": 4.0}),
+            ("put", f"/v1/configs/{server._CART_CAT}/{server._CART_ITEM}",
+             {"value": cartridge, "request_timeout": 4.0}),
+            ("release", {"silent": True, "cached_only": True}),
+        ]
+        assert "fresh-reset" not in calls
+        assert wifi in server.SID_RUNNER_REBOOT_REQUIRED
+        assert out["stop_delivery"] == "cartridge-safe REST"
+        assert out["stop_cartridge_safe"] is True
+        assert out["stop_elapsed_ms"] >= 0
+    finally:
+        server.CFG.clear(); server.CFG.update(previous_cfg)
+        server.JUKE.clear(); server.JUKE.update(previous_juke)
+        server.rest, server.cmd = previous_rest, previous_cmd
+        server.SID_RUNNER_REBOOT_REQUIRED.clear()
+        server.SID_RUNNER_REBOOT_REQUIRED.update(previous_required)
+
+
+def test_rc13_split_juke_stop_rest_failure_restores_cart_then_falls_back(monkeypatch):
+    previous_cfg = dict(server.CFG)
+    previous_juke = dict(server.JUKE)
+    previous_rest, previous_cmd = server.rest, server.cmd
+    calls = []
+    ethernet = "192.0.2.171"
+    wifi = "192.0.2.170"
+    cartridge = "/Flash/RetroReplay.crt"
+
+    class FakeRest:
+        host = wifi
+
+        def get_json(self, path):
+            calls.append(("get", path))
+            return {server._CART_CAT: {server._CART_ITEM: cartridge}}
+
+        def put(self, path, **kwargs):
+            calls.append(("put", path, kwargs))
+            if path == "/v1/machine:reset":
+                raise RuntimeError("REST reset failed")
+            return {}
+
+    class FakeCommand:
+        def reset_fresh(self):
+            calls.append("fresh-reset")
+
+    try:
+        server.CFG.update({
+            "u64_host": ethernet,
+            "rest_control_host": wifi,
+            "cart_safe_run": True,
+        })
+        server.JUKE.update({"items": [], "index": -1, "playing": True,
+                            "stop_after_current": False, "timer": None})
+        monkeypatch.setattr(server, "rest", FakeRest())
+        monkeypatch.setattr(server, "cmd", FakeCommand())
+        monkeypatch.setattr(server, "_matrix_release_all",
+                            lambda **kwargs: calls.append(("release", kwargs)))
+        monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+        monkeypatch.setattr(server, "_warn_event", lambda *args, **kwargs: None)
+
+        server.juke_stop()
+
+        reset_index = calls.index(("put", "/v1/machine:reset", {"request_timeout": 4.0}))
+        restore_index = calls.index((
+            "put", f"/v1/configs/{server._CART_CAT}/{server._CART_ITEM}",
+            {"value": cartridge, "request_timeout": 4.0},
+        ))
+        release_index = calls.index(("release", {"silent": True, "cached_only": True}))
+        fallback_index = calls.index("fresh-reset")
+        assert reset_index < restore_index < release_index < fallback_index
+    finally:
+        server.CFG.clear(); server.CFG.update(previous_cfg)
+        server.JUKE.clear(); server.JUKE.update(previous_juke)
+        server.rest, server.cmd = previous_rest, previous_cmd
+
+
+def test_rc13_juke_play_returns_stage_timings_and_logs_them(monkeypatch):
+    previous_juke = dict(server.JUKE)
+    previous_cfg = dict(server.CFG)
+    diagnostics = []
+    item = {
+        "label": "Timing.sid",
+        "path": "/HVSC/Timing.sid",
+        "data": b"sid-data",
+        "meta": {"name": "Timing", "start_song": 1, "songs": 1},
+    }
+    try:
+        server.CFG["sid_default_secs"] = 0
+        server.JUKE.clear(); server.JUKE.update({
+            "items": [item], "index": -1, "playing": False,
+            "shuffle": False, "radio": False, "song": 0, "timer": None,
+            "folder": "", "loading": False, "source": "test",
+            "generation": 0, "stop_after_current": False,
+        })
+        monkeypatch.setattr(server, "_cart_configured", lambda: "")
+        monkeypatch.setattr(server, "_post_sid_upload", lambda *args, **kwargs: {})
+        monkeypatch.setattr(server, "_diag_event",
+                            lambda level, message, **kwargs: diagnostics.append((level, message)))
+
+        out = server._juke_play(0)
+
+        timing = out["play_timing"]
+        for key in (
+            "coordinator_wait_ms", "materialise_ms", "cart_lookup_ms",
+            "runner_action_ms", "cart_safe_total_ms", "state_commit_ms", "total_ms",
+        ):
+            assert key in timing
+            assert timing[key] >= 0
+        assert timing["cartridge_configured"] is False
+        assert any("SID Jukebox Play timing:" in message for _level, message in diagnostics)
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous_juke)
+        server.CFG.clear(); server.CFG.update(previous_cfg)

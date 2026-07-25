@@ -1,6 +1,26 @@
+
+## Dual-interface control routing
+
+Ultimate hardware tested with both Ethernet and Wi-Fi enabled delays responses
+from the wired REST endpoint by approximately 2.5 seconds. The same behaviour
+was reproduced on an Ultimate 64 running firmware 3.15 and an older C64
+Ultimate running different firmware. It occurs immediately after boot and does
+not require a u64deck discovery scan.
+
+When Finder has verified and grouped both interfaces and Ethernet is selected,
+u64deck keeps the command socket, FTP and streaming path on Ethernet while
+routing ordinary REST control through the verified Wi-Fi address. The connected
+header shows **Ethernet · REST via Wi-Fi**; the split-routing screenshot below
+shows this state in context. If Wi-Fi is disabled or not verified, the selected
+address is used for all transports as before. Historical Wi-Fi addresses are
+never selected automatically.
+
+This is an application-side routing workaround, not a firmware fix. Disable
+Ultimate Wi-Fi and power-cycle the device to restore normal wired REST latency
+when testing the Ethernet REST endpoint itself.
 # u64deck
 
-**v1.8.0 — Public Beta 10.4**
+**v1.9.0 — Release Candidate 13**
 
 
 A lightweight, self-hosted control deck for the **Ultimate 64** (and, minus the
@@ -38,6 +58,18 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
   to discover unseen HVSC tunes already present on the Ultimate. Powered by
   **SIDFlow (Chris Gleissner)**.
 - **Audio mirror** — the U64 audio stream, played in the browser.
+- **Reliable, cartridge-safe SID Stop delivery** — under dual-interface split
+  routing, Jukebox Stop parks any configured fast cartridge, resets through the
+  responsive Wi-Fi REST-control path, then restores the cartridge setting
+  without activating it. Single-interface Legacy/C64U and CIA1-capable U64
+  sessions retain their previously verified REST/command-socket order and
+  compatibility fallback.
+- **SID-to-disk handoff recovery** — after native SID playback, affected
+  firmware can retain player state that a normal reset does not fully clear.
+  u64deck remembers SID-runner activity per device and performs one automatic
+  full reboot before the next Mount & Run, then continues with the normal mount,
+  reset, readiness gates, LOAD and RUN sequence. Ordinary disk launches are
+  unchanged, and a manual Reboot clears the pending recovery state.
 - **Unambiguous stream state** — stopping or losing video replaces the last
   frame with a C64-style VIDEO NOT CONNECTED panel, while the audio badge shows
   off/connecting/live/reconnecting/error and the live chunks-per-second rate.
@@ -67,8 +99,14 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
 - **Local USB index import** — remove a large collection stick from the Ultimate,
   connect it to the u64deck PC and build `/USB0` (or another mapped subtree)
   directly from local storage without FTP traffic.
-- **Auto-discovery** — *Select Ultimate…* sweeps your subnet and lists every
-  Ultimate on the network; one click to connect, no IP hunting.
+- **Verified interface-aware discovery** — *Select Ultimate…* checks previously
+  verified addresses first, then sends one bounded `/v1/info` request to every
+  remaining address on the local `/24`. There is no preliminary TCP port scan
+  and no retry storm. Ethernet and Wi-Fi responses are grouped into one physical
+  device using the firmware `unique_id`, verified Ethernet is preferred, and a
+  guarded **Clear discovered devices** action provides a clean recovery scan
+  without touching unrelated settings. Routine status and drive polling pause
+  while discovery runs so the Ultimate REST service is not overloaded.
 - **Stream quality options** — low-latency vs all-frames buffering, sharp vs
   soft scaling, 2×/3×/fit sizing; remembered across sessions.
 - **Assembly64 workspace** — use a full-height, responsive two-pane search and release-file view to query the public Assembly64 database. Results include
@@ -99,6 +137,27 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
 ![Settings](docs/settings.png)
 *Full firmware settings access — every category editable from the browser — plus index management and the SIDFlow similarity data panel.*
 
+![Find Ultimate Devices](docs/device-finder.png)
+*Find Ultimate Devices — one row per device with verified Ethernet (recommended) and Wi-Fi addresses, deduplicated by unique id.*
+
+![Wi-Fi and Ethernet header](docs/wifi-ethernet-header.png)
+*Connected header showing the active link type, with one-click Switch to Ethernet when a wired address is known.*
+
+![Split routing](docs/split-route.png)
+*When both interfaces belong to the same Ultimate, media and commands use Ethernet while status polling uses the faster Wi-Fi REST path — shown here as "Ethernet · REST via Wi-Fi" in the header.*
+
+![Wi-Fi streaming gated](docs/wifi-streaming-gated.png)
+*Screen tab over Wi-Fi: streaming is wired-only, so video, audio and recording are clearly gated while the rest of the app stays available.*
+
+![Mount and Run](docs/mount-and-run.png)
+*Mount & Run types LOAD and RUN automatically once the machine is ready, with each readiness gate recorded in Diagnostics.*
+
+![Busy loading](docs/busy-loading.png)
+*Amber “BUSY — loading program…” state during a slow genuine-drive load, keeping the device connected instead of showing a false timeout.*
+
+![Disk swap](docs/disk-swap.png)
+*Automatic multi-disk grouping with the swap bar, plus Add to Swap Queue for sets that are intentionally left ungrouped.*
+
 ## Quick start
 
 ### Tier 1 — Windows, no Python
@@ -124,15 +183,146 @@ python server.py --u64 192.168.1.64        # IP optional if you use Select Ultim
 # open http://localhost:8064
 ```
 
-Settings (device, interface, transport, passwords) live in `config.json`,
-which u64deck **creates and updates by itself** — it is deliberately not
-shipped in release zips, so unzipping an update over your install keeps
-your settings. `config.example.json` documents the available keys
-(`u64_host`, `password` for the U64 network password, `ftp_user`/
-`ftp_password`, `local_ip`, `stream_transport`, multicast groups,
+Settings (device, interface, transport and passwords) live in
+`config.json`, which u64deck **creates and updates by itself** and release
+archives deliberately do not include. `config.example.json` documents the
+available keys (`u64_host`, the Ultimate network `password`, FTP credentials,
+`local_ip`, `stream_transport`, multicast groups and
 `assembly64.client_id`).
 
-Always run u64deck as a normal user, and always the same way — mixing elevated ('Run as administrator') and normal launches leaves files with mismatched ownership and causes access-denied errors; if you've mixed them, start fresh in a new folder.
+### Updating an existing installation
+
+Install every release into a **new, empty folder**. Stop the previous u64deck
+process completely before copying user data, and do not extract a new release
+over older Python, static or executable files. Overlay installs can leave a
+mixed-version folder or stale bytecode and produce behaviour that is not
+present in a clean build.
+
+After the old process has stopped, copy only the persistent files you need:
+
+- `config.json` — device and application settings;
+- `user_items.json` — favourites and recent items;
+- `playlists.json` — saved SID playlists;
+- `.u64deck-index.sqlite3` — the stable storage/search index;
+- `.sidflow-similarity.sqlite` — imported SIDFlow similarity data, when used.
+
+Older installations may instead contain `.u64deck-index-*.sqlite3` files.
+These can be copied into the fresh folder and u64deck will perform its existing
+validated migration to the stable database. Copy SQLite databases only after
+u64deck has shut down so pending writes are committed. Do not copy `*-wal`,
+`*-shm`, `__pycache__`, `.pytest_cache`, `*.pyc`, temporary build/download
+files, old source/static files or the previous executable.
+
+Always run u64deck as a normal user, and always the same way — mixing elevated
+('Run as administrator') and normal launches leaves files with mismatched
+ownership and causes access-denied errors. If that has happened, use a fresh
+folder and copy only the supported persistent files listed above.
+
+## Interface-aware Ultimate discovery
+
+An Ultimate 64 or C64 Ultimate can expose the REST API on wired Ethernet and
+its ESP32 Wi-Fi interface at the same time. These are two interfaces belonging
+to one physical Ultimate, not two independent devices. u64deck verifies each
+live endpoint, groups matching responses using the firmware `unique_id`,
+classifies the observed MAC address and recommends verified Ethernet.
+
+This network identity drives visible application behaviour:
+
+- one Finder row represents one physical Ultimate;
+- both currently verified Ethernet and Wi-Fi addresses are shown in that row;
+- Ethernet is marked as recommended;
+- **Switch to Ethernet** appears when a verified wired address is known;
+- wired-only video, audio and recording controls are explained and gated over
+  Wi-Fi with **STREAMING NOT AVAILABLE OVER WI-FI**, while Storage, SID,
+  Settings, Assembly64 and supported machine controls remain available.
+
+### Cached-first discovery
+
+`config.json` retains previously verified addresses as discovery history. On a
+new scan, u64deck first tries addresses that still belong to the PC's current
+local `/24`, using a direct `GET /v1/info`. This makes the normal case fast, but
+history is never treated as proof that an interface is online: a cached address
+must answer during the current scan before it can be displayed, selected or
+recommended. Stale and off-subnet addresses remain history only.
+
+After the cached-first stage, every remaining address on the local `/24`
+receives exactly one direct `GET /v1/info` request. Both stages call the same
+production transport module: short-lived TCP sockets executed by a bounded
+`ThreadPoolExecutor` (4 cached workers, then 64 subnet workers).
+
+The transport deliberately separates connection time from response time:
+
+- TCP has **1.5 seconds to connect**;
+- after TCP connects, the Ultimate has **3.25 seconds to return the HTTP
+  response**.
+
+This is not a general five-second scan timeout. Hardware testing on Ultimate 64
+firmware 3.15 showed Ethernet establishing TCP in roughly 5–54 ms while
+occasionally taking about 2.1–2.6 seconds to return the first `/v1/info` byte.
+The old single 1.5-second timeout therefore discarded a healthy wired endpoint.
+The split design keeps unreachable subnet addresses bounded by the shorter
+connect deadline while allowing an already-connected Ultimate REST service time
+to answer.
+
+The application deliberately uses no preliminary TCP port probe, async HTTP
+substitute or same-scan retry pass. Each address is requested once. This avoids
+losing a valid interface to an overly short port check and avoids the contention
+caused by layered probes and retry storms. DHCP replacements are found by the
+full subnet phase and supersede old addresses when the same interface MAC is
+observed at the new IP.
+
+### Responsive connection hand-off
+
+Finder results are live verification results, not merely address suggestions.
+When **Use selected address** is pressed, u64deck reuses the successful Finder
+`/v1/info` result and the current MAC-based link classification rather than
+immediately repeating those REST operations. Manual IP addresses still receive
+a fresh verification request before the active backend is changed.
+
+Connect does not block on the optional CIA1 keyboard capability check. A cached
+capability is carried between the Ethernet and Wi-Fi addresses of the same
+physical Ultimate; otherwise the check runs later without holding up Connect.
+Routine status and Mounted Drives refreshes are coalesced and stand down while
+a user-initiated device operation is active. Browser timeouts therefore do not
+create a queue of stale polling work behind Connect or stream controls.
+
+The address chooser is explicit: select the Ethernet or Wi-Fi button, confirm
+the visible highlight, then press **Use selected address**. Ethernet remains the
+default recommendation when it was verified during the current scan.
+
+### REST service etiquette
+
+Ultimate hardware exposes a capable but constrained embedded REST service.
+Network clients should use bounded concurrency, bounded timeouts and coordinated
+polling. More retries and longer request queues can reduce reliability by
+creating contention rather than improving detection.
+
+While **Find Ultimate Devices** is scanning, u64deck pauses routine status and
+Mounted Drives polling. Discovery uses independent one-shot socket requests and sends at most one
+`/v1/info` request to each subnet address during that scan. Interface classification then uses current MAC/ARP evidence only; it does
+not issue follow-up `/v1/version` latency probes. Normal polling resumes when
+the bounded scan finishes or fails. A second Finder scan cannot overlap the
+first.
+
+For troubleshooting, `discovery_diagnostic.py` imports this exact production
+transport rather than maintaining a second scanner. For example:
+
+```bat
+python discovery_diagnostic.py --subnet 192.168.249.0/24 --cached 192.168.249.163 --cached 192.168.249.160
+```
+
+The diagnostic reads no u64deck configuration and sends no reset, mount,
+keyboard or playback commands.
+
+The **Clear discovered devices** action clears remembered identities and
+addresses, disconnects the current session and performs a genuinely fresh scan.
+It does not alter passwords, ports, SID/HVSC paths, mount preferences,
+Assembly64 settings or other unrelated configuration.
+
+When the link cannot be classified, u64deck labels it **Unknown** rather than
+guessing. Streaming controls remain available for an Unknown link, and a
+non-modal hint may suggest Ethernet if a stream starts but no video frame
+arrives.
 
 ## Mount safety modes
 
@@ -230,6 +420,18 @@ content are excluded.
   with the VIC streamer (U64 / C64U — the 1541 Ultimate-II+ has none).
 - Python 3.10+ on any machine on the same LAN (or the standalone exe).
 
+### Tested keyboard-input compatibility
+
+| Hardware / firmware | Interactive keyboard input |
+|---|---|
+| Ultimate 64 firmware 3.15 | CIA1 matrix input |
+| Ultimate 64 firmware earlier than 3.15 | Legacy KERNAL buffer |
+| Commodore 64 Ultimate — current official, Spiffy and prkl firmwares | Legacy KERNAL buffer |
+
+u64deck probes the available firmware capability and selects the supported input
+method automatically. Bulk text and Mount & Run LOAD/RUN delivery retain the
+compatible KERNAL-buffer path where required.
+
 ## Setup
 
 ### Standalone .exe (no Python needed)
@@ -241,7 +443,7 @@ The repo includes a PyInstaller spec and a GitHub Actions workflow
 1. Push this folder to a GitHub repo.
 2. The **build-exe** action runs on every push — grab `u64deck.exe` from the
    workflow's artifacts (Actions tab → latest run → *u64deck-windows*).
-3. Tag a release (`git tag v1.8.0-beta.10.4 && git push --tags`) and the exe is attached
+3. Tag a release (`git tag v1.9.0-rc.13 && git push --tags`) and the exe is attached
    to the GitHub Release automatically.
 
 Double-click the exe: it starts the server, opens your browser, and you hit
@@ -266,12 +468,21 @@ Compunet Reborn CRT are someone else's software; the `.gitignore` excludes
 
 ### Discovery
 
-There's no broadcast/mDNS announce in the Ultimate firmware, so discovery
-works the way Ultimate64 Manager does it: a parallel TCP sweep of your /24
-on port 80, then a `GET /v1/info` on each hit to confirm it's actually an
-Ultimate. Takes a couple of seconds; needs **Web Remote Control** enabled on
-the device. If your Ultimate lives on a different subnet, type that subnet
-prefix (e.g. `192.168.50.`) into the extra-subnet box before scanning.
+There's no broadcast/mDNS announce in the Ultimate firmware. Finder therefore
+checks live remembered addresses first, then sends one direct `GET /v1/info` to
+each remaining address on the local `/24`. It uses up to four cached-address
+workers and 64 subnet workers. Each address has a 1.5-second TCP-connect budget;
+only addresses that connect receive a separate 3.25-second HTTP-response budget.
+It does not use a TCP port pre-scan and does not retry failed addresses during
+the same scan. Routine status and drive polling pause until the scan has
+finished.
+
+Only addresses verified during the current scan are shown. Responses are grouped
+by firmware `unique_id`, verified Ethernet remains preferred over Wi-Fi, and
+DHCP changes are discovered by the full subnet phase. A fresh `/24` scan normally
+completes in several seconds and requires **Web Remote Control** on the device.
+If your Ultimate lives on a different subnet, enter that subnet prefix (for
+example `192.168.50.`) in the extra-subnet box before scanning.
 
 ### Stream quality
 
@@ -355,6 +566,27 @@ Mount & Run and Mount & Load type into the keyboard buffer after a reset. With a
 cartridge like **Retro Replay** active, reset lands in the cart's boot menu
 first — and if the typed `LOAD` characters arrive while that menu is up, the
 menu interprets them (that's how you end up staring at the MC monitor).
+
+Mount & Run now waits for the machine before typing. After the normal reset
+settle, u64deck polls the KERNAL readiness flag at zero-page `$CC` and requires
+two consecutive ready readings before sending the `LOAD` line through the
+established keyboard buffer. It applies the same gate after `LOAD`, so `RUN` is
+sent only when the screen editor is ready again rather than after a fixed
+delay. On CIA1-capable Ultimate 64 firmware the post-load `R`, `U`, `N` and
+Return are delivered as matrix key taps; Legacy/C64U sessions retain the
+keyboard-buffer RUN path. Each gate can wait for up to 2 minutes and records
+its result in Diagnostics, together with the RUN delivery method. If the
+machine remains busy, nothing further is typed and the UI reports whether
+`LOAD` or `RUN` was withheld. Firmware without `machine:readmem` automatically
+retains the established complete fixed-delay buffer behaviour.
+
+During a slow genuine-drive load the Ultimate's embedded HTTP service can be
+unavailable even though the machine and mounted drive are operating normally.
+While Mount & Run owns that operation, u64deck reports **BUSY — loading
+program…** in amber instead of treating the expected status timeout as an
+offline device. Status is retried locally and refreshed immediately when the
+Mount & Run request completes; genuine connection failures outside that window
+continue to use the normal offline handling.
 
 The SCREEN tab has an **Auto F7 Fastload** checkbox. When enabled, u64deck
 presses F7 after Reset or Reboot actions started from its UI, selecting
@@ -544,6 +776,16 @@ suffix match, such as `Game side1.d64` / `Game side2.d64`, `Game (Disk 1).d64`
 / `Game (Disk 2).d64`, `ThePhoenixCode-Disk1-BZ.D64` /
 `ThePhoenixCode-Disk2-BZ.D64`, or `Scratch-1.d64` / `Scratch-2.d64`. A shared
 release/language tag after the disk number is retained as part of the match.
+The matcher also recognises compound numbered tokens such as
+`EdgeOfDisgrace_0.d64` / `_1a.d64` / `_1b.d64`, bare parenthesised tokens such
+as `WeAreDemo(A).d64` / `(B).d64` and `Game(1).d64` / `(2).d64`, plus
+title-less marker names such as `side1.d64` / `side2.d64` within one folder.
+Square-bracket letters such as `Game[a].d64` remain excluded as alternate-dump
+markers. A bare-token family is also vetoed when an unsuffixed sibling exists,
+such as `Game.d64` beside `Game(a).d64`. Glued digits such as `Turrican1.d64`
+and `Turrican2.d64` are deliberately not grouped because they are
+indistinguishable from sequels; use the manual queue or a separator in the
+filename when they really are disk sides.
 Merely sharing a folder or ending in a number is not enough. Matching disks are naturally
 sorted, so `disk 10` follows `disk 9`. If there is more than one, the swap bar
 appears: numbered buttons jump to any disk and ▶ mounts the next. Ambiguous
@@ -554,7 +796,11 @@ an application restart or when **Refresh Drive Status** is used.
 
 A compact **Mounted Drives** strip appears at the top of SCREEN and STORAGE,
 showing both drive images and their effective RO/RW/UNLINKED mode. Click it to
-jump to the full eject and refresh controls.
+jump to the full eject and refresh controls. Mount & Run updates this strip as
+soon as the Ultimate confirms the mount, before the subsequent reset and slow
+real-drive load have finished. During the amber BUSY state u64deck keeps that
+confirmed filename visible instead of replacing it with a drive-status timeout,
+then reconciles the display with the device immediately after loading completes.
 
 **Manual queue** — when you want to choose the exact disks and order: in the
 STORAGE tab, choose **Add to Swap Queue** on each image in order (1, 2, 3…); the DISK SWAP QUEUE
@@ -569,6 +815,13 @@ Mid-demo the ritual is: software asks for disk N → click **N** (or ▶) in the
 swap bar → click the screen → press the key it's waiting for. Done.
 
 ## Acknowledgements
+
+u64deck was inspired in part by the workflows provided by **U64 Manager** and
+**Assembly64**, particularly around discovering Ultimate hardware and launching
+content over the network. u64deck extends that model with interface-aware
+discovery: Ethernet and Wi-Fi endpoints are verified independently, grouped into
+one physical device using the Ultimate `unique_id`, and used to recommend the
+preferred link and explain or gate network-dependent UI features.
 
 **SIDFlow-powered recommendations are made possible by Chris Gleissner**, who
 created SIDFlow, published the portable similarity export and explicitly

@@ -55,10 +55,10 @@
       <div class="panel">
         <h2>SCREEN &amp; RECORDING</h2>
         <div class="row" style="margin-bottom:8px">
-          <button id="btnVideo" class="primary" onclick="toggleVideo()">Start Video</button>
-          <button id="btnAudio" onclick="toggleAudio()">Start Audio</button>
-          <button onclick="toggleFullscreen()" title="double-click the screen also toggles">Full Screen</button>
-          <button id="btnRecord" class="tip" data-tip="Record video, audio, or both. Auto prefers MP4 when the browser supports it and otherwise uses WebM." onclick="toggleRecording()"><span id="recordDot" class="record-dot" aria-hidden="true"></span><span id="recButtonLabel">Record</span></button>
+          <button id="btnVideo" class="primary" data-wifi-tip="Start or stop the Ultimate VIC video stream." onclick="toggleVideo()">Start Video</button>
+          <button id="btnAudio" data-wifi-tip="Start or stop the Ultimate audio stream." onclick="toggleAudio()">Start Audio</button>
+          <button id="btnFullscreen" data-wifi-tip="double-click the screen also toggles" onclick="toggleFullscreen()" title="double-click the screen also toggles">Full Screen</button>
+          <button id="btnRecord" class="tip" data-wifi-tip="Record video, audio, or both." data-tip="Record video, audio, or both. Auto prefers MP4 when the browser supports it and otherwise uses WebM." onclick="toggleRecording()"><span id="recordDot" class="record-dot" aria-hidden="true"></span><span id="recButtonLabel">Record</span></button>
           <span id="recStatus" class="badge" style="display:none">00:00</span>
           <span id="recSummary" class="hint rec-summary">Combined · Standard · Auto</span>
           <label class="hint" title="After Reset C64, Reboot Ultimate, Mount & Run or Mount & Load, wait for the Retro Replay menu and press F7 to install Fastload">
@@ -68,8 +68,11 @@
           <span class="meter-group" aria-label="stream rates">
             <span id="fps" class="badge">0 fps</span>
             <span id="aud" class="badge" title="Ultimate audio stream status">Audio off</span>
+            <span id="streamLinkStatus" class="badge">Link unknown</span>
           </span>
         </div>
+        <div id="streamHint" class="stream-hint" style="display:none"></div>
+        <button id="wifiSwitchInline" class="mini primary" style="display:none;margin-bottom:8px" onclick="switchToEthernet()">Switch to Ethernet</button>
         <div class="row" style="margin-bottom:8px;flex-wrap:wrap;gap:6px">
           <label class="hint tip" data-tip="Controls how the live WebSocket handles incoming frames. It does not change recording bitrate or file quality.">Stream frames
             <select id="qMode" onchange="qualityChanged()">

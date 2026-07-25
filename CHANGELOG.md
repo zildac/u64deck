@@ -1,5 +1,385 @@
 # Changelog
 
+## 1.9.0 — Release Candidate 13
+
+- Changed SID Jukebox Stop under split dual-interface routing to use the
+  verified Wi-Fi REST-control path first instead of the selected Ethernet
+  command socket. This avoids the wired path associated with the repeatable
+  approximately three-second Stop delay seen when both Ultimate interfaces are
+  enabled; hardware confirmation remains the RC13 acceptance gate.
+- Made split-route Stop cartridge-safe. A configured fast cartridge is parked,
+  the C64 is reset to its normal screen, and the cartridge setting is restored
+  afterwards without activating it. Command-socket reset remains the fallback
+  if REST delivery fails.
+- Preserved the per-device SID-runner recovery flag. The first Mount & Run
+  after native SID playback still performs the proven full Ultimate reboot
+  before mounting, even after Stop has returned the machine to the C64 screen.
+- Added per-stage SID Play diagnostics covering coordinator wait, lazy SID
+  fetch, cartridge lookup/park, native SID upload, cartridge restore and state
+  commit. The API response includes the same timings so any remaining Play
+  delay can be attributed from hardware evidence rather than guessed.
+- Retained RC12 split Ethernet/Wi-Fi routing, hybrid post-load RUN delivery,
+  post-SID Mount & Run recovery and the frozen discovery implementation.
+
+## 1.9.0 — Release Candidate 12
+
+- Added split dual-interface routing for Ultimate devices with both Ethernet
+  and Wi-Fi verified. Selecting Ethernet keeps port 64, FTP and streaming on
+  the wired address while ordinary REST control uses the paired Wi-Fi address.
+- Hardware isolation reproduced the same approximately 2.5-second Ethernet
+  REST response delay on an Ultimate 64 running firmware 3.15 and an older C64
+  Ultimate running different firmware. Wi-Fi merely being enabled at boot was
+  sufficient; discovery and Wi-Fi HTTP requests were not required to trigger it.
+- The connected header and Screen status now show **Ethernet · REST via Wi-Fi**
+  whenever split routing is active. Connect responses and Diagnostics also
+  expose the selected and REST-control addresses.
+- Stream start/stop uses the selected Ethernet command socket first under split
+  routing, preserving the wired media path without waiting on the slow Ethernet
+  REST listener. REST remains the fallback.
+- Persisted split routing is accepted only when both addresses still belong to
+  the same known device. A newly discovered Wi-Fi address is used automatically
+  only when it was verified in the current Finder scan.
+- Retained RC11's reduced polling/hand-off behaviour, the hybrid post-load RUN
+  delivery and the automatic post-SID recovery reboot before the next Mount & Run.
+
+## 1.9.0 — Release Candidate 11
+
+- Preserved the hardware-passed RC10 discovery implementation byte-for-byte,
+  including the 1.5-second TCP-connect deadline, 3.25-second post-connect
+  response allowance, cached-first ordering, 64-worker subnet phase, one
+  `/v1/info` request per address, identity grouping and Ethernet preference.
+- Removed the automatic Info and Mounted Drives refreshes that previously ran
+  as soon as Finder completed.
+- Connect now reuses the live Finder `/v1/info` result and current link
+  classification. Manual addresses retain a fresh verification request.
+- Removed the blocking CIA1 capability probe and redundant old-interface
+  matrix release from same-device Ethernet/Wi-Fi hand-off. Cached capability
+  follows the physical device; otherwise the check runs after Connect.
+- Prevented routine status and drive polling from queueing behind interactive
+  device work, and coalesced duplicate browser refreshes.
+- Avoided sending a matrix `release_all` request when no key or chord is held.
+  Opening Finder, changing tabs or losing screen focus therefore creates no
+  unnecessary Ultimate REST request.
+- Replaced the ambiguous address controls with a visibly selected Ethernet or
+  Wi-Fi choice and one explicit **Use selected address** button.
+- RC10 passed discovery hardware testing but failed connection/UI responsiveness
+  acceptance. RC11 is the contained integration correction and requires fresh
+  hardware validation.
+
+## 1.9.0 — Release Candidate 10
+
+- Replaced RC9's single 1.5-second discovery request timeout with the
+  hardware-proven split-timeout transport. Each address receives 1.5 seconds
+  for TCP connection establishment and, only after connection succeeds, 3.25
+  seconds for the `/v1/info` response.
+- Hardware investigation on Ultimate 64 firmware 3.15 showed the wired endpoint
+  connecting in roughly 5–54 ms while sometimes delaying the first HTTP byte
+  for about 2.1–2.6 seconds. The single RC9 deadline therefore rejected a live
+  Ethernet interface even though TCP had already connected.
+- Kept the bounded design: four cached-address workers, 64 subnet workers, one
+  request per address, no port pre-scan, no retry pass, no asynchronous HTTP
+  pool and no follow-up REST probes for link classification.
+- The production Finder and `discovery_diagnostic.py` continue to import the
+  same implementation from `discovery_transport.py`; the diagnostic is not a
+  separate scanner.
+- Two consecutive clean-cache `/24` hardware scans found Ethernet and Wi-Fi,
+  grouped both responses by firmware `unique_id`, preferred verified Ethernet
+  and completed in about 6.1 seconds. A cached-first hardware scan also found
+  both interfaces and preferred Ethernet.
+- Expanded README and built-in Help documentation to explain why connection and
+  response deadlines are separate. No Mount & Run, SID, Jukebox, keyboard,
+  streaming, Mounted Drives or other machine-control behaviour changed.
+
+## 1.9.0 — Release Candidate 9
+
+- Replaced RC8's unvalidated asynchronous discovery transport with the exact
+  scanner model proven by the standalone hardware diagnostic:
+  `ThreadPoolExecutor + urllib`, four cached-address workers, 64 subnet workers,
+  a 1.5-second timeout, one direct `/v1/info` request per address, no port
+  pre-scan and no same-scan retry.
+- Moved that scanner into `discovery_transport.py`. Both the Finder and the
+  supplied `discovery_diagnostic.py` import the same production module; there is
+  no second implementation of the network transport.
+- Removed discovery's latency-race classification path. Ethernet/Wi-Fi labels
+  now use current MAC/ARP evidence only, so interface enumeration cannot add
+  `/v1/version` probes after the bounded `/v1/info` scan.
+- Retained RC8's polling suspension, overlap guard, verified-only results,
+  `unique_id` grouping, DHCP replacement handling and Ethernet preference.
+- Added transport-level and application-level regression coverage proving that
+  cached addresses are scanned first, are excluded from the subnet stage and
+  every candidate is submitted at most once.
+- RC8 failed dual-interface hardware acceptance and should not be published.
+  No Mount & Run, SID, Jukebox, keyboard, streaming, Mounted Drives or other
+  machine-control behaviour changed in RC9.
+
+## 1.9.0 — Release Candidate 8
+
+- Replaced the RC5–RC7 discovery experiments with the bounded cached-first
+  design proven by standalone hardware tests. Previously verified addresses on
+  the current local `/24` are requested first using direct `/v1/info` calls.
+- Every remaining subnet address then receives exactly one direct `/v1/info`
+  request using 64 workers and a 1.5-second per-address timeout. There is no TCP
+  port pre-scan, no second port pass and no same-scan retry storm.
+- Hardware measurement on U64 firmware 3.15 found both live interfaces reliably:
+  Ethernet responded in about 53 ms, Wi-Fi in about 38 ms, both appeared after
+  about 3.7 seconds and the complete fresh `/24` scan finished in about 6.7
+  seconds. The earlier apparent multi-second Ethernet delay was scan contention,
+  not intrinsic wired-interface latency.
+- Routine `/api/info` and `/api/drives` polling now pauses while Finder is
+  active, overlapping scans are rejected and normal polling resumes after the
+  bounded scan. Discovery uses separate short-lived HTTP clients, so it cannot
+  queue work on the active Ultimate REST backend.
+- Expanded README and built-in Help documentation covering interface-aware
+  identity, cached-first verification, Ethernet preference, link-dependent UI
+  features and REST etiquette for Ultimate network clients. Existing U64
+  Manager and Assembly64 acknowledgements are retained and clarified.
+- No Mount & Run, SID, keyboard, streaming, Mounted Drives or machine-control
+  behaviour changed.
+
+## 1.9.0 — Release Candidate 7
+
+- Fixed the evidence-confirmed dual-interface discovery failure on U64 firmware
+  3.15. A standalone direct `/v1/info` scan found Wi-Fi in about 45 ms but the
+  healthy Ethernet interface required about 2.2 seconds; the previous 1.5-second
+  verification limit therefore discarded Ethernet before identity grouping.
+- Retained the fast TCP subnet sweep and the verified-only grouping rules, but
+  increased the normal `/v1/info` verification window to 3.25 seconds and the
+  controlled post-batch retry to 4.5 seconds. The retry remains sequential so
+  two interfaces on one Ultimate do not compete for its firmware HTTP service.
+- The Find Ultimate Devices request now has a discovery-specific 45-second
+  browser window. The normal 15-second timeout for ordinary device operations
+  is unchanged.
+- Added diagnostics for slow `/v1/info` responses and regression coverage for
+  the real hardware timing shape. No Mount & Run, SID, keyboard, streaming,
+  Mounted Drives or machine-control code changed.
+
+## 1.9.0 — Release Candidate 6
+
+- Fixed the remaining dual-interface discovery failure where Ethernet could
+  lose the initial TCP port-80 pre-probe when Ethernet and Wi-Fi were enabled
+  on the same Ultimate. RC5 retried only `/v1/info`, so an address discarded
+  before verification could never be recovered.
+- Configured and remembered addresses now bypass the competing TCP pre-probe
+  and are verified directly, sequentially. Fresh scans retain the fast bulk
+  sweep, then perform one lower-contention second port pass on the subnet of a
+  verified Ultimate before sequentially verifying any recovered addresses.
+- Successfully recovered Ethernet and Wi-Fi responses continue to be grouped
+  by firmware `unique_id`, with verified Ethernet recommended. An interface
+  that fails both port passes or verification remains historical only and is
+  never displayed or selected from stale data.
+- Added hardware-shaped regression coverage in which Ethernet loses the TCP
+  pre-probe itself, then is recovered, grouped with Wi-Fi and preferred. No
+  Mount & Run, SID, input, streaming or machine-control code changed.
+
+## 1.9.0 — Release Candidate 5
+
+- Fixed dual-interface discovery when Ethernet and Wi-Fi are enabled on the
+  same Ultimate. The fast concurrent verification pass is retained, but any
+  address that loses the initial `/v1/info` race is retried once after the
+  parallel batch has finished.
+- Verification retries are sequential, preventing the two interfaces of one
+  physical Ultimate from competing for the firmware HTTP service. Successfully
+  recovered addresses are grouped by the existing firmware identity and the
+  verified Ethernet address remains preferred.
+- Verified-only safeguards remain unchanged: an interface that does not answer
+  either verification attempt is omitted from the live result and cannot be
+  recommended merely because it exists in discovery history.
+- Added end-to-end regression coverage for recovery of a competing Ethernet
+  interface and for a genuinely unavailable historical interface remaining
+  absent after retry. No Mount & Run, SID, input or streaming code changed.
+
+## 1.9.0 — Release Candidate 4
+
+- Added conditional SID-runner recovery before Mount & Run. Successful native
+  SID playback is remembered per Ultimate, including after Stop or natural
+  completion, because affected firmware can retain player state that a normal
+  C64 reset does not fully clear.
+- The first Mount & Run after SID-player activity now disarms Jukebox callbacks,
+  performs one full `machine:reboot`, closes the pre-reboot command socket,
+  waits for the Ultimate REST service to return, and only then mounts the disk
+  and continues through the established reset, readiness gates, LOAD and RUN
+  sequence. Mount & Run is unchanged when no SID has played.
+- A successful explicit Reboot clears the pending recovery state. Failed reboot
+  or return-to-service checks leave the state armed and abort before mounting,
+  preventing a false successful launch.
+- Added regression coverage for per-device SID-runner state, successful and
+  failed recovery reboots, operation ordering, manual Reboot clearing and the
+  unchanged ordinary Mount & Run path. Jukebox Stop routing is unchanged.
+
+## 1.9.0 — Release Candidate 3
+
+- Fixed a state-dependent Mount & Run race after native SID playback. Every
+  SID completion timer now carries a generation token, and stale callbacks exit
+  without resetting the C64, starting another SID or reclaiming the machine
+  after a disk launch has begun.
+- Mount & Run, Mount & Load, explicit Reset/Reboot and non-Jukebox runner
+  actions now disarm pending SID timers, stop-after-current and Radio state
+  before taking ownership of the machine. The current play queue remains
+  available but is no longer marked as playing.
+- SID auto-advance is serialised with other interactive device operations and
+  rechecks its generation after waiting. Whichever action acquires the device
+  first completes normally; a later stale Jukebox callback is ignored.
+- Added regression coverage for timer cancellation, generation invalidation,
+  stale completion callbacks, Mount & Run after a finished SID and non-Jukebox
+  runner takeover. Jukebox Stop transport routing is unchanged.
+
+## 1.9.0 — Release Candidate 2
+
+- Fixed a cold-start lifecycle race in `/api/drives`. Mounted Drives now takes
+  the same status-priority coordinator lock as `/api/info` before capturing the
+  active REST backend, so Connect or Clear cannot replace and close that client
+  while a waiting drive refresh still holds it.
+- A closed-client handover is retried once against the current backend. If no
+  usable backend is available, the API returns a controlled temporary status
+  with the last confirmed mount snapshot and the browser retries, rather than
+  exposing an ASGI traceback or generic Internal Server Error.
+- Added defensive handling for malformed rows in a device drive payload without
+  changing normal `/v1/drives`, mount, swap or BUSY behaviour.
+- Updated the README to require clean-folder upgrades and document exactly which
+  settings, favourites, playlists and SQLite data files may be copied after the
+  previous process has stopped. Overlay installs and stale runtime files are
+  explicitly unsupported.
+- SID Jukebox Stop routing is unchanged from the hardware-verified RC1 code; the
+  reported delay was not reproducible after extraction to a clean folder.
+
+## 1.9.0 — Release Candidate 1
+
+- Mount & Run now exposes its locally confirmed mount state while reset, LOAD
+  and RUN continue in the same synchronous operation. The Mounted Drives strip
+  updates as soon as the Ultimate accepts the image, retains that filename and
+  mode through a slow genuine-drive load, and reconciles with `/v1/drives`
+  immediately when loading finishes.
+- `/api/drives` recognises the same expected Mount & Run BUSY state as
+  `/api/info`, returning the confirmed local mount snapshot without contacting
+  the occupied Ultimate HTTP service. Raw drive-status timeout text is therefore
+  suppressed only during the known loading window; ordinary errors remain
+  visible at all other times.
+- Promoted the release line to v1.9.0 Release Candidate 1 and updated active
+  backend, UI, README, packaging, workflow and test metadata consistently.
+- Expanded the searchable built-in Help with a dedicated Find Ultimate Devices
+  guide, clearer Mounted Drives and image-inspection behaviour, Quick Launch,
+  Assembly64, indexing, Settings and BUSY-state troubleshooting details. Help
+  remains version-agnostic.
+- Expanded the canonical README gallery from six to twelve entries covering
+  the device finder, link-aware header, Wi-Fi streaming gate, Mount & Run,
+  BUSY loading and disk swap. Added a standalone gallery release gate that
+  verifies both canonical order and matching PNG files before publication.
+- Feature scope remains frozen: readiness gates, hybrid RUN delivery, reset
+  routing, discovery, disk grouping, SID playback and streaming behaviour are
+  unchanged from the hardware-verified beta baseline.
+
+## 1.8.0 — Public Beta 17
+
+- Jukebox Stop now uses the fastest proven reset route for the connected
+  device. Legacy/C64U sessions reset directly through REST and use a fresh
+  port-64 command connection only as a fallback; CIA1-capable U64 sessions
+  retain fresh-command-socket-first delivery with REST fallback.
+- Stop routing uses the capability result already cached during connection and
+  never adds a new CIA1 probe to the button path. Matrix release is also
+  cached-only, keeping Stop responsive when the device is busy.
+- During a genuine-drive Mount & Run load, `/api/info` now reports the local
+  expected state `BUSY — loading program…` without contacting the occupied
+  Ultimate HTTP service. The UI shows this as an amber status rather than a red
+  offline timeout and retries status locally every two seconds.
+- All browser Mount & Run entry points request an immediate status refresh when
+  the operation completes or fails. Normal offline handling resumes after the
+  Mount & Run operation has ended.
+- Mount & Run readiness gates, hybrid CIA1 RUN delivery, Legacy RUN delivery,
+  REST-client lifecycle locking, discovery and disk-swap behaviour remain
+  unchanged from Public Beta 16.
+
+## 1.8.0 — Public Beta 16
+
+- Serialised device-backend replacement with active Ultimate operations so
+  Connect and Clear discovered devices cannot close the shared REST client
+  while `/api/info` or another request is using it.
+- Added a per-client lifecycle lock around the internal `httpx.Client`,
+  including timeout reconfiguration, request execution and closure. This
+  prevents the `Cannot send a request, as the client has been closed` race
+  observed during Beta 15 hardware testing.
+- Mount & Run continues to send `LOAD"*",8,1` through the established command
+  buffer and retains both `$CC` readiness gates. After a successful load gate,
+  CIA1-capable U64 firmware now receives `R`, `U`, `N` and Return as matrix key
+  taps; Legacy/C64U sessions retain command-buffer RUN delivery.
+- A failed CIA1 RUN request is not automatically repeated through the buffer,
+  avoiding a duplicate RUN after an ambiguous transport timeout. Diagnostics
+  records the selected RUN delivery method or failure.
+- Firmware without `machine:readmem` still uses the complete Public Beta 11
+  fixed-delay command-buffer sequence unchanged.
+
+## 1.8.0 — Public Beta 15
+
+- Discovery now treats persisted addresses as history and probe candidates,
+  never as proof that an interface is online. The device list, preferred
+  address and switch controls contain only addresses that answered `/v1/info`
+  during the current scan or current verified connection.
+- Disabled Wi-Fi and disconnected Ethernet interfaces disappear on the next
+  scan. DHCP replacements remove the superseded address when the same interface
+  MAC is observed at a new IP, while non-responding history keeps its original
+  `last_seen` value instead of being refreshed falsely.
+- Added **Clear discovered devices** to the Select Ultimate dialog. After a
+  confirmation it clears remembered hosts and the active connection, preserves
+  all unrelated settings, writes `config.json` atomically and immediately runs
+  a clean subnet scan.
+- Added concise discovery diagnostics for candidate/response/device counts,
+  omitted historical addresses, DHCP replacements and preferred-host updates.
+- Jukebox Stop now discards an idle port-64 connection and sends reset over a
+  newly established command socket. REST reset remains the compatibility
+  fallback and the chosen delivery path is recorded in Diagnostics.
+- Retains the hostname-first scanner label, `$CC`-gated Mount & Run behaviour
+  and conservative disk-swap filename additions introduced in the previous
+  bench build, while preserving automatic CIA1/Legacy capability handling.
+
+## 1.8.0 — Public Beta 14
+
+- Rebuilt from the verified Public Beta 11 baseline, retaining its
+  Ethernet/Wi-Fi discovery, interface classification and capability-driven
+  CIA1/Legacy input behaviour unchanged.
+- Mount & Run now waits for the KERNAL screen editor before typing both
+  `LOAD"*",8,1` and `RUN`. The readiness gate polls zero-page `$CC` every
+  500 ms, requires two consecutive zero readings, waits up to 120 seconds and
+  records the result of both the boot and load gates in Diagnostics.
+- Firmware without `/v1/machine:readmem` automatically keeps Public Beta 11's
+  fixed-delay Mount & Run behaviour. Automation continues to use the existing
+  keyboard-buffer command path on every device; no input-method selector or
+  unified keyboard-routing refactor is included.
+- The scanner now presents the device hostname first, retaining `unique_id`
+  as the internal deduplication key and as a visible fallback only.
+- Automatic disk-swap grouping now recognises compound numbered tokens such
+  as `_0/_1a/_1b`, safe parenthesised tokens such as `(A)/(B)` and `(1)/(2)`,
+  and title-less marker sets such as `side1/side2`. GoodTools square-bracket
+  letters, families with an unsuffixed sibling and glued sequel-like digits
+  remain deliberately excluded.
+
+## 1.8.0 — Public Beta 11
+
+- Added interface-aware discovery for Ultimate 64 and C64 Ultimate systems with
+  simultaneous Ethernet and ESP32 Wi-Fi addresses. Scan results are grouped by
+  `/v1/info` `unique_id` (hostname fallback), retain every known address in
+  `config.json`, and prefer the wired address without preventing an explicit
+  Wi-Fi connection.
+- Added deterministic link classification from on-link neighbour-table MACs:
+  the firmware's `02:15:41` wired signature is Ethernet, bundled Espressif OUIs
+  identify Wi-Fi, and every other or off-link address remains Unknown. Dual
+  addresses with contradictory classifications fall back to a three-sample
+  `/v1/version` median-latency race.
+- Added a fail-soft, additive-only weekly Espressif OUI refresh. The bundled
+  330-prefix 2026-07 snapshot is permanent, malformed or incomplete downloads
+  are discarded, and the wired signature can never enter the Wi-Fi set.
+- Added Ethernet/Wi-Fi awareness to the scanner, connected-device header and
+  Screen status. A Wi-Fi connection disables only video, audio, recording and
+  full-screen controls, explains that firmware streaming is wired-only, and
+  offers one-click switching to a remembered Ethernet address.
+- Kept Storage, Settings, SID Jukebox, Assembly64 and file operations available
+  over Wi-Fi, while extending the device REST timeout only for positively
+  identified Wi-Fi links. Unknown links retain existing behaviour and show a
+  soft Ethernet hint only when a stream starts but no video frames arrive.
+- Expanded Help and README documentation, retained the canonical six-image
+  screenshot gallery including `docs/settings.png`, and added regression
+  coverage for identity deduplication, MAC classification, contradiction and
+  latency fallbacks, OUI refresh safety, Wi-Fi gating and timeout scaling.
+- Updated release metadata consistently for Public Beta 11 / archive 75.
+
 ## 1.8.0 — Public Beta 10.4
 
 - Renamed the SID Jukebox queue column from **Len** to **Length** and now

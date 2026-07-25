@@ -32,6 +32,11 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 import discovery
+from network_awareness import (
+    LINK_ETHERNET, LINK_UNKNOWN, LINK_WIFI, LinkDetector,
+    classify_address_group, device_identity, load_oui_cache, merge_known_device,
+    preferred_address, refresh_oui_cache,
+)
 from d64 import DiskImage, ascii_to_petscii
 from ultimate import (AudioReceiver, CommandSocket, DeviceFS, UltimateError,
                       UltimateREST, VideoReceiver)
@@ -99,6 +104,11 @@ BUILD = build_id(ASSETS, Path(__file__).parent)
 
 DEFAULT_CONFIG = {
     "u64_host": "",
+    # When Ethernet is selected and the same Ultimate has a live Wi-Fi
+    # address, REST control can use Wi-Fi while command/FTP/streams remain
+    # bound to Ethernet. This avoids the device firmware's ~2.5 s wired REST
+    # response delay when both interfaces are enabled.
+    "rest_control_host": "",
     "password": "",
     "http_port": 8064,
     # Interface the u64deck web UI listens on. "127.0.0.1" = this machine
@@ -168,6 +178,10 @@ DEFAULT_CONFIG = {
     "sid_index_root": "",
     "ftp_user": "anonymous",
     "ftp_password": "",
+    # Device identities and all previously observed interface addresses.
+    # Optional/backward-compatible; populated by discovery and connection.
+    "known_devices": {},
+    "active_device_identity": "",
     "assembly64": {
         "base": "http://hackerswithstyle.se/leet",
         "client_id": "Ultimate",
@@ -219,7 +233,10 @@ def save_config():
 
 
 CFG = load_config()
-if CFG.pop("_config_migration_pending", False):
+if not isinstance(CFG.get("known_devices"), dict):
+    CFG["known_devices"] = {}
+_config_cleanup_pending = CFG.pop("input_method_preferences", None) is not None
+if CFG.pop("_config_migration_pending", False) or _config_cleanup_pending:
     save_config()
 USER_ITEMS = UserItemsStore(ROOT / "user_items.json")
 DIAG_EVENTS = deque(maxlen=200)
@@ -242,6 +259,23 @@ MATRIX_KEYBOARD_INPUTS = {
 MATRIX_TRANSITIONS = {"press", "release", "tap"}
 INPUT_CAPABILITIES: dict[str, dict] = {}
 INPUT_CAP_LOCK = threading.Lock()
+
+# Ethernet/Wi-Fi awareness. The optional Wireshark cache is additive-only;
+# the bundled 2026-07 Espressif list remains the permanent floor.
+OUI_CACHE_PATH = ROOT / ".espressif-ouis-cache.json"
+_OUI_SET, _OUI_META = load_oui_cache(OUI_CACHE_PATH)
+LINK_DETECTOR = LinkDetector(_OUI_SET)
+LINK_STATE_LOCK = threading.RLock()
+# Addresses confirmed by the most recent discovery scan or successful
+# /v1/info call in this process. Persisted addresses are history only.
+DISCOVERY_LIVE_ADDRESSES: dict[str, set[str]] = {}
+# Finder uses dedicated short-lived HTTP clients, but routine status/drive
+# polling must still stand down while a /24 scan is active.  This prevents the
+# browser from competing with discovery for the Ultimate's constrained REST
+# service and also blocks overlapping Finder scans.
+DISCOVERY_ACTIVE = threading.Event()
+DISCOVERY_SCAN_LOCK = threading.Lock()
+
 
 VALID_BROWSER_STARTUP = {"edge_app", "system", "none"}
 
@@ -345,8 +379,16 @@ def _warn_event(key: str, message: str) -> None:
     _warn_throttled(key, message)
 
 
+def _refresh_ouis_background() -> None:
+    # Fail-soft by contract: offline installs use the bundled list forever.
+    effective = refresh_oui_cache(OUI_CACHE_PATH)
+    LINK_DETECTOR.merge_ouis(effective)
+
+
 @asynccontextmanager
 async def _lifespan(_app):
+    threading.Thread(target=_refresh_ouis_background, daemon=True,
+                     name="espressif-oui-refresh").start()
     yield
     _clean_shutdown()          # cancel jukebox timer, stop stream receivers
 
@@ -379,9 +421,14 @@ IMAGE_CACHE_MAX = 8
 
 def init_backends():
     global rest, cmd, devfs, video, audio
-    rest = UltimateREST(CFG["u64_host"], CFG.get("password", ""), coordinator=DEVICE_OP)
-    cmd = CommandSocket(CFG["u64_host"], coordinator=DEVICE_OP)
-    devfs = DeviceFS(CFG["u64_host"], CFG.get("ftp_user", "anonymous"),
+    selected_host = str(CFG.get("u64_host") or "").strip()
+    control_host = _saved_control_host_for_selected(selected_host)
+    rest = UltimateREST(control_host, CFG.get("password", ""), coordinator=DEVICE_OP)
+    control_link = _persisted_address(control_host).get("link_type", LINK_UNKNOWN)
+    timeout_link = LINK_ETHERNET if control_host != selected_host else control_link
+    _configure_rest_timeout(rest, timeout_link)
+    cmd = CommandSocket(selected_host, coordinator=DEVICE_OP)
+    devfs = DeviceFS(selected_host, CFG.get("ftp_user", "anonymous"),
                      CFG.get("ftp_password", ""), coordinator=DEVICE_OP)
     video = VideoReceiver(CFG["video_port"]); video.start()
     audio = AudioReceiver(CFG["audio_port"]); audio.start()
@@ -395,9 +442,279 @@ def err(e: Exception, code: int = 502):
     raise HTTPException(status_code=code, detail=str(e))
 
 
+DEFAULT_REST_TIMEOUT = 8.0
+WIFI_REST_TIMEOUT = 45.0
+
+
+def _known_devices() -> dict:
+    devices = CFG.get("known_devices")
+    if not isinstance(devices, dict):
+        devices = {}
+        CFG["known_devices"] = devices
+    return devices
+
+
+def _known_identity_for_host(host: str) -> tuple[str, dict | None]:
+    host = str(host or "").strip()
+    for identity, record in _known_devices().items():
+        addresses = record.get("addresses") if isinstance(record, dict) else None
+        if isinstance(addresses, dict) and host in addresses:
+            return str(identity), record
+    return "", None
+
+
+def _persisted_address(host: str) -> dict:
+    _identity, record = _known_identity_for_host(host)
+    if not isinstance(record, dict):
+        return {}
+    addresses = record.get("addresses")
+    row = addresses.get(host) if isinstance(addresses, dict) else None
+    return dict(row) if isinstance(row, dict) else {}
+
+
+def _host_was_verified_by_discovery(host: str) -> bool:
+    """Return True only for an address verified in the current process."""
+    identity, _record = _known_identity_for_host(host)
+    return bool(identity and host in DISCOVERY_LIVE_ADDRESSES.get(identity, set()))
+
+
+def _discovery_info_for_host(host: str) -> dict:
+    """Rebuild the /v1/info fields saved by the latest verified Finder hit.
+
+    Finder has already completed a live /v1/info request for this address.
+    Reusing that result during Connect avoids immediately repeating a slow REST
+    call while still requiring manual addresses to be verified normally.
+    """
+    if not _host_was_verified_by_discovery(host):
+        return {}
+    _identity, record = _known_identity_for_host(host)
+    if not isinstance(record, dict):
+        return {}
+    return {
+        "product": str(record.get("product") or "Ultimate"),
+        "firmware_version": str(record.get("firmware") or ""),
+        "core_version": str(record.get("core") or ""),
+        "hostname": str(record.get("hostname") or ""),
+        "unique_id": str(record.get("unique_id") or ""),
+    }
+
+
+def _same_known_device(first_host: str, second_host: str) -> bool:
+    first_identity, _first = _known_identity_for_host(first_host)
+    second_identity, _second = _known_identity_for_host(second_host)
+    return bool(first_identity and first_identity == second_identity)
+
+
+def _verified_control_host_for_selected(selected_host: str) -> str:
+    """Choose the live REST-control address for a selected device interface.
+
+    Ultimate firmware on both the U64 and older C64 Ultimate hardware delays
+    Ethernet REST replies by roughly 2.5 seconds whenever Wi-Fi is enabled.
+    Finder has already verified both addresses and grouped them by firmware
+    identity.  When the user selects Ethernet, keep command socket, FTP and
+    streaming bound to Ethernet but route ordinary REST control through the
+    currently verified Wi-Fi address.  Historical/stale Wi-Fi addresses are
+    never selected automatically.
+    """
+    selected_host = str(selected_host or "").strip()
+    identity, record = _known_identity_for_host(selected_host)
+    if not identity or not isinstance(record, dict):
+        return selected_host
+    addresses = record.get("addresses")
+    if not isinstance(addresses, dict):
+        return selected_host
+    selected = addresses.get(selected_host)
+    if not isinstance(selected, dict) or selected.get("link_type") != LINK_ETHERNET:
+        return selected_host
+    live = DISCOVERY_LIVE_ADDRESSES.get(identity, set())
+    for ip, row in addresses.items():
+        if (ip in live and isinstance(row, dict)
+                and row.get("link_type") == LINK_WIFI):
+            return str(ip)
+    return selected_host
+
+
+def _saved_control_host_for_selected(selected_host: str) -> str:
+    """Return a persisted split-control route only for the same known device."""
+    selected_host = str(selected_host or "").strip()
+    saved = str(CFG.get("rest_control_host") or "").strip()
+    if not selected_host or not saved:
+        return selected_host
+    if saved == selected_host:
+        return selected_host
+    if not _same_known_device(selected_host, saved):
+        return selected_host
+    selected = _persisted_address(selected_host)
+    control = _persisted_address(saved)
+    if (selected.get("link_type") == LINK_ETHERNET
+            and control.get("link_type") == LINK_WIFI):
+        return saved
+    return selected_host
+
+
+def _control_route_payload(selected_host: str, client: UltimateREST | None) -> dict:
+    control_host = str(getattr(client, "host", "") or selected_host or "").strip()
+    row = _persisted_address(control_host)
+    control_link = str(row.get("link_type") or LINK_UNKNOWN)
+    split = bool(control_host and selected_host and control_host != selected_host)
+    return {
+        "control_ip": control_host,
+        "control_link_type": control_link,
+        "rest_via_alternate": split,
+        "rest_route_label": (
+            "REST via Wi-Fi" if split and control_link == LINK_WIFI
+            else "REST via Ethernet" if control_link == LINK_ETHERNET
+            else "REST via selected address"
+        ),
+    }
+
+
+def _configure_rest_timeout(client: UltimateREST | None, link_type: str) -> float:
+    timeout = WIFI_REST_TIMEOUT if link_type == LINK_WIFI else DEFAULT_REST_TIMEOUT
+    if client is not None and hasattr(client, "set_timeout"):
+        client.set_timeout(timeout)
+    return timeout
+
+
+def _link_payload(host: str, *, info_payload: dict | None = None, force: bool = False,
+                  persist: bool = True, client: UltimateREST | None = None) -> dict:
+    """Classify one address and expose only currently verified alternatives.
+
+    ``known_devices`` is historical state. An address becomes eligible for the
+    connected header or Switch-to-Ethernet control only after a successful
+    discovery hit or a live ``/v1/info`` response in this process.
+    """
+    host = str(host or "").strip()
+    if not host:
+        return {"ip": "", "link_type": LINK_UNKNOWN, "label": "Unknown",
+                "addresses": [], "ethernet_ip": "", "wifi_ip": "",
+                "identity": "", "rest_timeout": DEFAULT_REST_TIMEOUT}
+    with LINK_STATE_LOCK:
+        existing_identity, existing_record = _known_identity_for_host(host)
+        previous = _persisted_address(host)
+        observation = LINK_DETECTOR.detect(host, force=force)
+        address = observation.as_dict()
+        if observation.link_type == LINK_UNKNOWN and previous.get("link_type") in {LINK_ETHERNET, LINK_WIFI}:
+            # Classification history may describe a *live* current address when
+            # ARP is temporarily incomplete, but it never establishes liveness.
+            address.update({k: v for k, v in previous.items() if k not in {"last_seen"}})
+            address["ip"] = host
+
+        verified_info = dict(info_payload or {})
+        identity = existing_identity
+        record = existing_record or {}
+        if verified_info:
+            identity, record = merge_known_device(
+                _known_devices(), info=verified_info, address=address)
+            DISCOVERY_LIVE_ADDRESSES.setdefault(identity, set()).add(host)
+        elif not identity:
+            identity, _source = device_identity({}, host)
+            record = {
+                "identity": identity, "identity_source": "ip",
+                "unique_id": "", "hostname": "", "addresses": {},
+            }
+
+        all_addresses = record.get("addresses") if isinstance(record, dict) else {}
+        live_ips = set(DISCOVERY_LIVE_ADDRESSES.get(identity, set()))
+        addresses_map = {
+            ip: row for ip, row in (all_addresses.items() if isinstance(all_addresses, dict) else [])
+            if ip in live_ips and isinstance(row, dict)
+        }
+
+        # Only compare interfaces that were verified in the current process.
+        if force and len(addresses_map) == 2:
+            current_types = [str(row.get("link_type") or LINK_UNKNOWN)
+                             for row in addresses_map.values()]
+            needs_race = (LINK_UNKNOWN in current_types or
+                          (len(current_types) == 2 and current_types[0] == current_types[1]
+                           and current_types[0] in {LINK_ETHERNET, LINK_WIFI}))
+            if needs_race:
+                try:
+                    raced = asyncio.run(classify_address_group(
+                        list(addresses_map), LINK_DETECTOR))
+                    for race_ip, race_obs in raced.items():
+                        previous_row = addresses_map.get(race_ip)
+                        if isinstance(previous_row, dict):
+                            previous_row.update(race_obs.as_dict())
+                except Exception as race_error:
+                    _warn_event("link-latency-race",
+                                f"could not compare Ultimate interfaces: {race_error}")
+
+        addresses = [dict(row) for row in addresses_map.values()]
+        order = {LINK_ETHERNET: 0, LINK_WIFI: 1, LINK_UNKNOWN: 2}
+        addresses.sort(key=lambda row: (
+            order.get(row.get("link_type"), 2), str(row.get("ip", ""))))
+        selected = next((row for row in addresses if row.get("ip") == host), address)
+        link_type = str(selected.get("link_type") or LINK_UNKNOWN)
+        ethernet_ip = next((str(row.get("ip")) for row in addresses
+                            if row.get("link_type") == LINK_ETHERNET), "")
+        wifi_ip = next((str(row.get("ip")) for row in addresses
+                        if row.get("link_type") == LINK_WIFI), "")
+        preferred = preferred_address(addresses)
+        if persist and verified_info:
+            CFG["active_device_identity"] = identity
+            save_config()
+        route = _control_route_payload(host, client)
+        timeout_link = LINK_ETHERNET if route["rest_via_alternate"] else route["control_link_type"]
+        timeout = _configure_rest_timeout(client, timeout_link)
+        return {
+            "identity": identity,
+            "identity_source": record.get("identity_source", "") if isinstance(record, dict) else "",
+            "unique_id": record.get("unique_id", "") if isinstance(record, dict) else "",
+            "hostname": record.get("hostname", "") if isinstance(record, dict) else "",
+            "ip": host,
+            "link_type": link_type,
+            "label": "Ethernet" if link_type == LINK_ETHERNET else "Wi-Fi" if link_type == LINK_WIFI else "Unknown",
+            "method": selected.get("method", "unknown"),
+            "mac": selected.get("mac", ""),
+            "addresses": addresses,
+            "ethernet_ip": ethernet_ip,
+            "wifi_ip": wifi_ip,
+            "preferred_ip": preferred.get("ip") if preferred else host,
+            "rest_timeout": timeout,
+            "streaming_available": link_type != LINK_WIFI,
+            **route,
+        }
+
+
+def _current_link_payload(*, force: bool = False, info_payload: dict | None = None,
+                          persist: bool = False) -> dict:
+    return _link_payload(CFG.get("u64_host", ""), info_payload=info_payload,
+                         force=force, persist=persist, client=rest)
+
+
 def _input_cache_key(client: UltimateREST | None = None) -> str:
     client = client or rest
     return str(getattr(client, "host", "") or CFG.get("u64_host", "")).strip()
+
+
+def _cached_input_status(client: UltimateREST | None = None) -> dict:
+    """Return capability state without issuing an Ultimate REST request."""
+    client = client or rest
+    host = _input_cache_key(client)
+    with INPUT_CAP_LOCK:
+        cached = INPUT_CAPABILITIES.get(host)
+        if cached:
+            return dict(cached)
+    return {
+        "available": None, "pending": True, "mode": "unknown", "status": 0,
+        "label": "Input capability pending", "host": host,
+        "detail": "Capability will be checked after connection or on first use",
+    }
+
+
+def _transfer_input_capability(first_host: str, second_host: str) -> dict:
+    """Carry a cached capability across two addresses of one physical U64."""
+    if not _same_known_device(first_host, second_host):
+        return _cached_input_status()
+    with INPUT_CAP_LOCK:
+        cached = INPUT_CAPABILITIES.get(first_host)
+        if not cached:
+            return _cached_input_status()
+        transferred = dict(cached)
+        transferred["host"] = second_host
+        INPUT_CAPABILITIES[second_host] = dict(transferred)
+        return transferred
 
 
 def _input_status(client: UltimateREST | None = None, force: bool = False) -> dict:
@@ -591,20 +908,152 @@ def interfaces_set(payload: dict = Body(...)):
 
 # --- discovery / connection ---------------------------------------------
 
+def _discovery_candidate_ips() -> list[str]:
+    candidates = []
+    configured = str(CFG.get("u64_host") or "").strip()
+    if configured:
+        candidates.append(configured)
+    for record in _known_devices().values():
+        addresses = record.get("addresses") if isinstance(record, dict) else None
+        if not isinstance(addresses, dict):
+            continue
+        for ip in addresses:
+            value = str(ip or "").strip()
+            if value and value not in candidates:
+                candidates.append(value)
+    return candidates
+
+
+def _record_discovery_diagnostics(result: dict) -> None:
+    for message in result.get("diagnostics") or []:
+        _diag_event("info", str(message))
+
+
+async def _run_discovery(subnet: str = "", port: int = 80) -> dict:
+    if not DISCOVERY_SCAN_LOCK.acquire(blocking=False):
+        raise HTTPException(409, "A device discovery scan is already running")
+    DISCOVERY_ACTIVE.set()
+    try:
+        extra = [subnet] if subnet else None
+        old_host = str(CFG.get("u64_host") or "").strip()
+        active_identity = str(CFG.get("active_device_identity") or "").strip()
+        if not active_identity and old_host:
+            active_identity, _record = _known_identity_for_host(old_host)
+        result = await discovery.discover(
+            extra, port, known_devices=_known_devices(), detector=LINK_DETECTOR,
+            candidate_ips=_discovery_candidate_ips())
+        with LINK_STATE_LOCK:
+            DISCOVERY_LIVE_ADDRESSES.clear()
+            for device in result.get("devices", []):
+                identity = str(device.get("identity") or "").strip()
+                if identity:
+                    DISCOVERY_LIVE_ADDRESSES[identity] = {
+                        str(row.get("ip") or "").strip()
+                        for row in device.get("addresses", [])
+                        if str(row.get("ip") or "").strip()
+                    }
+        _record_discovery_diagnostics(result)
+
+        # If DHCP moved the currently selected device, retain the identity but
+        # update the saved host to a verified address. The live backend is not
+        # switched silently; the scanner's Use button remains the explicit action.
+        if active_identity:
+            device = next((row for row in result.get("devices", [])
+                           if row.get("identity") == active_identity), None)
+            if device:
+                live_ips = {str(row.get("ip") or "") for row in device.get("addresses", [])}
+                preferred = str(device.get("preferred_ip") or "").strip()
+                if preferred and old_host not in live_ips and preferred != old_host:
+                    CFG["u64_host"] = preferred
+                    _diag_event("info", f"Preferred address updated: {old_host or '(none)'} → {preferred}")
+        save_config()
+        return result
+    finally:
+        DISCOVERY_ACTIVE.clear()
+        DISCOVERY_SCAN_LOCK.release()
+
+
 @app.get("/api/discover")
 async def api_discover(subnet: str = Query(""), port: int = Query(80)):
-    """Sweep local /24 subnet(s) for Ultimate devices (same method as
-    Ultimate64 Manager: TCP:80 scan + /v1/info verification)."""
-    extra = [subnet] if subnet else None
+    """Sweep local /24 subnet(s) and return only verified Ultimate devices."""
     try:
-        return await discovery.discover(extra, port)
+        return await _run_discovery(subnet, port)
+    except HTTPException:
+        raise
     except Exception as e:
         err(e, 500)
 
 
+def _disconnect_discovery_session() -> None:
+    """Drop the active device clients without disturbing local receivers."""
+    global rest, cmd, devfs
+    # Backend replacement is a device operation too. Without this lifecycle
+    # gate, browser /api/info polling can enter the old client while Clear or
+    # Connect closes it, producing httpx's "client has been closed" runtime
+    # failure and leaving the UI offline.
+    with DEVICE_OP.operation("interactive", "disconnecting Ultimate session"):
+        old_rest, old_cmd = rest, cmd
+        try:
+            if old_rest:
+                _matrix_release_all(client=old_rest, silent=True, cached_only=True)
+        except Exception:
+            pass
+        if old_rest and "STREAM_STATE" in globals():
+            for stream_name in ("video", "audio"):
+                if STREAM_STATE.get(stream_name):
+                    try:
+                        old_rest.stream_stop(stream_name)
+                    except Exception:
+                        pass
+                    STREAM_STATE[stream_name] = False
+        for resource in (old_cmd, old_rest):
+            try:
+                if resource:
+                    resource.close()
+            except Exception:
+                pass
+        rest = UltimateREST("", CFG.get("password", ""), coordinator=DEVICE_OP)
+        cmd = CommandSocket("", coordinator=DEVICE_OP)
+        devfs = DeviceFS("", CFG.get("ftp_user", "anonymous"),
+                         CFG.get("ftp_password", ""), coordinator=DEVICE_OP)
+        with INPUT_CAP_LOCK:
+            INPUT_CAPABILITIES.clear()
+        _READMEM_SUPPORT.clear()
+        LINK_DETECTOR.clear()
+        with LINK_STATE_LOCK:
+            DISCOVERY_LIVE_ADDRESSES.clear()
+
+
+def _clear_discovery_state() -> None:
+    """Clear saved discovery identity and replace clients as one operation."""
+    with DEVICE_OP.operation("interactive", "clearing discovery history"):
+        CFG["known_devices"] = {}
+        CFG["active_device_identity"] = ""
+        CFG["u64_host"] = ""
+        CFG["rest_control_host"] = ""
+        CFG.pop("input_method_preferences", None)
+        _disconnect_discovery_session()
+        save_config()
+
+
+@app.post("/api/discover/clear")
+async def api_discover_clear(subnet: str = Query(""), port: int = Query(80)):
+    """Clear remembered hosts, disconnect, then perform a genuinely fresh scan."""
+    await run_in_threadpool(_clear_discovery_state)
+    _diag_event("info", "Discovery history cleared — starting fresh scan")
+    try:
+        result = await _run_discovery(subnet, port)
+    except HTTPException:
+        raise
+    except Exception as e:
+        err(e, 500)
+    result["cleared"] = True
+    return result
+
+
 @app.post("/api/connect")
 def api_connect(payload: dict = Body(...)):
-    """Switch the active device at runtime (used after discovery)."""
+    """Switch device and use a verified Wi-Fi REST control path when useful."""
     host = (payload.get("host") or "").strip()
     if not host:
         raise HTTPException(400, "host required")
@@ -612,39 +1061,103 @@ def api_connect(payload: dict = Body(...)):
         raise HTTPException(409, "stop the storage index before switching devices")
     global rest, cmd, devfs
     password = payload.get("password", CFG.get("password", ""))
+    control_host = _verified_control_host_for_selected(host)
+    if control_host == host:
+        control_host = _saved_control_host_for_selected(host)
     try:
-        new_rest = UltimateREST(host, password, coordinator=DEVICE_OP)
+        new_rest = UltimateREST(control_host, password, coordinator=DEVICE_OP)
         new_cmd = CommandSocket(host, coordinator=DEVICE_OP)
         new_devfs = DeviceFS(host, CFG.get("ftp_user", "anonymous"),
                              CFG.get("ftp_password", ""), coordinator=DEVICE_OP)
     except Exception as e:
         return {"connected": False, "host": host, "error": str(e)}
-    # Verify before replacing a known-good connection. A typo should not
-    # strand the UI on a dead host or overwrite the saved configuration.
-    try:
-        device_info = new_rest.info()
-    except Exception as e:
-        new_rest.close()
-        new_cmd.close()
-        return {"connected": False, "host": host, "error": str(e)}
-    old_rest, old_cmd = rest, cmd
-    # Release any held CIA1 keys on the old target before changing device.
-    if old_rest:
-        _matrix_release_all(client=old_rest, silent=True, cached_only=True)
-    rest, cmd, devfs = new_rest, new_cmd, new_devfs
-    input_status = _input_status(new_rest, force=True)
-    CFG["u64_host"] = host
-    CFG["password"] = password
-    save_config()
-    try:
-        if old_cmd:
-            old_cmd.close()
-        if old_rest:
-            old_rest.close()
-    except Exception:
-        pass
-    return {"connected": True, "host": host, "info": device_info,
-            "input": input_status}
+
+    # Finder has already verified both addresses of the grouped device. Reuse
+    # either live result; manual addresses retain the original verification.
+    device_info = (_discovery_info_for_host(host)
+                   or _discovery_info_for_host(control_host))
+    reused_discovery = bool(device_info)
+    if not device_info:
+        try:
+            device_info = new_rest.info()
+        except Exception as first_error:
+            # A persisted Wi-Fi control address may have changed under DHCP.
+            # Fall back to the explicitly selected address rather than leaving
+            # Connect offline behind a stale alternate route.
+            if control_host != host:
+                try:
+                    new_rest.close()
+                    control_host = host
+                    new_rest = UltimateREST(host, password, coordinator=DEVICE_OP)
+                    device_info = new_rest.info()
+                except Exception as fallback_error:
+                    new_rest.close()
+                    new_cmd.close()
+                    return {"connected": False, "host": host,
+                            "error": str(fallback_error),
+                            "alternate_error": str(first_error)}
+            else:
+                new_rest.close()
+                new_cmd.close()
+                return {"connected": False, "host": host, "error": str(first_error)}
+
+    with DEVICE_OP.operation("interactive", "switching Ultimate device"):
+        old_rest, old_cmd, old_devfs = rest, cmd, devfs
+        old_selected_host = str(CFG.get("u64_host", "") or "").strip()
+        old_control_host = str(getattr(old_rest, "host", "") or old_selected_host).strip()
+        same_device = _same_known_device(old_selected_host, host)
+        host_changed = bool(old_selected_host and old_selected_host != host)
+
+        if host_changed and old_rest and "STREAM_STATE" in globals():
+            for stream_name in ("video", "audio"):
+                if STREAM_STATE.get(stream_name):
+                    try:
+                        # Split-control streams are driven through the selected
+                        # Ethernet command socket, not the alternate REST host.
+                        old_cmd.stream_off({"video": 0, "audio": 1}[stream_name])
+                    except Exception:
+                        try:
+                            old_rest.stream_stop(stream_name)
+                        except Exception:
+                            pass
+                    STREAM_STATE[stream_name] = False
+
+        if host_changed and old_rest and not same_device:
+            _matrix_release_all(client=old_rest, silent=True, cached_only=True)
+
+        rest, cmd, devfs = new_rest, new_cmd, new_devfs
+        if host_changed or old_control_host != control_host:
+            _reset_readmem_support(control_host)
+        input_status = (_transfer_input_capability(old_control_host, control_host)
+                        if same_device else _cached_input_status(new_rest))
+        CFG["u64_host"] = host
+        CFG["rest_control_host"] = control_host
+        CFG["password"] = password
+        link_status = _link_payload(host, info_payload=device_info, force=False,
+                                    persist=True, client=new_rest)
+        save_config()
+        if control_host != host:
+            _diag_event(
+                "info",
+                f"Dual-interface route active: selected Ethernet {host}; "
+                f"REST control via verified Wi-Fi {control_host}; "
+                "streams and command socket remain on Ethernet",
+            )
+        try:
+            if old_cmd and old_cmd is not new_cmd:
+                old_cmd.close()
+            if old_rest and old_rest is not new_rest:
+                old_rest.close()
+            if old_devfs and old_devfs is not new_devfs and hasattr(old_devfs, "close"):
+                old_devfs.close()
+        except Exception:
+            pass
+    return {
+        "connected": True, "host": host, "control_host": control_host,
+        "rest_via_alternate": control_host != host,
+        "info": device_info, "input": input_status, "link": link_status,
+        "reused_discovery": reused_discovery,
+    }
 
 
 # --- basic / machine ----------------------------------------------------
@@ -781,19 +1294,66 @@ def boot_options_set(payload: dict = Body(...)):
 def info():
     if not CFG.get("u64_host"):
         raise HTTPException(503, "No device configured — use Select Ultimate…")
+    if DISCOVERY_ACTIVE.is_set():
+        return {
+            "u64deck_discovery_busy": True,
+            "u64deck_busy_label": "DISCOVERY — scanning network…",
+            "u64deck_retry_ms": 1000,
+        }
+    # Mount & Run can keep the Ultimate's small HTTP service occupied for a
+    # long genuine-drive load.  Report that known local operation immediately
+    # instead of queueing a status request behind it until the browser's
+    # 15-second timeout makes a healthy, busy machine look offline.
+    busy = _mount_run_busy_payload()
+    if busy:
+        return busy
+    snapshot = DEVICE_OP.snapshot()
+    if (getattr(snapshot, "active_priority", None) == "interactive" or
+            getattr(snapshot, "waiting_interactive", 0)):
+        return {
+            "u64deck_operation_busy": True,
+            "u64deck_busy_label": getattr(snapshot, "active_reason", "") or "Ultimate operation in progress",
+            "u64deck_retry_ms": 1000,
+        }
     try:
         # Status polling sits behind user actions but ahead of background work.
         with DEVICE_OP.operation("status", "checking Ultimate status"):
-            return rest.info()
-    except (UltimateError, httpx.HTTPError) as e:
+            active_rest = rest
+            active_host = str(CFG.get("u64_host", "") or "").strip()
+            payload = active_rest.info()
+            if isinstance(payload, dict):
+                payload = dict(payload)
+                known_identity, _known_record = _known_identity_for_host(active_host)
+                payload["u64deck_link"] = _link_payload(
+                    active_host, info_payload=payload,
+                    persist=not bool(known_identity), client=active_rest)
+                payload["u64deck_input"] = _cached_input_status(active_rest)
+        return payload
+    except (UltimateError, httpx.HTTPError, RuntimeError) as e:
         err(e)
+
+
+@app.get("/api/link/status")
+def link_status(refresh: bool = Query(False)):
+    if not CFG.get("u64_host"):
+        return _current_link_payload(force=bool(refresh))
+    try:
+        return _current_link_payload(force=bool(refresh))
+    except Exception as exc:
+        _warn_event("link-status", f"could not classify active interface: {exc}")
+        return {"ip": CFG.get("u64_host", ""), "link_type": LINK_UNKNOWN,
+                "label": "Unknown", "addresses": [], "ethernet_ip": "",
+                "wifi_ip": "", "streaming_available": True,
+                "rest_timeout": DEFAULT_REST_TIMEOUT}
 
 
 @app.get("/api/input/status")
 def input_status(refresh: bool = Query(False)):
     if not CFG.get("u64_host"):
-        return _input_status()
-    return _input_status(force=bool(refresh))
+        return _cached_input_status()
+    if refresh:
+        return _input_status(force=True)
+    return _cached_input_status()
 
 
 @app.post("/api/input/events")
@@ -831,8 +1391,11 @@ def machine(action: str):
         # operation so indexing cannot resume during the cartridge-menu wait.
         with DEVICE_OP.operation("interactive", f"machine {action}"):
             if action in {"reset", "reboot"}:
+                _juke_disarm_machine_takeover(f"machine {action}")
                 _matrix_release_all(silent=True)
             result = rest.put(f"/v1/machine:{action}")
+            if action == "reboot":
+                _sid_runner_clear_reboot_required(rest)
             pressed = None
             if action == "reset":
                 pressed = _send_boot_prekey()
@@ -909,6 +1472,32 @@ def _remember_mount(drive: str, mode: str, *, path: str = "", name: str = "") ->
     MOUNT_STATE[drive] = {"mode": _mount_mode(mode), "path": path, "name": name,
                           "mounted_at": time.time()}
 
+
+def _mount_state_snapshot() -> dict[str, dict]:
+    """Return a detached copy of u64deck's last confirmed mount state."""
+    return {drive: dict(MOUNT_STATE.get(drive) or {}) for drive in ("a", "b")}
+
+
+def _mount_run_busy_payload() -> dict | None:
+    """Describe an active Mount & Run without touching the occupied device.
+
+    The mount endpoint records a drive only after the Ultimate confirms the
+    mount.  Exposing that local state lets the browser update Mounted Drives
+    immediately while the synchronous endpoint continues through reset, LOAD
+    and RUN.  No speculative mount is shown before the device accepts it.
+    """
+    snapshot = DEVICE_OP.snapshot()
+    if (snapshot.active_priority == "interactive" and
+            snapshot.active_reason == "mounting and booting disk"):
+        return {
+            "u64deck_busy": True,
+            "u64deck_busy_reason": "mount_run",
+            "u64deck_busy_label": "BUSY — loading program…",
+            "u64deck_retry_ms": 2000,
+            "u64deck_mounts": _mount_state_snapshot(),
+        }
+    return None
+
 @app.get("/api/mount/options")
 def mount_options():
     return {"default_mode": _mount_mode(CFG.get("default_mount_mode")),
@@ -922,21 +1511,84 @@ def mount_options_set(payload: dict = Body(...)):
     save_config()
     return mount_options()
 
+def _drive_status_unavailable_payload(exc: Exception) -> dict:
+    """Return a controlled transient response for a backend lifecycle handover."""
+    message = "Drive status temporarily unavailable while the device connection changes — retrying…"
+    _diag_event("warning", message, error=str(exc))
+    return {
+        "u64deck_drives_unavailable": True,
+        "u64deck_drives_message": message,
+        "u64deck_retry_ms": 1000,
+        "u64deck_mounts": _mount_state_snapshot(),
+    }
+
+
+def _decorate_drive_status(out: object) -> object:
+    """Attach local mount/swap state to one device-reported drive payload."""
+    decision = _reconcile_swap_from_drives(out)
+    for row in out.get("drives", []) if isinstance(out, dict) else []:
+        if not isinstance(row, dict):
+            continue
+        for key in ("a", "b"):
+            if isinstance(row.get(key), dict):
+                row[key]["u64deck_mount"] = dict(MOUNT_STATE.get(key) or {})
+    if isinstance(out, dict):
+        out["swap_reconstructed"] = bool(decision and decision.get("source") == "reconstructed")
+        out["swap_decision"] = dict(decision or SWAP.get("decision") or {})
+    return out
+
+
 @app.get("/api/drives")
 def drives():
-    try:
-        out = rest.get_json("/v1/drives")
-        decision = _reconcile_swap_from_drives(out)
-        for row in out.get("drives", []) if isinstance(out, dict) else []:
-            for key in ("a", "b"):
-                if isinstance(row.get(key), dict):
-                    row[key]["u64deck_mount"] = dict(MOUNT_STATE.get(key) or {})
-        if isinstance(out, dict):
-            out["swap_reconstructed"] = bool(decision and decision.get("source") == "reconstructed")
-            out["swap_decision"] = dict(decision or SWAP.get("decision") or {})
-        return out
-    except (UltimateError, httpx.HTTPError) as e:
-        err(e)
+    if DISCOVERY_ACTIVE.is_set():
+        return {
+            "u64deck_discovery_busy": True,
+            "u64deck_drives_unavailable": True,
+            "u64deck_drives_message": "Drive status paused while device discovery is running.",
+            "u64deck_mounts": copy.deepcopy(MOUNT_STATE),
+            "u64deck_retry_ms": 1000,
+        }
+    busy = _mount_run_busy_payload()
+    if busy:
+        return busy
+    snapshot = DEVICE_OP.snapshot()
+    if (getattr(snapshot, "active_priority", None) == "interactive" or
+            getattr(snapshot, "waiting_interactive", 0)):
+        return {
+            "u64deck_operation_busy": True,
+            "u64deck_drives_unavailable": True,
+            "u64deck_drives_message": getattr(snapshot, "active_reason", "") or "Ultimate operation in progress",
+            "u64deck_mounts": copy.deepcopy(MOUNT_STATE),
+            "u64deck_retry_ms": 1000,
+        }
+
+    # Capture the active REST backend only after the status operation owns the
+    # device coordinator. Connect/Clear use the same coordinator before they
+    # replace and close a backend, so a cold-start drive poll can no longer
+    # retain the old client while waiting behind the switch operation.
+    active_rest = None
+    for attempt in range(2):
+        try:
+            with DEVICE_OP.operation("status", "checking mounted drives"):
+                active_rest = rest
+                if active_rest is None:
+                    raise RuntimeError("Ultimate REST client is unavailable")
+                out = active_rest.get_json("/v1/drives")
+            return _decorate_drive_status(out)
+        except RuntimeError as exc:
+            replacement = rest
+            if attempt == 0 and replacement is not None and replacement is not active_rest:
+                _diag_event(
+                    "warning",
+                    "Mounted Drives backend changed during refresh — retrying current connection",
+                    error=str(exc),
+                )
+                continue
+            if "closed" in str(exc).casefold() or "unavailable" in str(exc).casefold():
+                return _drive_status_unavailable_payload(exc)
+            err(exc)
+        except (UltimateError, httpx.HTTPError) as exc:
+            err(exc)
 
 
 @app.put("/api/drives/{drive}/{action}")
@@ -1123,7 +1775,10 @@ def image_run(token: str, index: int = Query(...), mode: str = Query("dma")):
         raise HTTPException(400, "file is empty")
     try:
         if mode == "load":
-            return rest.post_file("/v1/runners:load_prg", f.name + ".prg", data)
+            return _run_direct_takeover(
+                lambda: rest.post_file("/v1/runners:load_prg", f.name + ".prg", data),
+                "loading PRG",
+            )
         return _run_cart_safe(lambda: rest.run_prg(f.name + ".prg", data))
     except (UltimateError, httpx.HTTPError) as e:
         err(e)
@@ -1157,6 +1812,7 @@ def image_mount_load(token: str, index: int = Query(...), drive: str = Query("a"
         err(e, 404)
     try:
         with DEVICE_OP.operation("interactive", "mounting and loading disk file"):
+            _juke_disarm_machine_takeover("Mount & Load")
             _matrix_release_all(silent=True)
             if device_path:
                 rest.mount_path(drive, device_path, mode=mode)
@@ -1234,6 +1890,98 @@ def _boot_settle():
         time.sleep(wait)
 
 
+# ---------------------------------------------------------------------------
+# BASIC readiness gate for Mount & Run.
+#
+# The KERNAL only consumes injected keyboard-buffer data when the screen
+# editor is at its input loop. Typing during a reset/cartridge boot can lose
+# the start of LOAD; typing RUN during a serial load can lose RUN entirely.
+# Zero-page $CC is the KERNAL cursor-blink enable flag: 0 means the editor is
+# accepting input. The gate debounces that state before either command.
+
+_BASIC_GATE_POLL = 0.5
+_BASIC_GATE_TIMEOUT = 120.0
+_READMEM_SUPPORT: dict[str, bool] = {}
+
+
+def _readmem_cache_key() -> str:
+    return str(getattr(rest, "host", "") or CFG.get("u64_host", "")).strip()
+
+
+def _reset_readmem_support(host: str | None = None) -> None:
+    """Forget a cached readmem result after a reconnect or firmware change."""
+    key = str(host or _readmem_cache_key()).strip()
+    if key:
+        _READMEM_SUPPORT.pop(key, None)
+
+
+def _read_basic_ready_flag() -> int | None:
+    """Return $CC (0 = editor input loop), or ``None`` if unsupported."""
+    key = _readmem_cache_key()
+    if key and _READMEM_SUPPORT.get(key) is False:
+        return None
+    try:
+        data = rest.read_memory("00CC", 1)
+    except Exception:
+        return -1  # transient failure: keep polling until timeout
+    if data is None:
+        if not key or key not in _READMEM_SUPPORT:
+            _diag_event(
+                "info",
+                "machine:readmem not available on this firmware — "
+                "Mount & Run uses fixed delays",
+            )
+        if key:
+            _READMEM_SUPPORT[key] = False
+        return None
+    if key:
+        _READMEM_SUPPORT[key] = True
+    return data[0] if data else -1
+
+
+def _basic_ready_gate(stage: str, *, timeout: float = _BASIC_GATE_TIMEOUT,
+                      poll: float = _BASIC_GATE_POLL, grace: float = 0.0,
+                      reader=None, sleeper=time.sleep,
+                      clock=time.monotonic) -> str:
+    """Wait until two consecutive reads show the BASIC editor is ready.
+
+    Returns ``ready``, ``timeout`` or ``unsupported``. Every completion is
+    recorded in Diagnostics so hardware behaviour can be verified without
+    changing the timings speculatively.
+    """
+    reader = reader or _read_basic_ready_flag
+    started = clock()
+    last_value: int | None = None
+
+    def finish(result: str) -> str:
+        elapsed = max(0.0, clock() - started)
+        shown = "unsupported" if last_value is None else str(last_value)
+        _diag_event(
+            "info",
+            f"Mount & Run gate '{stage}': {result} after {elapsed:.1f}s "
+            f"(last $CC read: {shown})",
+        )
+        return result
+
+    if grace > 0:
+        sleeper(grace)
+    deadline = started + max(1.0, float(timeout))
+    consecutive = 0
+    while True:
+        last_value = reader()
+        if last_value is None:
+            return finish("unsupported")
+        if last_value == 0:
+            consecutive += 1
+            if consecutive >= 2:
+                return finish("ready")
+        else:
+            consecutive = 0
+        if clock() >= deadline:
+            return finish("timeout")
+        sleeper(max(0.0, float(poll)))
+
+
 def _bus_id_for(drive: str) -> int:
     try:
         for d in rest.get_json("/v1/drives").get("drives", []):
@@ -1244,12 +1992,55 @@ def _bus_id_for(drive: str) -> int:
     return 8
 
 
+_RUN_MATRIX_EVENTS = [
+    {"kind": "keyboard", "inputs": ["r"], "transition": "tap"},
+    {"kind": "keyboard", "inputs": ["u"], "transition": "tap"},
+    {"kind": "keyboard", "inputs": ["n"], "transition": "tap"},
+    {"kind": "keyboard", "inputs": ["return"], "transition": "tap"},
+]
+
+
+def _dispatch_run_after_gate() -> tuple[bool, str]:
+    """Deliver RUN after the load gate using the best proven transport.
+
+    LOAD deliberately remains on the established command-buffer path. On a
+    CIA1-capable U64, the post-load RUN line uses matrix key taps because bench
+    testing showed that a fresh buffer write can be acknowledged without being
+    consumed after a genuine drive load. Legacy/C64U sessions keep the existing
+    command-buffer delivery. A failed matrix request is not followed by a
+    second transport, avoiding a late duplicate RUN after an ambiguous timeout.
+    """
+    status = _input_status(rest)
+    if status.get("available"):
+        try:
+            _matrix_send(list(_RUN_MATRIX_EVENTS), client=rest)
+        except Exception as exc:
+            note = f"CIA1 matrix RUN delivery failed — RUN not resent ({exc})"
+            _warn_event("mount-run-delivery", f"Mount & Run: {note}")
+            _diag_event("warning", "Mount & Run RUN delivery: CIA1 matrix failed")
+            return False, note
+        _diag_event("info", "Mount & Run RUN delivery: CIA1 matrix")
+        return True, "CIA1 matrix"
+
+    cmd.type_petscii(b"RUN\r")
+    _diag_event("info", "Mount & Run RUN delivery: Legacy KERNAL buffer")
+    return True, "Legacy KERNAL buffer"
+
+
 def _mount_and_boot(drive: str, mode: str, *, device_path: str = None,
                     name: str = None, data: bytes = None):
-    """Mount an image and autostart it: reset, LOAD"*",{bus},1 + RUN."""
+    """Mount an image and autostart it: reset, LOAD"*",{bus},1 + RUN.
+
+    LOAD uses the established keyboard-buffer path. On firmware with
+    machine:readmem, readiness gates protect both stages and CIA1-capable U64s
+    deliver the final RUN line through matrix key taps. Legacy devices keep the
+    buffer path; a readmem 404 retains the established fixed-delay behaviour.
+    """
     drive, mode = _drive_key(drive), _mount_mode(mode)
     with DEVICE_OP.operation("interactive", "mounting and booting disk"):
+        _juke_disarm_machine_takeover("Mount & Run")
         _matrix_release_all(silent=True)
+        _sid_runner_reboot_before_mount_run()
         if device_path:
             rest.mount_path(drive, device_path, mode=mode)
         else:
@@ -1258,10 +2049,36 @@ def _mount_and_boot(drive: str, mode: str, *, device_path: str = None,
         rest.put("/v1/machine:reset")
         _boot_settle()
         bus_id = _bus_id_for(drive)
-        cmd.type_petscii(f'LOAD"*",{bus_id},1\r'.encode())
-        time.sleep(0.4)
-        cmd.type_petscii(b"RUN\r")
-        return {"errors": [], "typed": f'LOAD"*",{bus_id},1 + RUN'}
+        load_line = f'LOAD"*",{bus_id},1'
+
+        boot_gate = _basic_ready_gate("boot")
+        if boot_gate == "timeout":
+            note = "machine not ready — LOAD not typed"
+            _warn_event("mount-boot-gate", f"Mount & Run: {note}")
+            return {"errors": [], "typed": "", "note": note}
+
+        cmd.type_petscii((load_line + "\r").encode())
+
+        if boot_gate == "unsupported":
+            time.sleep(0.4)
+            cmd.type_petscii(b"RUN\r")
+            return {"errors": [], "typed": f"{load_line} + RUN"}
+
+        load_gate = _basic_ready_gate("load", grace=1.0)
+        if load_gate == "ready":
+            delivered, delivery = _dispatch_run_after_gate()
+            if delivered:
+                return {"errors": [], "typed": f"{load_line} + RUN"}
+            return {"errors": [], "typed": load_line,
+                    "note": delivery}
+        if load_gate == "unsupported":
+            time.sleep(0.4)
+            cmd.type_petscii(b"RUN\r")
+            return {"errors": [], "typed": f"{load_line} + RUN"}
+
+        note = "load still running — RUN not sent"
+        _warn_event("mount-load-gate", f"Mount & Run: {note}")
+        return {"errors": [], "typed": load_line, "note": note}
 
 
 @app.put("/api/mount/run/device")
@@ -1303,23 +2120,69 @@ def _cart_configured() -> str:
         return ""
 
 
-def _run_cart_safe(fn):
-    """Run a DMA action with any freezer cartridge parked."""
+def _run_cart_safe(fn, *, preserve_jukebox: bool = False,
+                   timings: dict | None = None):
+    """Run a DMA action with any freezer cartridge parked.
+
+    ``timings`` is an optional caller-owned dictionary used by the SID
+    Jukebox diagnostics.  Normal runner callers remain unchanged, while the
+    Jukebox can distinguish device upload time from cartridge lookup, park and
+    restore time when hardware reports a visible delay.
+    """
+    started = time.monotonic()
     with DEVICE_OP.operation("interactive", "running software"):
+        acquired = time.monotonic()
+        if timings is not None:
+            timings["cart_safe_wait_ms"] = round((acquired - started) * 1000.0, 1)
+        if not preserve_jukebox:
+            _juke_disarm_machine_takeover("runner action")
+        stage = time.monotonic()
         cart = _cart_configured() if CFG.get("cart_safe_run", True) else ""
+        if timings is not None:
+            timings["cart_lookup_ms"] = round((time.monotonic() - stage) * 1000.0, 1)
+            timings["cartridge_configured"] = bool(cart)
         if cart:
+            stage = time.monotonic()
             try:
                 rest.put(f"/v1/configs/{_CART_CAT}/{_CART_ITEM}", value="")
             except Exception:
                 cart = ""
+            finally:
+                if timings is not None:
+                    timings["cart_park_ms"] = round(
+                        (time.monotonic() - stage) * 1000.0, 1
+                    )
+                    timings["cartridge_parked"] = bool(cart)
         try:
+            stage = time.monotonic()
             return fn()
         finally:
+            if timings is not None:
+                timings["runner_action_ms"] = round(
+                    (time.monotonic() - stage) * 1000.0, 1
+                )
             if cart:
+                stage = time.monotonic()
                 try:
                     rest.put(f"/v1/configs/{_CART_CAT}/{_CART_ITEM}", value=cart)
                 except Exception:
                     pass
+                finally:
+                    if timings is not None:
+                        timings["cart_restore_ms"] = round(
+                            (time.monotonic() - stage) * 1000.0, 1
+                        )
+            if timings is not None:
+                timings["cart_safe_total_ms"] = round(
+                    (time.monotonic() - started) * 1000.0, 1
+                )
+
+
+def _run_direct_takeover(fn, reason: str = "runner action"):
+    """Run a non-cartridge-safe machine action after disarming SID timers."""
+    with DEVICE_OP.operation("interactive", reason):
+        _juke_disarm_machine_takeover(reason)
+        return fn()
 
 
 def _t64_first_prg(data: bytes):
@@ -1402,18 +2265,100 @@ def _sid_ssl_payload(data: bytes) -> bytes | None:
     return bytes(payload) if any(payload) else None
 
 
+def _sid_runner_device_key(client=None) -> str:
+    active = client or rest
+    return str(getattr(active, "host", "") or "").strip().casefold()
+
+
+def _sid_runner_mark_reboot_required(client=None) -> None:
+    key = _sid_runner_device_key(client)
+    if not key:
+        return
+    with JUKE_TIMER_LOCK:
+        SID_RUNNER_REBOOT_REQUIRED.add(key)
+
+
+def _sid_runner_reboot_required(client=None) -> bool:
+    key = _sid_runner_device_key(client)
+    if not key:
+        return False
+    with JUKE_TIMER_LOCK:
+        return key in SID_RUNNER_REBOOT_REQUIRED
+
+
+def _sid_runner_clear_reboot_required(client=None) -> None:
+    key = _sid_runner_device_key(client)
+    if not key:
+        return
+    with JUKE_TIMER_LOCK:
+        SID_RUNNER_REBOOT_REQUIRED.discard(key)
+
+
+def _wait_for_ultimate_after_reboot(client, *, timeout: float = 12.0,
+                                    poll: float = 0.4, sleeper=time.sleep,
+                                    clock=time.monotonic) -> dict:
+    """Wait for the Ultimate REST service after a full machine reboot."""
+    deadline = clock() + max(1.0, float(timeout))
+    last_error = None
+    while True:
+        try:
+            probe = getattr(client, "probe_info", None)
+            if callable(probe):
+                return probe(request_timeout=min(1.5, max(0.2, float(poll) * 3)))
+            return client.info()
+        except Exception as exc:
+            last_error = exc
+        if clock() >= deadline:
+            raise UltimateError(
+                f"Ultimate did not return after SID-player recovery reboot: {last_error}"
+            ) from last_error
+        sleeper(max(0.05, float(poll)))
+
+
+def _sid_runner_reboot_before_mount_run() -> bool:
+    """Clear native SID-runner state before the next disk autostart.
+
+    A normal ``machine:reset`` is sufficient for ordinary Mount & Run actions,
+    but hardware testing showed that the native SID player can leave the C64 in
+    a residual state where LOAD/RUN are accepted yet do not start the mounted
+    program.  One full machine reboot restores the normal boot path.  The
+    reboot is conditional and per device, so ordinary Mount & Run remains fast.
+    """
+    active_rest = rest
+    if not _sid_runner_reboot_required(active_rest):
+        return False
+    _diag_event(
+        "info",
+        "Mount & Run: rebooting Ultimate to clear previous SID-player state",
+    )
+    active_rest.put("/v1/machine:reboot", request_timeout=4.0)
+    if cmd:
+        cmd.close()
+    time.sleep(max(2.5, float(CFG.get("boot_wait", 2.8))))
+    _wait_for_ultimate_after_reboot(active_rest)
+    _sid_runner_clear_reboot_required(active_rest)
+    _diag_event(
+        "info",
+        "Mount & Run: Ultimate reboot completed — continuing with mount",
+    )
+    return True
+
+
 def _post_sid_upload(filename: str, data: bytes, songnr: int | None = None):
-    """Upload a SID with its compact per-file song-length array when known."""
+    """Upload a SID and remember that a later disk launch may need reboot."""
     params = {"songnr": int(songnr)} if songnr else {}
     ssl_payload = _sid_ssl_payload(data)
     ssl_name = Path(filename).with_suffix(".ssl").name
-    return rest.post_sid(
+    active_rest = rest
+    result = active_rest.post_sid(
         filename,
         data,
         songlengths=ssl_payload,
         songlengths_filename=ssl_name,
         **params,
     )
+    _sid_runner_mark_reboot_required(active_rest)
+    return result
 
 
 @app.put("/api/run/device")
@@ -1425,7 +2370,10 @@ def run_device(path: str = Query(...)):
                 lambda: rest.run_prg(name + ".prg", prg))
         runner = _runner_for(path)
         if runner == "run_crt":
-            return rest.put(f"/v1/runners:{runner}", file=path)
+            return _run_direct_takeover(
+                lambda: rest.put(f"/v1/runners:{runner}", file=path),
+                "running cartridge",
+            )
         return _run_cart_safe(lambda: rest.put(f"/v1/runners:{runner}", file=path))
     except ValueError as e:
         err(e, 400)
@@ -1444,7 +2392,10 @@ async def run_upload(file: UploadFile = File(...)):
         runner = _runner_for(name)
         if runner == "run_crt":
             return await run_in_threadpool(
-                rest.post_file, f"/v1/runners:{runner}", name, data)
+                _run_direct_takeover,
+                lambda: rest.post_file(f"/v1/runners:{runner}", name, data),
+                "running cartridge",
+            )
         if runner == "sidplay":
             return await run_in_threadpool(
                 _run_cart_safe, lambda: _post_sid_upload(name, data))
@@ -1485,6 +2436,9 @@ STREAM_LAST = {}    # per-stream record of the last start/stop attempt
 
 
 def _stream_ctl(name: str, on: bool):
+    if on and _current_link_payload().get("link_type") == LINK_WIFI:
+        raise UltimateError(
+            "Streaming is not available over the Ultimate Wi-Fi interface; connect using Ethernet")
     if not on:
         _matrix_release_all(silent=True)
     stream_id = {"video": 0, "audio": 1}[name]
@@ -1502,26 +2456,54 @@ def _stream_ctl(name: str, on: bool):
            "via": "rest", "rest_error": None, "socket_error": None,
            "ts": time.strftime("%H:%M:%S")}
     STREAM_LAST[name] = rec
-    try:
-        if on:
-            rest.stream_start(name, dest)
-        else:
-            rest.stream_stop(name)
-        rec["ok"] = True
-    except (UltimateError, httpx.HTTPError) as e:
-        rec["rest_error"] = str(e)
+    split_control = bool(getattr(rest, "host", "") and
+                         getattr(rest, "host", "") != CFG.get("u64_host", ""))
+    if split_control:
+        # The selected interface is Ethernet but ordinary REST control is using
+        # the paired Wi-Fi address. Start/stop streams over port 64 first so the
+        # stream remains bound to the selected wired path and avoids the slow
+        # Ethernet REST listener entirely.
         rec["via"] = "socket"
-        # older firmware: fall back to the TCP command socket
         try:
             if on:
                 cmd.stream_on(stream_id, dest)
             else:
                 cmd.stream_off(stream_id)
             rec["ok"] = True
-        except Exception as e2:
-            rec["socket_error"] = str(e2)
-            rec["ok"] = False
-            raise
+        except Exception as socket_error:
+            rec["socket_error"] = str(socket_error)
+            rec["via"] = "rest"
+            try:
+                if on:
+                    rest.stream_start(name, dest)
+                else:
+                    rest.stream_stop(name)
+                rec["ok"] = True
+            except Exception as rest_error:
+                rec["rest_error"] = str(rest_error)
+                rec["ok"] = False
+                raise
+    else:
+        try:
+            if on:
+                rest.stream_start(name, dest)
+            else:
+                rest.stream_stop(name)
+            rec["ok"] = True
+        except (UltimateError, httpx.HTTPError) as e:
+            rec["rest_error"] = str(e)
+            rec["via"] = "socket"
+            # older firmware: fall back to the TCP command socket
+            try:
+                if on:
+                    cmd.stream_on(stream_id, dest)
+                else:
+                    cmd.stream_off(stream_id)
+                rec["ok"] = True
+            except Exception as e2:
+                rec["socket_error"] = str(e2)
+                rec["ok"] = False
+                raise
     STREAM_STATE[name] = on
 
 
@@ -1560,6 +2542,9 @@ def stream_transport_set(payload: dict = Body(...)):
 def stream_ctl(name: str, state: str):
     if name not in ("video", "audio") or state not in ("start", "stop"):
         raise HTTPException(400, "bad stream request")
+    if state == "start" and _current_link_payload().get("link_type") == LINK_WIFI:
+        raise HTTPException(409,
+            "Streaming is not available over Wi-Fi. Connect using the Ultimate's Ethernet address.")
     try:
         _stream_ctl(name, state == "start")
         return {"errors": [], "state": STREAM_STATE}
@@ -1578,6 +2563,7 @@ def stream_status():
         "audio": {"packets": audio.packets, "last_pkt_len": audio.last_pkt_len,
                   "mcast_group": audio._mcast_group},
         "last_command": STREAM_LAST,
+        "link": _current_link_payload(),
         # kept for backward compat
         "frames": video.frame_no, "packets": video.packets,
     }
@@ -1800,13 +2786,18 @@ def _asm_deploy_bytes(filename: str, action: str, data: bytes):
         return _mount_and_boot("a", _mount_mode(None), name=filename, data=data)
     if low.endswith((".d64", ".d71", ".d81", ".g64")):
         mode = _mount_mode(None)
-        _matrix_release_all(silent=True)
-        out = rest.mount_attachment("a", filename, data, mode=mode)
-        _remember_mount("a", mode, name=filename)
-        rest.put("/v1/machine:reset")
-        return out
+        def mount_and_reset():
+            _matrix_release_all(silent=True)
+            out = rest.mount_attachment("a", filename, data, mode=mode)
+            _remember_mount("a", mode, name=filename)
+            rest.put("/v1/machine:reset")
+            return out
+        return _run_direct_takeover(mount_and_reset, "running Assembly64 disk")
     if low.endswith(".crt"):
-        return rest.post_file("/v1/runners:run_crt", filename, data)
+        return _run_direct_takeover(
+            lambda: rest.post_file("/v1/runners:run_crt", filename, data),
+            "running Assembly64 cartridge",
+        )
     if low.endswith(".sid"):
         return _run_cart_safe(lambda: _post_sid_upload(filename, data))
     if low.endswith(".mod"):
@@ -2854,7 +3845,10 @@ def _swap_normalize_title(value: str) -> str:
 def _swap_token(value: str):
     value = value.casefold()
     if value.isdigit():
-        return "number", (0, int(value))
+        return "number", (0, int(value), "")
+    compound = _re.fullmatch(r"(\d+)([a-z])", value)
+    if compound:
+        return "number", (0, int(compound.group(1)), compound.group(2))
     return "letter", (1, value)
 
 
@@ -2904,7 +3898,7 @@ def _swap_signature(filename: str):
 
     # Parenthesised/bracketed forms: Game (Disk 1), Game [Side B], Game (1 of 3).
     wrapped = _re.fullmatch(
-        r"(?P<base>.+?)[\s._-]*[\(\[]\s*(?P<body>[^\)\]]+)\s*[\)\]]",
+        r"(?P<base>.+?)[\s._-]*(?P<open>[\(\[])\s*(?P<body>[^\)\]]+)\s*[\)\]]",
         stem,
     )
     if wrapped:
@@ -2914,6 +3908,20 @@ def _swap_signature(filename: str):
         result = numbered_total(wrapped.group("base"), wrapped.group("body"))
         if result:
             return result
+        # Bare wrapped tokens: WeAreDemo(A)/(B), Game(1)/(2). Parenthesised
+        # letters are accepted; square-bracket letters are GoodTools-style
+        # alternate-dump markers and deliberately remain ungrouped.
+        body = wrapped.group("body").strip().casefold()
+        bare = None
+        if _re.fullmatch(r"[a-z]", body) and wrapped.group("open") == "(":
+            bare = body
+        elif body.isdigit():
+            bare = body
+        if bare is not None:
+            title = _swap_normalize_title(wrapped.group("base"))
+            if title:
+                token_kind, token_sort = _swap_token(bare)
+                return (ext, "bare-wrapped", title, token_kind), token_sort
 
     # Explicit markers must be separated from the title, preventing a title
     # such as "Riverside1" from being misread as "River / side 1".  A stable
@@ -2949,15 +3957,31 @@ def _swap_signature(filename: str):
             of_total.group("token") + " of " + of_total.group("total"),
         )
 
-    # Generic numbered series such as Scratch-1.d64 / Scratch-2.d64.  The
-    # separator and complete normalised prefix are mandatory, and the caller
-    # will only accept the family when at least two siblings match.
-    trailing = _re.fullmatch(r"(?P<base>.+?)[\s._-]+(?P<token>\d+)", stem)
+    # Generic numbered series such as Scratch-1.d64 / Scratch-2.d64 and
+    # compound demo numbering such as EdgeOfDisgrace_1a.d64. A separator is
+    # mandatory, so glued sequel-like names remain deliberately excluded.
+    trailing = _re.fullmatch(
+        r"(?P<base>.+?)[\s._-]+(?P<token>\d+[a-z]?)",
+        stem,
+        flags=_re.IGNORECASE,
+    )
     if trailing:
         title = _swap_normalize_title(trailing.group("base"))
         if title:
             token_kind, token_sort = _swap_token(trailing.group("token"))
             return (ext, "numbered", title, token_kind), token_sort
+
+    # Title-less marker names such as side1.d64 / side2.d64. The complete
+    # stem must be marker+token, so Riverside1 can never be misclassified.
+    untitled = _re.fullmatch(
+        r"(?P<marker>disk|disc|side|part|volume|vol)[\s._-]*(?P<token>\d+|[a-z])",
+        stem,
+        flags=_re.IGNORECASE,
+    )
+    if untitled:
+        marker = _SWAP_MARKER_ALIASES[untitled.group("marker").casefold()]
+        token_kind, token_sort = _swap_token(untitled.group("token"))
+        return (ext, "marked-untitled", marker, token_kind), token_sort
     return None
 
 
@@ -2968,6 +3992,20 @@ def _swap_group_candidates(current_name: str, sibling_names) -> list[str]:
     if current_signature is None:
         return [current_name]
     family, _current_token = current_signature
+
+    # Game.d64 beside Game(a).d64 / Game(b).d64 is an alternate-dump family,
+    # not a multi-disk set. The unsuffixed sibling veto keeps it solo.
+    if len(family) >= 3 and family[1] == "bare-wrapped":
+        ext, _kind, title = family[0], family[1], family[2]
+        for name in list(sibling_names) + [current_name]:
+            plain = name.rsplit("/", 1)[-1]
+            plain_stem, plain_dot, plain_ext = plain.rpartition(".")
+            if not plain_dot or ("." + plain_ext.casefold()) != ext:
+                continue
+            if (_swap_signature(plain) is None and
+                    _swap_normalize_title(plain_stem) == title):
+                return [current_name]
+
     matches = []
     seen = set()
     for name in sibling_names:
@@ -3238,8 +4276,15 @@ import threading as _threading
 JUKE = {"items": [], "index": -1, "playing": False, "shuffle": False,
         "radio": False, "song": 0, "timer": None, "folder": "", "loading": False,
         "source": "", "generation": 0, "stop_after_current": False}
+JUKE_TIMER_LOCK = _threading.RLock()
 JUKE_PLAYED: set[str] = set()
 JUKE_RECENT_TRACKS = deque(maxlen=80)
+# Native SID playback can leave some firmware/device combinations in a state
+# that a normal C64 reset does not fully clear.  Track this per Ultimate so the
+# next Mount & Run can perform one full machine reboot before mounting.  The
+# flag deliberately survives Jukebox Stop and timer disarming; only a confirmed
+# reboot clears it.
+SID_RUNNER_REBOOT_REQUIRED: set[str] = set()
 SIDFLOW_DB_PATH = ROOT / ".sidflow-similarity.sqlite"
 SIDFLOW_STORE = SimilarityStore(SIDFLOW_DB_PATH)
 SIDFLOW_PRESENT_CACHE = {"signature": None, "paths": {}}
@@ -3652,8 +4697,9 @@ def load_songlengths():
 
 
 def _juke_new_generation() -> int:
-    JUKE["generation"] = int(JUKE.get("generation", 0)) + 1
-    return JUKE["generation"]
+    with JUKE_TIMER_LOCK:
+        JUKE["generation"] = int(JUKE.get("generation", 0)) + 1
+        return JUKE["generation"]
 
 
 def _juke_reset_similarity_session(*, disable_radio: bool = True) -> None:
@@ -3664,10 +4710,31 @@ def _juke_reset_similarity_session(*, disable_radio: bool = True) -> None:
 
 
 def _juke_cancel_timer():
-    t = JUKE.get("timer")
-    if t:
-        t.cancel()
-        JUKE["timer"] = None
+    with JUKE_TIMER_LOCK:
+        t = JUKE.get("timer")
+        if t:
+            t.cancel()
+            JUKE["timer"] = None
+
+
+def _juke_disarm_machine_takeover(reason: str = "machine takeover") -> int:
+    """Invalidate pending SID callbacks before another action owns the C64.
+
+    Cancelling a ``threading.Timer`` is not enough once its callback has begun.
+    The generation bump makes every previously scheduled callback stale, while
+    the state reset prevents Radio or stop-after-current from taking the
+    machine back after a mount, runner action, reset or reboot has started.
+    """
+    with JUKE_TIMER_LOCK:
+        active = bool(JUKE.get("playing") or JUKE.get("stop_after_current") or
+                      JUKE.get("timer") or JUKE.get("radio"))
+        _juke_cancel_timer()
+        generation = _juke_new_generation()
+        JUKE.update({"playing": False, "stop_after_current": False,
+                     "loading": False, "radio": False})
+    if active:
+        _diag_event("info", f"SID Jukebox disarmed for {reason}")
+    return generation
 
 
 def _juke_state():
@@ -3974,37 +5041,79 @@ def _juke_materialise(it: dict) -> dict:
     return it
 
 
-def _juke_play(index: int, song: int = 0):
+def _juke_play(index: int, song: int = 0, *, expected_generation: int | None = None):
     if not JUKE["items"]:
         raise HTTPException(400, "jukebox is empty")
     index = index % len(JUKE["items"])
-    it = _juke_materialise(JUKE["items"][index])
-    song = song or int(it.get("song") or it["meta"].get("start_song", 1) or 1)
-    try:
-        _run_cart_safe(lambda: _post_sid_upload(
-            it["label"], it["data"], songnr=song
-        ))
-    except (UltimateError, httpx.HTTPError) as e:
-        err(e)
-    JUKE.update({"index": index, "song": song, "playing": True,
-                 "stop_after_current": False})
-    track_id = _sidflow_item_track_id(it, song)
-    if track_id:
-        JUKE_PLAYED.add(track_id.casefold())
-        JUKE_RECENT_TRACKS.append(track_id.casefold())
-    _sidflow_radio_topup()
-    _juke_cancel_timer()
-    length = _juke_length(it, song)
-    if length is None:
-        length = float(CFG.get("sid_default_secs", 180) or 0)
-    if length > 0:
-        t = _threading.Timer(length + 1.0, _juke_auto_next)
-        t.daemon = True
-        JUKE["timer"] = t
-        t.start()
-    out = _juke_state()
-    out["started"] = it["label"]
-    return out
+    play_started = time.monotonic()
+    play_timing: dict[str, float | bool] = {}
+
+    # Keep the device operation from lazy materialisation through timer commit.
+    # A Mount & Run waiting behind us will disarm the replacement timer; if it
+    # acquired first, the generation check exits before any FTP or runner work.
+    with DEVICE_OP.operation("interactive", "playing SID"):
+        play_timing["coordinator_wait_ms"] = round(
+            (time.monotonic() - play_started) * 1000.0, 1
+        )
+        with JUKE_TIMER_LOCK:
+            if (expected_generation is not None and
+                    int(JUKE.get("generation", 0)) != int(expected_generation)):
+                return _juke_state()
+        stage = time.monotonic()
+        it = _juke_materialise(JUKE["items"][index])
+        play_timing["materialise_ms"] = round(
+            (time.monotonic() - stage) * 1000.0, 1
+        )
+        song = song or int(it.get("song") or it["meta"].get("start_song", 1) or 1)
+        try:
+            _run_cart_safe(lambda: _post_sid_upload(
+                it["label"], it["data"], songnr=song
+            ), preserve_jukebox=True, timings=play_timing)
+        except (UltimateError, httpx.HTTPError) as e:
+            err(e)
+
+        stage = time.monotonic()
+        with JUKE_TIMER_LOCK:
+            if (expected_generation is not None and
+                    int(JUKE.get("generation", 0)) != int(expected_generation)):
+                return _juke_state()
+            JUKE.update({"index": index, "song": song, "playing": True,
+                         "stop_after_current": False})
+            track_id = _sidflow_item_track_id(it, song)
+            if track_id:
+                JUKE_PLAYED.add(track_id.casefold())
+                JUKE_RECENT_TRACKS.append(track_id.casefold())
+            _sidflow_radio_topup()
+            _juke_cancel_timer()
+            generation = _juke_new_generation()
+            length = _juke_length(it, song)
+            if length is None:
+                length = float(CFG.get("sid_default_secs", 180) or 0)
+            if length > 0:
+                t = _threading.Timer(length + 1.0, _juke_auto_next,
+                                     args=(generation,))
+                t.daemon = True
+                JUKE["timer"] = t
+                t.start()
+        play_timing["state_commit_ms"] = round(
+            (time.monotonic() - stage) * 1000.0, 1
+        )
+        play_timing["total_ms"] = round(
+            (time.monotonic() - play_started) * 1000.0, 1
+        )
+        _diag_event(
+            "info",
+            "SID Jukebox Play timing: "
+            + ", ".join(
+                f"{key}={value}"
+                for key, value in play_timing.items()
+                if key.endswith("_ms")
+            ),
+        )
+        out = _juke_state()
+        out["started"] = it["label"]
+        out["play_timing"] = play_timing
+        return out
 
 
 def _juke_next_index():
@@ -4018,13 +5127,33 @@ def _juke_next_index():
     return (JUKE["index"] + 1) % n
 
 
-def _juke_auto_next():
+def _juke_auto_next(generation: int | None = None):
+    """Advance only if this is still the timer for the active SID session."""
     try:
-        if JUKE.get("stop_after_current"):
-            JUKE["stop_after_current"] = False
-            juke_stop()
-        elif JUKE["playing"] and JUKE["items"]:
-            _juke_play(_juke_next_index())
+        with JUKE_TIMER_LOCK:
+            current_generation = int(JUKE.get("generation", 0))
+            if generation is not None and int(generation) != current_generation:
+                return
+            stop_after_current = bool(JUKE.get("stop_after_current"))
+            should_advance = bool(JUKE.get("playing") and JUKE.get("items"))
+            next_index = _juke_next_index() if should_advance else -1
+
+        if stop_after_current:
+            # Serialise the timer-triggered reset with Mount & Run and re-check
+            # after acquiring the device. Whichever operation acquires first
+            # completes; the later one observes the generation change.
+            with DEVICE_OP.operation("interactive", "finishing SID playback"):
+                with JUKE_TIMER_LOCK:
+                    if (generation is not None and
+                            int(JUKE.get("generation", 0)) != int(generation)):
+                        return
+                    JUKE["stop_after_current"] = False
+                juke_stop()
+        elif should_advance:
+            if generation is None:
+                _juke_play(next_index)
+            else:
+                _juke_play(next_index, expected_generation=generation)
     except Exception:
         pass
 
@@ -5077,33 +6206,160 @@ def juke_prev():
     return _juke_play((JUKE["index"] - 1) % n if n else 0)
 
 
-@app.put("/api/juke/stop")
-def juke_stop():
-    _juke_cancel_timer()
-    JUKE["playing"] = False
-    JUKE["stop_after_current"] = False
+def _juke_stop_command_reset() -> tuple[bool, str, str]:
+    """Attempt Stop through a newly connected port-64 socket."""
+    try:
+        if cmd is None:
+            return False, "failed", "no command socket available"
+        resetter = getattr(cmd, "reset_fresh", None) or getattr(cmd, "reset", None)
+        if resetter is None:
+            return False, "failed", "command socket reset is unavailable"
+        resetter()
+        route = "fresh command socket" if hasattr(cmd, "reset_fresh") else "command socket"
+        return True, route, ""
+    except Exception as exc:
+        return False, "failed", str(exc)
 
-    # Stop SID audio as quickly as possible. The command-socket reset is a
-    # tiny independent packet and intentionally bypasses ordinary REST/status
-    # coordination; REST remains the compatibility fallback. Release any
-    # injected matrix keys after the reset so a held remote key cannot survive.
-    reset_sent = False
+
+def _split_rest_control_active() -> bool:
+    """Return True when REST is routed through a paired control address."""
+    selected = str(CFG.get("u64_host") or "").strip()
+    control = str(getattr(rest, "host", "") or selected).strip()
+    saved = str(CFG.get("rest_control_host") or "").strip()
+    return bool(
+        selected and control and selected != control
+        and (saved == control or _same_known_device(selected, control))
+    )
+
+
+def _juke_stop_rest_reset(*, cartridge_safe: bool = False) -> tuple[bool, str]:
+    """Reset through REST, optionally parking a configured cartridge first.
+
+    With split routing the REST client is the verified Wi-Fi control path, so
+    it avoids the delayed wired command-socket path.  Parking the configured
+    cartridge before reset returns the C64 to its normal screen; restoring the
+    setting afterwards does not activate the cartridge until a later reset.
+    """
+    cart = ""
+    parked = False
+    restore_error = ""
     try:
-        if cmd is not None:
-            cmd.reset()
-            reset_sent = True
-    except Exception:
-        reset_sent = False
+        if rest is None:
+            raise RuntimeError("no REST client available")
+        if cartridge_safe and CFG.get("cart_safe_run", True):
+            cart = _cart_configured()
+            if cart:
+                rest.put(
+                    f"/v1/configs/{_CART_CAT}/{_CART_ITEM}",
+                    value="", request_timeout=4.0,
+                )
+                parked = True
+        rest.put("/v1/machine:reset", request_timeout=4.0)
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        if parked:
+            try:
+                rest.put(
+                    f"/v1/configs/{_CART_CAT}/{_CART_ITEM}",
+                    value=cart, request_timeout=4.0,
+                )
+            except Exception as exc:
+                restore_error = str(exc)
+                _warn_event(
+                    "juke-stop-cart-restore",
+                    "SID Jukebox Stop reset succeeded but the configured "
+                    f"cartridge could not be restored: {restore_error}",
+                )
+    return True, ""
+
+
+def _juke_stop_cached_matrix_available() -> bool:
+    """Return the connected device's cached CIA1 capability without probing.
+
+    Stop is an immediate user action.  A missing capability cache therefore
+    takes the safe Legacy/REST-first route rather than adding a network probe
+    before reset delivery.
+    """
+    with INPUT_CAP_LOCK:
+        status = dict(INPUT_CAPABILITIES.get(_input_cache_key(rest)) or {})
+    return bool(status.get("available"))
+
+
+def _juke_stop_impl():
+    stop_started = time.monotonic()
+    with JUKE_TIMER_LOCK:
+        _juke_cancel_timer()
+        _juke_new_generation()
+        JUKE["playing"] = False
+        JUKE["stop_after_current"] = False
+
+    matrix_capable = _juke_stop_cached_matrix_available()
+    split_control = _split_rest_control_active()
+    mode = "Split REST" if split_control else ("CIA1" if matrix_capable else "Legacy")
+    primary_error = ""
+
+    # Under RC12 split routing, ordinary REST is already using the responsive
+    # verified Wi-Fi control address while the command socket remains bound to
+    # Ethernet.  Use cartridge-safe REST first so Stop does not inherit the
+    # measured ~3-second wired command delay and does not boot the configured
+    # fast cartridge.  Single-interface routing keeps the hardware-verified
+    # CIA1/Legacy order from Public Beta 17.
+    if split_control:
+        primary_ok, primary_error = _juke_stop_rest_reset(cartridge_safe=True)
+        primary_route = "cartridge-safe REST"
+    elif matrix_capable:
+        primary_ok, primary_route, primary_error = _juke_stop_command_reset()
+    else:
+        primary_ok, primary_error = _juke_stop_rest_reset()
+        primary_route = "REST"
+
     try:
-        _matrix_release_all(silent=True)
+        _matrix_release_all(silent=True, cached_only=True)
     except Exception:
         pass
-    if not reset_sent:
-        try:
-            rest.put("/v1/machine:reset", request_timeout=4.0)
-        except Exception:
-            pass
-    return _juke_state()
+
+    delivery = primary_route if primary_ok else "failed"
+    fallback_error = ""
+    if not primary_ok:
+        if split_control:
+            fallback_ok, fallback_route, fallback_error = _juke_stop_command_reset()
+            if fallback_ok:
+                delivery = f"{fallback_route} fallback"
+        elif matrix_capable:
+            fallback_ok, fallback_error = _juke_stop_rest_reset()
+            if fallback_ok:
+                delivery = "REST fallback"
+        else:
+            fallback_ok, fallback_route, fallback_error = _juke_stop_command_reset()
+            if fallback_ok:
+                delivery = f"{fallback_route} fallback"
+
+    elapsed_ms = round((time.monotonic() - stop_started) * 1000.0, 1)
+    if delivery == "failed":
+        detail = "; ".join(part for part in (primary_error, fallback_error) if part)
+        _warn_event(
+            "juke-stop-reset",
+            f"SID Jukebox Stop reset failed ({mode}): {detail}",
+        )
+    else:
+        failure_note = f"; primary failed: {primary_error}" if primary_error else ""
+        _diag_event(
+            "info",
+            f"SID Jukebox Stop: reset delivered via {delivery} "
+            f"({mode}{failure_note}); elapsed="
+            f"{elapsed_ms}ms",
+        )
+    out = _juke_state()
+    out["stop_delivery"] = delivery
+    out["stop_elapsed_ms"] = elapsed_ms
+    out["stop_cartridge_safe"] = bool(split_control and primary_ok)
+    return out
+
+
+@app.put("/api/juke/stop")
+def juke_stop():
+    return _juke_stop_impl()
 
 
 @app.put("/api/juke/shuffle")
@@ -5211,6 +6467,7 @@ def library_run(name: str = Query(...), drive: str = Query("a")):
         if low.endswith((".d64", ".d71", ".d81", ".g64", ".dnp")):
             drive, mode = _drive_key(drive), _mount_mode(None)
             with DEVICE_OP.operation("interactive", "launching library disk"):
+                _juke_disarm_machine_takeover("launching library disk")
                 _matrix_release_all(silent=True)
                 out = rest.mount_attachment(drive, p.name, data, mode=mode)
                 _remember_mount(drive, mode, name=p.name)
@@ -5221,7 +6478,10 @@ def library_run(name: str = Query(...), drive: str = Query("a")):
             return _run_cart_safe(lambda: rest.run_prg(name + ".prg", prg))
         runner = _runner_for(p.name)
         if runner == "run_crt":
-            return rest.post_file(f"/v1/runners:{runner}", p.name, data)
+            return _run_direct_takeover(
+                lambda: rest.post_file(f"/v1/runners:{runner}", p.name, data),
+                "launching library cartridge",
+            )
         if runner == "sidplay":
             return _run_cart_safe(lambda: _post_sid_upload(p.name, data))
         return _run_cart_safe(

@@ -40,6 +40,8 @@ header{display:flex;align-items:center;gap:14px;padding:10px 16px;flex:0 0 auto;
 #devinfo .input-mode.matrix{color:var(--ok)}
 #devinfo .input-mode.buffer{color:var(--warn)}
 #devinfo .reconnecting{color:var(--warn)}
+#devinfo .device-busy{color:var(--warn)}
+.drive-busy-note{color:var(--warn)}
 .header-actions{align-items:center}
 .machine{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
 @media(max-width:760px){
@@ -290,3 +292,25 @@ pre.raw{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
 .jkq-similarity{color:var(--acc);font-size:11px;margin-left:6px}
 .sidflow-juke-credit-row{margin-top:4px;align-items:baseline;gap:10px;flex-wrap:wrap}
 .sidflow-juke-credit-row #jkSlInfo,.sidflow-juke-credit-row .sidflow-credit{line-height:1.25}
+
+/* dual-interface awareness */
+#devinfo .link-mode{display:inline-flex;align-items:center;color:var(--dim);font:inherit;
+  padding:0;border:0;background:none;border-radius:0;vertical-align:baseline}
+#devinfo .link-mode.ethernet{color:var(--ok)}
+#devinfo .link-mode.wifi{color:var(--warn)}
+#devinfo button.link-mode.wifi.switchable{cursor:pointer;text-decoration:underline;text-underline-offset:2px}
+#devinfo button.link-mode.wifi.switchable:hover{color:#ffd993}
+#devinfo button.link-mode:disabled{opacity:1;cursor:default}
+.disc-device{border-bottom:1px solid var(--line);padding:9px 0}
+.disc-device-main{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.disc-address-line{margin-top:3px;color:var(--dim);font-size:12px}
+.disc-address.ethernet{color:var(--ok)}
+.disc-address.wifi{color:var(--warn)}
+.disc-alternatives{margin-top:6px;color:var(--dim);font-size:12px}
+.disc-alternatives summary{cursor:pointer;user-select:none}
+.disc-alternatives button{margin:6px 5px 0 0}
+.disc-choice-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}
+.disc-choice{border:1px solid var(--line)}
+.disc-choice.selected{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 32%,transparent);background:color-mix(in srgb,var(--accent) 14%,var(--panel))}
+.stream-hint{border:1px solid rgba(255,184,92,.45);background:rgba(255,184,92,.08);
+  color:#ffd993;border-radius:7px;padding:7px 9px;margin-bottom:8px;font-size:12px}

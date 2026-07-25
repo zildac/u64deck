@@ -25,3 +25,7 @@ user_items.json
 .u64deck-index.sqlite3-shm
 index-backups/
 .sidflow-*
+
+.espressif-ouis-cache.json
+.espressif-ouis-cache.json.tmp-*
+DISCOVERY-FROZEN.sha256

@@ -3,8 +3,14 @@
 const $=s=>document.querySelector(s);
 function toast(msg,cls){const d=document.createElement("div");d.className="toast "+(cls||"");
   d.textContent=msg;$("#toasts").append(d);setTimeout(()=>d.remove(),5000)}
+let DEVICE_REQUEST_TIMEOUT_MS=15000;
+let LINK_STATUS={ip:"",link_type:"unknown",label:"Unknown",addresses:[],ethernet_ip:"",wifi_ip:"",control_ip:"",control_link_type:"unknown",rest_via_alternate:false,rest_route_label:"",streaming_available:true,rest_timeout:8};
+let UI_INTERACTIVE_DEPTH=0,INFO_IN_FLIGHT=false,DRIVES_IN_FLIGHT=false,INPUT_PROBE_TIMER=null;
+function uiInteractiveStart(){UI_INTERACTIVE_DEPTH++}
+function uiInteractiveEnd(){UI_INTERACTIVE_DEPTH=Math.max(0,UI_INTERACTIVE_DEPTH-1)}
+function uiInteractive(){return UI_INTERACTIVE_DEPTH>0}
 async function api(path,opts={}){
-  const options={...opts},timeoutMs=Number(options.timeoutMs??15000);delete options.timeoutMs;
+  const options={...opts},timeoutMs=Number(options.timeoutMs??DEVICE_REQUEST_TIMEOUT_MS);delete options.timeoutMs;
   let timer=null,controller=null;
   if(!options.signal&&timeoutMs>0){controller=new AbortController();options.signal=controller.signal;
     timer=setTimeout(()=>controller.abort(),timeoutMs)}
@@ -201,15 +207,18 @@ async function downloadDiagnostics(){
 }
 
 /* ---------- discovery ---------- */
+let DISCOVERY_SCAN_ACTIVE=false;
+const DISCOVERY_SELECTION={};
 function openDiscover(){
   let ov=$("#discOverlay");
   if(!ov){
     ov=document.createElement("div");ov.id="discOverlay";
     ov.style.cssText="position:fixed;inset:0;background:rgba(0,0,0,.72);display:flex;align-items:flex-start;justify-content:center;padding-top:9vh;z-index:50";
-    ov.innerHTML=`<div class="panel" style="width:min(560px,92vw)">
+    ov.innerHTML=`<div class="panel" style="width:min(620px,92vw)">
       <h2>FIND ULTIMATE DEVICES</h2>
-      <div id="discBody" class="hint">Scans your local /24 subnet(s) for anything answering the
-        Ultimate REST API on port 80 — same method Ultimate64 Manager uses. Takes a couple of seconds.</div>
+      <div id="discBody" class="hint">Checks previously verified addresses first, then sends one bounded
+        Ultimate <code>/v1/info</code> request to each remaining address on the local /24. Ethernet and Wi-Fi
+        interfaces are grouped into one physical device. Only interfaces verified during this scan are shown.</div>
       <div class="row" style="margin-top:10px">
         <button class="primary" id="discGo" onclick="runDiscover()">Scan network</button>
         <input id="discSubnet" placeholder="extra subnet e.g. 192.168.50." style="flex:1">
@@ -219,42 +228,103 @@ function openDiscover(){
         <input id="discManual" placeholder="…or type an IP manually" style="flex:1"
           onkeydown="if(event.key==='Enter')connectTo($('#discManual').value)">
         <button onclick="connectTo($('#discManual').value)">Connect</button>
+      </div>
+      <div class="row" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
+        <button class="danger" id="discClear" onclick="clearDiscoveredDevices()">Clear discovered devices</button>
+        <span class="hint">Recovery option: clears remembered hosts only, then performs a fresh scan.</span>
       </div></div>`;
     ov.addEventListener("click",e=>{if(e.target===ov)ov.remove()});
     document.body.appendChild(ov);
   }
 }
+function selectDiscoveryAddress(group,ip,button){
+  DISCOVERY_SELECTION[group]=ip;
+  const root=button?.closest?.(".disc-device");
+  if(root)root.querySelectorAll(".disc-choice").forEach(btn=>btn.classList.toggle("selected",btn.dataset.ip===ip));
+}
+function useSelectedDiscoveryAddress(group){
+  const host=DISCOVERY_SELECTION[group]||"";if(host)connectTo(host);
+}
+function renderDiscoveryResults(r){
+  const body=$("#discBody");
+  if(!r.devices.length){
+    body.innerHTML=`No Ultimate devices found on ${esc(r.subnets.join(", ")||"any local subnet")}.<br>
+      Check the device is on, on the same network, and that <b>Web Remote Control</b> is enabled
+      in its Network Settings — or enter its IP below.`;
+    return;
+  }
+  body.innerHTML=r.devices.map((d,index)=>{
+    const addresses=(d.addresses||[]),preferred=d.preferred_ip||(addresses[0]?.ip||"");
+    const group="device-"+index;DISCOVERY_SELECTION[group]=preferred;
+    const choices=addresses.map(a=>{
+      const label=a.link_type==="ethernet"?"Ethernet":a.link_type==="wifi"?"Wi-Fi":"Unknown link";
+      const recommended=a.ip===preferred&&a.link_type==="ethernet"?" · recommended":"";
+      return `<button class="mini disc-choice${a.ip===preferred?" selected":""}" data-ip="${esc(a.ip)}" onclick="selectDiscoveryAddress('${group}','${jsq(a.ip)}',this)">${label} · ${esc(a.ip)}${recommended}</button>`;
+    }).join("");
+    return `<div class="disc-device">
+      <div class="disc-device-main"><div><b>${esc(d.product)}</b>${d.firmware?" · fw "+esc(d.firmware):""}${d.hostname?" · "+esc(d.hostname):(d.unique_id?" · "+esc(d.unique_id):"")}
+      <div class="disc-address-line">Select the address to use:</div><div class="disc-choice-row">${choices}</div></div>
+      <button class="primary" onclick="useSelectedDiscoveryAddress('${group}')">Use selected address</button></div></div>`;
+  }).join("");
+}
+
 async function runDiscover(){
-  const body=$("#discBody"),btn=$("#discGo");
-  btn.disabled=true;body.innerHTML="Scanning… <span class='cursor'></span>";
+  const body=$("#discBody"),btn=$("#discGo"),clear=$("#discClear");
+  btn.disabled=true;if(clear)clear.disabled=true;DISCOVERY_SCAN_ACTIVE=true;
+  body.innerHTML="Checking known addresses, then scanning the local /24… <span class='cursor'></span>";
   try{
     const sub=$("#discSubnet").value.trim();
-    const r=await api("/api/discover"+(sub?"?subnet="+encodeURIComponent(sub):""));
-    if(!r.devices.length){
-      body.innerHTML=`No Ultimate devices found on ${esc(r.subnets.join(", ")||"any local subnet")}.<br>
-        Check the device is on, on the same network, and that <b>Web Remote Control</b> is enabled
-        in its Network Settings — or enter its IP below.`;
-    }else{
-      body.innerHTML=r.devices.map(d=>`
-        <div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:6px 0">
-          <span><b>${esc(d.product)}</b> · ${esc(d.ip)}${d.firmware?" · fw "+esc(d.firmware):""}${d.hostname?" · "+esc(d.hostname):""}</span>
-          <button class="primary" onclick="connectTo('${jsq(d.ip)}')">Use</button>
-        </div>`).join("");
-    }
+    const r=await api("/api/discover"+(sub?"?subnet="+encodeURIComponent(sub):""),{timeoutMs:30000});
+    renderDiscoveryResults(r);
   }catch(e){body.innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`}
-  btn.disabled=false;
+  finally{
+    DISCOVERY_SCAN_ACTIVE=false;btn.disabled=false;if(clear)clear.disabled=false;
+  }
+}
+async function clearDiscoveredDevices(){
+  const question="Clear all remembered Ultimate devices and addresses?\n\nThe current connection will be removed and a fresh network scan will begin. Other settings will not be changed.";
+  if(!confirm(question))return;
+  const body=$("#discBody"),btn=$("#discGo"),clear=$("#discClear");
+  if(btn)btn.disabled=true;if(clear)clear.disabled=true;DISCOVERY_SCAN_ACTIVE=true;
+  body.innerHTML="Clearing discovery history and scanning… <span class='cursor'></span>";
+  try{
+    const sub=$("#discSubnet").value.trim();
+    const r=await api("/api/discover/clear"+(sub?"?subnet="+encodeURIComponent(sub):""),{method:"POST",timeoutMs:30000});
+    closeLocalStreamsForLinkChange();
+    LINK_STATUS={ip:"",link_type:"unknown",label:"Unknown",addresses:[],ethernet_ip:"",wifi_ip:"",control_ip:"",control_link_type:"unknown",rest_via_alternate:false,rest_route_label:"",streaming_available:true,rest_timeout:8};
+    LAST_DEVICE_INFO=null;INPUT_STATUS={available:false,mode:"buffer",label:"Legacy KERNAL buffer",status:0};
+    applyLinkStatus(LINK_STATUS);matrixClearLocalState();renderInputMode();
+    $("#devinfo").innerHTML='<span style="color:var(--err)">No device configured — choose a verified result below</span>';
+    toast("Discovery history cleared — scanning for Ultimate devices.","ok");
+    renderDiscoveryResults(r);
+  }catch(e){body.innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`}
+  finally{DISCOVERY_SCAN_ACTIVE=false;if(btn)btn.disabled=false;if(clear)clear.disabled=false}
+}
+function scheduleInputProbe(delay=2500){
+  clearTimeout(INPUT_PROBE_TIMER);INPUT_PROBE_TIMER=setTimeout(()=>{
+    INPUT_PROBE_TIMER=null;
+    if(uiInteractive()){scheduleInputProbe(1000);return}
+    loadInputStatus(true);
+  },delay);
 }
 async function connectTo(host){
-  host=(host||"").trim();if(!host)return;
+  host=(host||"").trim();if(!host||uiInteractive())return;
+  uiInteractiveStart();
   try{
     const r=await api("/api/connect",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({host})});
-    if(r.connected){toast("Connected to "+host,"ok");
+      body:JSON.stringify({host}),timeoutMs:30000});
+    if(r.connected){
+      toast("Connected to "+host+(r.rest_via_alternate?" · REST control via "+r.control_host:""),"ok");
       if(r.input){INPUT_STATUS=r.input;renderInputMode()}
-      matrixClearLocalState();const ov=$("#discOverlay");if(ov)ov.remove();loadInfo();}
-    else toast("Could not connect to "+host+": "+r.error,"err");
+      if(r.link)applyLinkStatus(r.link);
+      if(r.info){LAST_DEVICE_INFO=r.info;INFO_FAILURES=0;renderDeviceInfo(r.info)}
+      matrixClearLocalState();const ov=$("#discOverlay");if(ov)ov.remove();
+      if(INPUT_STATUS.pending||INPUT_STATUS.available===null)scheduleInputProbe();
+    }else toast("Could not connect to "+host+": "+r.error,"err");
   }catch(e){toast(e.message,"err")}
+  finally{uiInteractiveEnd()}
 }
+
 
 /* ---------- stream quality ---------- */
 const QK="u64deck.quality";
@@ -321,15 +391,54 @@ async function ifaceChanged(){
 }
 
 /* ---------- device info / machine ---------- */
+function linkName(type){return type==="ethernet"?"Ethernet":type==="wifi"?"Wi-Fi":"Unknown"}
+function linkWarning(){return "Connected over Wi-Fi. Video and audio streaming are not supported over Wi-Fi, and the API is slower. Switch to the Ethernet address if available."}
+function linkBadgeHtml(){
+  if(LINK_STATUS.link_type==="ethernet"){
+    const split=LINK_STATUS.rest_via_alternate&&LINK_STATUS.control_link_type==="wifi";
+    const title=split?`Ethernet selected for command socket, FTP and streaming; REST control is routed through verified Wi-Fi ${LINK_STATUS.control_ip||""} to avoid the Ultimate dual-interface wired REST delay`:`Connected through the Ultimate wired interface`;
+    return ` <span class="link-mode ethernet" title="${esc(title)}">· Ethernet${split?" · REST via Wi-Fi":""}</span>`;
+  }
+  if(LINK_STATUS.link_type==="wifi"){const clickable=!!LINK_STATUS.ethernet_ip;return ` <button class="link-mode wifi${clickable?" switchable":""}" data-tip="${esc(linkWarning())}" ${clickable?`onclick="switchToEthernet()"`:"disabled"}>· Wi-Fi${clickable?" · Switch to Ethernet":""}</button>`}
+  return "";
+}
+function closeLocalStreamsForLinkChange(){
+  clearTimeout(VIDEO_NO_FRAME_TIMER);VIDEO_NO_FRAME_TIMER=null;
+  videoWanted=false;videoOn=false;if(wsV){const old=wsV;wsV=null;old.onclose=null;old.close()}
+  audioWanted=false;audioOn=false;clearTimeout(audioReconnectTimer);audioReconnectTimer=null;if(wsA){const old=wsA;wsA=null;old.onclose=null;old.close()}
+  $("#btnVideo").textContent="Start video";$("#btnVideo").classList.add("primary");setAudioState("off",0);
+}
+function renderLinkState(){
+  const wifi=LINK_STATUS.link_type==="wifi",known=LINK_STATUS.link_type!=="unknown";
+  const reason="Streaming is not available over Wi-Fi. Connect using the Ultimate's Ethernet address.";
+  for(const id of ["btnVideo","btnAudio","btnRecord","btnFullscreen"]){const el=$("#"+id);if(!el)continue;el.disabled=wifi;if(wifi)el.dataset.tip=reason;else if(el.dataset.wifiTip){el.dataset.tip=el.dataset.wifiTip}}
+  const badge=$("#streamLinkStatus");if(badge){const split=!wifi&&LINK_STATUS.rest_via_alternate;badge.textContent=wifi?"Wi-Fi · streaming unavailable":known?(split?"Ethernet · REST via Wi-Fi":"Ethernet"):"Link unknown";badge.className="badge "+(wifi?"bad":known?"on":"")}
+  const switcher=$("#wifiSwitchInline");if(switcher){switcher.style.display=wifi&&LINK_STATUS.ethernet_ip?"inline-flex":"none"}
+  const hint=$("#streamHint");if(hint&&wifi){hint.style.display="none"}
+  if(wifi){closeLocalStreamsForLinkChange();bezelReset();drawVideoPlaceholder("STREAMING NOT AVAILABLE OVER WI-FI\nCONNECT VIA ETHERNET TO STREAM")}
+  else if(!videoHasFrame&&videoPlaceholderMessage.includes("WI-FI"))drawVideoPlaceholder("VIDEO NOT CONNECTED");
+}
+function applyLinkStatus(status){
+  LINK_STATUS={...LINK_STATUS,...(status||{})};
+  DEVICE_REQUEST_TIMEOUT_MS=LINK_STATUS.link_type==="wifi"?45000:15000;
+  renderLinkState();if(LAST_DEVICE_INFO)renderDeviceInfo(LAST_DEVICE_INFO);
+}
+async function loadLinkStatus(refresh=false){try{const r=await api("/api/link/status"+(refresh?"?refresh=true":""),{timeoutMs:refresh?50000:15000});applyLinkStatus(r);return r}catch(e){return LINK_STATUS}}
+async function switchToEthernet(){if(!LINK_STATUS.ethernet_ip)return;await connectTo(LINK_STATUS.ethernet_ip)}
 let VER_SHOWN=false,LAST_DEVICE_INFO=null,INFO_FAILURES=0,INFO_RETRY_TIMER=null;
-let INPUT_STATUS={available:false,mode:"buffer",label:"Legacy KERNAL buffer",status:0};
+let MOUNT_RUN_STATUS_WATCH=null,MOUNT_RUN_BUSY=false;
+let INPUT_STATUS={available:null,pending:true,mode:"unknown",label:"Input capability pending",status:0};
 function inputModeSuffix(){
+  if(INPUT_STATUS.pending||INPUT_STATUS.available===null)return ` <span class="input-mode buffer" title="${esc(INPUT_STATUS.label||"")}">· input checking</span>`;
   const matrix=INPUT_STATUS.available;
   return ` <span class="input-mode ${matrix?"matrix":"buffer"}" title="${esc(INPUT_STATUS.label||"")}">· input ${matrix?"CIA1":"buffer"}</span>`;
 }
 function renderInputMode(){
   const badge=$("#inputModeBadge"),help=$("#kbhelp");if(!badge||!help)return;
-  if(INPUT_STATUS.available){
+  if(INPUT_STATUS.pending||INPUT_STATUS.available===null){
+    badge.textContent="Checking input…";badge.className="badge";
+    help.innerHTML="Keyboard capability is being checked in the background. Other device controls remain available.";
+  }else if(INPUT_STATUS.available){
     badge.textContent="CIA1 matrix";badge.className="badge matrix";
     help.innerHTML="Esc = RUN/STOP · F1–F8 · cursor keys · Backspace = DEL · Home / Shift-Home = CLR. <b>CIA1 matrix input is active</b>: held keys, chords, cracktros, games and the Ultimate menu are supported.";
   }else{
@@ -339,30 +448,69 @@ function renderInputMode(){
 }
 function renderDeviceInfo(i,suffix=""){
   $("#devinfo").innerHTML=`<b>${esc(i.product||"?")}</b> fw ${esc(i.firmware_version||"?")}`+
-    (i.core_version?` · core ${esc(i.core_version)}`:"")+(i.hostname?` · ${esc(i.hostname)}`:"")+inputModeSuffix()+suffix;
+    (i.core_version?` · core ${esc(i.core_version)}`:"")+(i.hostname?` · ${esc(i.hostname)}`:"")+linkBadgeHtml()+inputModeSuffix()+suffix;
 }
+function stopMountRunStatusWatch(){
+  if(MOUNT_RUN_STATUS_WATCH){clearInterval(MOUNT_RUN_STATUS_WATCH);MOUNT_RUN_STATUS_WATCH=null}
+}
+function beginMountRunStatusWatch(){
+  MOUNT_RUN_BUSY=false;stopMountRunStatusWatch();
+  setTimeout(loadInfo,150);
+  // The mount request is synchronous at the API level, so poll the local busy
+  // snapshot until the server confirms the mount and begins the load phase.
+  MOUNT_RUN_STATUS_WATCH=setInterval(loadInfo,750);
+}
+function finishMountRunStatusWatch(){
+  stopMountRunStatusWatch();MOUNT_RUN_BUSY=false;loadInfo();
+}
+let INPUT_STATUS_IN_FLIGHT=false;
 async function loadInputStatus(refresh=false){
+  if(INPUT_STATUS_IN_FLIGHT||uiInteractive())return INPUT_STATUS;
+  INPUT_STATUS_IN_FLIGHT=true;
   try{
-    const r=await api("/api/input/status"+(refresh?"?refresh=true":""));
+    const r=await api("/api/input/status"+(refresh?"?refresh=true":""),{timeoutMs:15000});
     const wasMatrix=!!INPUT_STATUS.available;INPUT_STATUS=r||INPUT_STATUS;
     if(wasMatrix&&!INPUT_STATUS.available)matrixClearLocalState();
     renderInputMode();if(LAST_DEVICE_INFO)renderDeviceInfo(LAST_DEVICE_INFO);
     return INPUT_STATUS;
   }catch(e){
-    INPUT_STATUS={available:false,mode:"buffer",label:"Legacy KERNAL buffer",status:0,detail:e.message};
+    INPUT_STATUS={available:false,pending:false,mode:"buffer",label:"Legacy KERNAL buffer",status:0,detail:e.message};
     matrixClearLocalState();renderInputMode();if(LAST_DEVICE_INFO)renderDeviceInfo(LAST_DEVICE_INFO);
     return INPUT_STATUS;
-  }
+  }finally{INPUT_STATUS_IN_FLIGHT=false}
 }
 async function loadInfo(){
-  if(!VER_SHOWN){try{const c=await api("/api/app_config");
-    if(c.version){$("#ver").textContent="v"+c.version+(c.release_label?" · "+c.release_label:"")+(c.build?" · "+c.build:"");
-      $("#ver").title="version "+c.version+(c.release_label?" ("+c.release_label+")":"")+", build "+(c.build||"?")+" — quote this in bug reports";
-      VER_SHOWN=true}}catch(e){}}
-  try{const previousFailures=INFO_FAILURES,i=await api("/api/info");
-    LAST_DEVICE_INFO=i;INFO_FAILURES=0;
+  if(DISCOVERY_SCAN_ACTIVE||uiInteractive()||INFO_IN_FLIGHT)return;
+  INFO_IN_FLIGHT=true;
+  try{
+    if(!VER_SHOWN){try{const c=await api("/api/app_config");
+      if(c.version){$("#ver").textContent="v"+c.version+(c.release_label?" · "+c.release_label:"")+(c.build?" · "+c.build:"");
+        $("#ver").title="version "+c.version+(c.release_label?" ("+c.release_label+")":"")+", build "+(c.build||"?")+" — quote this in bug reports";
+        VER_SHOWN=true}}catch(e){}}
+    const previousFailures=INFO_FAILURES,i=await api("/api/info");
+    if(i?.u64deck_discovery_busy||i?.u64deck_operation_busy){
+      if(INFO_RETRY_TIMER)clearTimeout(INFO_RETRY_TIMER);
+      const retry=Math.max(500,Number(i.u64deck_retry_ms)||1000);
+      INFO_RETRY_TIMER=setTimeout(()=>{INFO_RETRY_TIMER=null;loadInfo()},retry);
+      return;
+    }
+    if(i?.u64deck_busy){
+      INFO_FAILURES=0;MOUNT_RUN_BUSY=true;stopMountRunStatusWatch();
+      applyBusyMountSnapshot(i.u64deck_mounts);
+      const label=esc(i.u64deck_busy_label||"BUSY — loading program…");
+      if(LAST_DEVICE_INFO)renderDeviceInfo(LAST_DEVICE_INFO,` <span class="device-busy">· ${label}</span>`);
+      else $("#devinfo").innerHTML=`<span class="device-busy">${label}</span>`;
+      if(INFO_RETRY_TIMER)clearTimeout(INFO_RETRY_TIMER);
+      const retry=Math.max(500,Number(i.u64deck_retry_ms)||2000);
+      INFO_RETRY_TIMER=setTimeout(()=>{INFO_RETRY_TIMER=null;loadInfo()},retry);
+      return;
+    }
+    LAST_DEVICE_INFO=i;INFO_FAILURES=0;MOUNT_RUN_BUSY=false;
     if(INFO_RETRY_TIMER){clearTimeout(INFO_RETRY_TIMER);INFO_RETRY_TIMER=null}
-    await loadInputStatus(previousFailures>0);renderDeviceInfo(i);
+    if(i.u64deck_link)applyLinkStatus(i.u64deck_link);else await loadLinkStatus(previousFailures>0);
+    if(i.u64deck_input){INPUT_STATUS=i.u64deck_input;renderInputMode();
+      if(INPUT_STATUS.pending||INPUT_STATUS.available===null)scheduleInputProbe()}
+    renderDeviceInfo(i);
   }catch(e){
     const unconfig=/No device configured/.test(e.message);
     if(!unconfig&&LAST_DEVICE_INFO&&INFO_FAILURES===0){
@@ -374,8 +522,10 @@ async function loadInfo(){
     }
     INFO_FAILURES++;
     $("#devinfo").innerHTML=`<span style="color:var(--err)">${unconfig
-      ?"No device configured — click Select Ultimate\u2026 \u2192":esc("offline: "+e.message)}</span>`}
+      ?"No device configured — click Select Ultimate… →":esc("offline: "+e.message)}</span>`;
+  }finally{INFO_IN_FLIGHT=false}
 }
+
 let AUTO_FASTLOAD=false;
 async function loadBootOptions(){
   try{
@@ -532,8 +682,9 @@ async function flushMatrixEvents(){
   }finally{MATRIX_SENDING=false;if(MATRIX_QUEUE.length&&INPUT_STATUS.available)flushMatrixEvents()}
 }
 function matrixReleaseAll(reason="",keepalive=false){
+  const hadState=MATRIX_HELD.size>0||MATRIX_QUEUE.length>0||MATRIX_SENDING;
   MATRIX_HELD.clear();MATRIX_QUEUE=[];
-  if(!INPUT_STATUS.available)return;
+  if(!hadState||!INPUT_STATUS.available)return;
   if(keepalive){
     fetch("/api/input/release_all",{method:"POST",keepalive:true}).catch(()=>{});return;
   }
@@ -565,6 +716,7 @@ function screenshot(){
     setTimeout(()=>URL.revokeObjectURL(a.href),1000);
     toast("screenshot saved ✓","ok")},"image/png")}
 function toggleFullscreen(){
+  if(LINK_STATUS.link_type==="wifi"){toast("Streaming is not available over Wi-Fi; switch to Ethernet for Full Screen","err");return}
   const crt=screenEl.closest(".crt");
   if(document.fullscreenElement)document.exitFullscreen();
   else crt.requestFullscreen().then(()=>screenEl.focus()).catch(e=>toast(e.message,"err"));
@@ -652,6 +804,7 @@ const ctx2d=screenEl.getContext("2d");
 const imgData=ctx2d.createImageData(384,272);
 const px32=new Uint32Array(imgData.data.buffer);
 let wsV=null,frames=0,videoOn=false,videoWanted=false,videoHasFrame=false,videoPlaceholderMessage="VIDEO NOT CONNECTED",achunks=0;
+let VIDEO_NO_FRAME_TIMER=null;
 let wsA=null,actx=null,nextT=0,audioOn=false,audioWanted=false,audioState="off",audioRate=0;
 let audioReconnectTimer=null;
 
@@ -666,6 +819,7 @@ function drawFrame(buf){
   for(let i=0,p=0;i<b.length;i++){const v=b[i];
     px32[p++]=PAL32[v&15];px32[p++]=PAL32[v>>4]}
   ctx2d.putImageData(imgData,0,0);frames++;videoHasFrame=true;
+  clearTimeout(VIDEO_NO_FRAME_TIMER);VIDEO_NO_FRAME_TIMER=null;const streamHint=$("#streamHint");if(streamHint)streamHint.style.display="none";
   screenEl.setAttribute("aria-label","Live C64 screen — click to focus, then keys are sent to the machine");
   // dynamic bezel: the stream includes the VIC border — sample it and let
   // the CSS frame follow (black for demos, strobing for loaders...)
@@ -695,17 +849,18 @@ function drawVideoPlaceholder(message="VIDEO NOT CONNECTED"){
   ctx2d.beginPath();ctx2d.moveTo(174,84);ctx2d.lineTo(210,105);
   ctx2d.moveTo(210,84);ctx2d.lineTo(174,105);ctx2d.stroke();
   ctx2d.textAlign="center";ctx2d.textBaseline="middle";
-  ctx2d.font="bold 18px monospace";ctx2d.fillStyle="#ffffff";
-  ctx2d.fillText(message,192,151);
+  const lines=String(message).split("\n");
+  ctx2d.font=`bold ${lines.length>1?14:18}px monospace`;ctx2d.fillStyle="#ffffff";
+  if(lines.length>1){ctx2d.fillText(lines[0],192,145);ctx2d.fillText(lines[1],192,164)}else ctx2d.fillText(lines[0],192,151);
   ctx2d.font="12px monospace";ctx2d.fillStyle="#b7abff";
   let audioLine="AUDIO OFF";
   if(audioState==="live")audioLine=`AUDIO STILL CONNECTED · ${audioRate}/S`;
   else if(audioState==="connecting")audioLine="AUDIO CONNECTING";
   else if(audioState==="reconnecting")audioLine="AUDIO RECONNECTING";
   else if(audioState==="error")audioLine="AUDIO ERROR";
-  ctx2d.fillText(audioLine,192,178);
+  if(lines.length===1)ctx2d.fillText(audioLine,192,178);
   ctx2d.font="10px monospace";ctx2d.fillStyle="#7770a8";
-  ctx2d.fillText("PRESS START VIDEO TO CONNECT",192,199);
+  if(lines.length===1)ctx2d.fillText("PRESS START VIDEO TO CONNECT",192,199);
   ctx2d.restore();
   videoHasFrame=false;frames=0;$("#fps").textContent="0 fps";$("#fps").classList.remove("on");
   screenEl.setAttribute("aria-label",message.toLowerCase()+" — press Start video to connect");
@@ -727,15 +882,21 @@ function openVideoWS(){
   };
 }
 async function toggleVideo(){
+  if(LINK_STATUS.link_type==="wifi"){toast("Streaming is not available over Wi-Fi. Switch to Ethernet to start video.","err");return}
   if(REC.active&&REC.mode!=="audio"&&videoOn){toast("Stop recording before stopping video","err");return}
-  if(videoOn||videoWanted){videoWanted=false;try{await put("/api/stream/video/stop")}catch(e){}
+  if(videoOn||videoWanted){videoWanted=false;uiInteractiveStart();try{await put("/api/stream/video/stop")}catch(e){}finally{uiInteractiveEnd()}
     if(wsV){const old=wsV;wsV=null;old.close()}videoOn=false;$("#btnVideo").textContent="Start video";
     bezelReset();drawVideoPlaceholder("VIDEO NOT CONNECTED");
     $("#btnVideo").classList.add("primary");return}
   videoWanted=true;drawVideoPlaceholder("VIDEO CONNECTING");
+  uiInteractiveStart();
   try{await put("/api/stream/video/start")}catch(e){videoWanted=false;drawVideoPlaceholder("VIDEO ERROR");toast(e.message,"err");return}
+  finally{uiInteractiveEnd()}
   openVideoWS();
   videoOn=true;$("#btnVideo").textContent="Stop video";$("#btnVideo").classList.remove("primary");
+  clearTimeout(VIDEO_NO_FRAME_TIMER);VIDEO_NO_FRAME_TIMER=setTimeout(()=>{
+    if(videoWanted&&!videoHasFrame&&LINK_STATUS.link_type==="unknown"){const hint=$("#streamHint");if(hint){hint.textContent="No video frames received. If this Ultimate is connected over Wi-Fi, streaming is not supported — use its Ethernet address.";hint.style.display="block"}}
+  },5000);
   screenEl.focus()}
 
 /* ---------- audio ---------- */
@@ -775,9 +936,10 @@ function openAudioWS(reconnecting=false){
   };
 }
 async function toggleAudio(){
+  if(LINK_STATUS.link_type==="wifi"){toast("Streaming is not available over Wi-Fi. Switch to Ethernet to start audio.","err");return}
   if(REC.active&&REC.mode!=="video"&&audioWanted){toast("Stop recording before stopping audio","err");return}
   if(audioWanted){audioWanted=false;clearTimeout(audioReconnectTimer);audioReconnectTimer=null;
-    try{await put("/api/stream/audio/stop")}catch(e){}
+    uiInteractiveStart();try{await put("/api/stream/audio/stop")}catch(e){}finally{uiInteractiveEnd()}
     if(wsA){const old=wsA;wsA=null;old.close()}audioOn=false;achunks=0;nextT=0;setAudioState("off",0);return}
   audioWanted=true;setAudioState("connecting",0);
   try{
@@ -788,7 +950,9 @@ async function toggleAudio(){
   }catch(e){audioWanted=false;audioOn=false;setAudioState("error",0);toast(e.message,"err");return}
   if(actx.state!=="running")
     toast("Browser blocked audio playback (AudioContext: "+actx.state+")","err");
+  uiInteractiveStart();
   try{await put("/api/stream/audio/start")}catch(e){audioWanted=false;audioOn=false;setAudioState("error",0);toast(e.message,"err");return}
+  finally{uiInteractiveEnd()}
   audioOn=true;openAudioWS(false)}
 
 /* ---------- flexible video / audio recording ---------- */
@@ -933,6 +1097,7 @@ async function saveRecordingBlob(blob){
   document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);return filename;
 }
 async function startRecording(){
+  if(LINK_STATUS.link_type==="wifi"){toast("Recording requires video or audio streaming and is not available over Wi-Fi","err");return}
   const cfg=recSettings();saveRecSettings();REC.mode=cfg.mode;
   if(typeof MediaRecorder==="undefined"){toast("This browser cannot record media","err");return}
   if(cfg.mode!=="audio"&&!screenEl.captureStream){toast("This browser cannot record canvas video","err");return}
@@ -983,6 +1148,7 @@ window.addEventListener("beforeunload",e=>{if(REC.active){e.preventDefault();e.r
 /* ---------- device file system ---------- */
 let DEFAULT_MOUNT_MODE="unlinked";
 let DRIVE_STATE={a:{},b:{}};
+let DRIVE_STATUS_RETRY_TIMER=null;
 function mountMode(){return $("#mountModeDefault")?.value||DEFAULT_MOUNT_MODE||"unlinked"}
 function mountModeShort(mode=mountMode()){return mode==="readonly"?"RO":mode==="readwrite"?"RW":"UNLINKED"}
 function mountModeLong(mode=mountMode()){return mode==="readonly"?"Read-only":mode==="readwrite"?"Read/write":"Unlinked — temporary writes"}
@@ -1382,12 +1548,14 @@ async function mountRunDevice(path){
   if(!allowReplaceDrive("a"))return;
   const mode=mountMode();
   toast("mounting + booting…","ok");
+  beginMountRunStatusWatch();
   try{const r=await put(`/api/mount/run/device?drive=a&mode=${mode}&image=${encodeURIComponent(path)}`);
     toast((r.typed||"booted")+" ✓","ok");
     showSwapDecision(r.swap_decision);
     rememberRecent(itemSpec("disk",path.split("/").pop()||path,path,"disk_run",{path}));
     refreshDrives();tab("screen");screenEl.focus()}
-  catch(e){toast(e.message,"err")}}
+  catch(e){toast(e.message,"err")}
+  finally{finishMountRunStatusWatch()}}
 async function localMountRun(){
   if(!allowReplaceDrive("a"))return;
   const f=$("#localfile").files[0];if(!f){toast("choose a file first","err");return}
@@ -1395,9 +1563,11 @@ async function localMountRun(){
   const fd=new FormData();fd.append("file",f);fd.append("drive","a");
   fd.append("mode",$("#localmode").value);
   toast("uploading + booting…","ok");
+  beginMountRunStatusWatch();
   try{const r=await api("/api/mount/run/upload",{method:"POST",body:fd});
     toast((r.typed||"booted")+" ✓","ok");refreshDrives();tab("screen");screenEl.focus()}
-  catch(e){toast(e.message,"err")}}
+  catch(e){toast(e.message,"err")}
+  finally{finishMountRunStatusWatch()}}
 async function mountDevice(path,drive){
   if(!allowReplaceDrive(drive))return;
   const mode=mountMode();
@@ -1414,6 +1584,31 @@ function driveImageName(state){
   const raw=state.image_file||state.path||state.name||"";
   return raw?String(raw).split("/").pop():"";
 }
+function driveStatusLine(k,state){
+  const name=driveImageName(state),mode=state.mode||state.reported_mode||"";
+  const type=state.enabled?(state.type?`${state.type}${state.bus_id!=null?" #"+state.bus_id:""}`:"Mounted"):"Off";
+  const badge=mode?` <span class="mount-badge ${esc(mode)}">${mountModeShort(mode)}</span> <span class="hint">${esc(mountModeLong(mode))}</span>`:"";
+  return `<b>Drive ${k.toUpperCase()}</b> · ${esc(type)}${badge}${name?" · "+esc(name):""}`;
+}
+function renderDrivePanel(note=""){
+  const lines=["a","b"].map(k=>driveStatusLine(k,DRIVE_STATE[k]||{}));
+  if(note)lines.push(`<span class="drive-busy-note">${esc(note)}</span>`);
+  $("#drivestat").innerHTML=lines.join("<br>");
+  renderDriveSummaries();
+}
+function applyBusyMountSnapshot(mounts){
+  if(!mounts||typeof mounts!=="object")return;
+  let changed=false;
+  for(const k of ["a","b"]){
+    const mount=mounts[k];
+    if(!mount||typeof mount!=="object"||!Object.keys(mount).length)continue;
+    const previous=DRIVE_STATE[k]||{};
+    DRIVE_STATE[k]={...previous,...mount,enabled:true,
+      image_file:mount.path||mount.name||previous.image_file||"",provisional:true};
+    changed=true;
+  }
+  if(changed)renderDrivePanel("Loading program — device status will refresh when complete.");
+}
 function renderDriveSummaries(){
   const parts=["a","b"].map(k=>{
     const state=DRIVE_STATE[k]||{},name=driveImageName(state);
@@ -1429,24 +1624,45 @@ function jumpToMountedDrives(){
   requestAnimationFrame(()=>$("#mountedDrivesPanel")?.scrollIntoView({behavior:"smooth",block:"start"}));
 }
 async function refreshDrives(){
+  if(DISCOVERY_SCAN_ACTIVE||uiInteractive()||DRIVES_IN_FLIGHT)return;
+  DRIVES_IN_FLIGHT=true;
   try{const r=await api("/api/drives");
-    const bits=[];DRIVE_STATE={a:{enabled:false},b:{enabled:false}};
+    if(r?.u64deck_discovery_busy||r?.u64deck_operation_busy){
+      const retry=Math.max(500,Number(r.u64deck_retry_ms)||1000);
+      if(DRIVE_STATUS_RETRY_TIMER)clearTimeout(DRIVE_STATUS_RETRY_TIMER);
+      DRIVE_STATUS_RETRY_TIMER=setTimeout(()=>{DRIVE_STATUS_RETRY_TIMER=null;refreshDrives()},retry);
+      return;
+    }
+    if(DRIVE_STATUS_RETRY_TIMER){clearTimeout(DRIVE_STATUS_RETRY_TIMER);DRIVE_STATUS_RETRY_TIMER=null}
+    if(r?.u64deck_busy){
+      MOUNT_RUN_BUSY=true;applyBusyMountSnapshot(r.u64deck_mounts);
+      return;
+    }
+    if(r?.u64deck_drives_unavailable){
+      MOUNT_RUN_BUSY=false;applyBusyMountSnapshot(r.u64deck_mounts);
+      renderDrivePanel(r.u64deck_drives_message||"Drive status temporarily unavailable — retrying…");
+      const retry=Math.max(500,Number(r.u64deck_retry_ms)||1000);
+      DRIVE_STATUS_RETRY_TIMER=setTimeout(()=>{DRIVE_STATUS_RETRY_TIMER=null;refreshDrives()},retry);
+      return;
+    }
+    MOUNT_RUN_BUSY=false;DRIVE_STATE={a:{enabled:false},b:{enabled:false}};
     for(const d of (r.drives||[])){for(const k of ["a","b"]){if(d[k]){
       const v=d[k],m=v.u64deck_mount||{},mode=m.mode||v.mode||v.mount_mode||"";
       DRIVE_STATE[k]={...m,enabled:!!v.enabled,type:v.type||"",bus_id:v.bus_id,
         image_file:v.image_file||v.image_path||"",reported_mode:v.mode||v.mount_mode||"",mode};
-      const full=mode?mountModeLong(mode):"";
-      const badge=mode?` <span class="mount-badge ${esc(mode)}">${mountModeShort(mode)}</span> <span class="hint">${esc(full)}</span>`:"";
-      const image=v.image_file||v.image_path||m.path||m.name||"";
-      bits.push(`<b>Drive ${k.toUpperCase()}</b> · ${v.enabled?v.type+" #"+v.bus_id:"Off"}${badge}${image?" · "+esc(image):""}`)}}}
-    $("#drivestat").innerHTML=bits.join("<br>")||"–";
-    renderDriveSummaries();
+      }}}
+    renderDrivePanel();
     await swapRefresh();
     if(r.swap_reconstructed)showSwapDecision(r.swap_decision,true);
   }catch(e){
+    if(MOUNT_RUN_BUSY){
+      renderDrivePanel("Loading program — device status will refresh when complete.");
+      return;
+    }
     $("#drivestat").textContent=e.message;
     document.querySelectorAll(".drive-summary-content").forEach(el=>el.textContent="Drive status unavailable: "+e.message);
-  }}
+  }finally{DRIVES_IN_FLIGHT=false}
+}
 async function driveAct(d,a){
   if(a==="remove"&&DRIVE_STATE[d]?.mode==="unlinked"&&!confirm(`Drive ${d.toUpperCase()} is mounted UNLINKED. Removing it discards temporary writes. Continue?`))return;
   try{await put(`/api/drives/${d}/${a}`);refreshDrives()}catch(e){toast(e.message,"err")}
@@ -1869,6 +2085,7 @@ function asmDeployEncoded(item,filename,action){
 async function asmDeploy(item,filename,action){
   const e=ASM.current;if(!e)return;
   toast((action==="inspect"?"Downloading ":"Deploying ")+filename+"…","ok");
+  if(action==="mount_run")beginMountRunStatusWatch();
   try{
     const r=await api("/api/asm64/deploy",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({id:e.id,category:e.category??0,item,filename,action})});
@@ -1876,7 +2093,8 @@ async function asmDeploy(item,filename,action){
     else toast(asmActionLabel(action)+" ✓","ok");
     rememberRecent(itemSpec("assembly64",e.name||filename,[e.group,e.handle].filter(Boolean).join(" · "),"assembly_open",{entry:e}));
     if(action.startsWith("mount"))refreshDrives();
-  }catch(e2){toast(e2.message,"err")}}
+  }catch(e2){toast(e2.message,"err")}
+  finally{if(action==="mount_run")finishMountRunStatusWatch()}}
 
 /* ---------- disk swap ---------- */
 let swapBusy=false;

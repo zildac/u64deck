@@ -42,6 +42,11 @@ class UltimateREST:
         self.coordinator = coordinator
         self.base = f"http://{host}"
         self._timeout = timeout
+        # The backend can be replaced while browser status polling is active.
+        # Protect the httpx client for the full duration of each request so a
+        # timeout reconfiguration or device switch cannot close it mid-call.
+        self._client_lock = threading.RLock()
+        self._closed = False
         self._headers = {}
         if password:
             self._headers["X-Password"] = password
@@ -52,8 +57,45 @@ class UltimateREST:
         coordinator = getattr(self, "coordinator", None)
         return coordinator.operation("interactive", reason) if coordinator else nullcontext()
 
+    def _lifecycle_lock(self):
+        """Return the per-client lifecycle lock, including test-built clients."""
+        lock = getattr(self, "_client_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._client_lock = lock
+        return lock
+
+    @contextmanager
+    def _client_access(self):
+        """Lease the current httpx client until one request has completed."""
+        with self._lifecycle_lock():
+            if getattr(self, "_closed", False):
+                raise RuntimeError("Ultimate REST client is closed")
+            yield self.client
+
     def close(self):
-        self.client.close()
+        with self._lifecycle_lock():
+            if getattr(self, "_closed", False):
+                return
+            self._closed = True
+            self.client.close()
+
+    def set_timeout(self, timeout: float) -> None:
+        """Apply a new default timeout without retaining a stale client pool."""
+        value = max(1.0, float(timeout))
+        with self._lifecycle_lock():
+            if getattr(self, "_closed", False):
+                return
+            if abs(value - float(self._timeout)) < 0.001:
+                return
+            old = self.client
+            self._timeout = value
+            self.client = httpx.Client(
+                base_url=self.base, timeout=self._timeout, headers=self._headers)
+            try:
+                old.close()
+            except Exception:
+                pass
 
     def _check(self, r: httpx.Response):
         if r.status_code == 403:
@@ -71,17 +113,18 @@ class UltimateREST:
         client guarantees that the retry does not reuse the damaged keep-alive
         connection.  Mutating PUT/POST requests are deliberately not retried.
         """
-        try:
-            return self.client.get(path, params=params)
-        except httpx.TransportError as first_error:
-            time.sleep(0.12)
+        with self._client_access() as client:
             try:
-                with httpx.Client(
-                        base_url=self.base, timeout=self._timeout,
-                        headers=self._headers) as retry_client:
-                    return retry_client.get(path, params=params)
-            except httpx.TransportError as retry_error:
-                raise retry_error from first_error
+                return client.get(path, params=params)
+            except httpx.TransportError as first_error:
+                time.sleep(0.12)
+                try:
+                    with httpx.Client(
+                            base_url=self.base, timeout=self._timeout,
+                            headers=self._headers) as retry_client:
+                        return retry_client.get(path, params=params)
+                except httpx.TransportError as retry_error:
+                    raise retry_error from first_error
 
     def get_json(self, path: str, **params):
         with self._operation(f"REST GET {path}"):
@@ -91,12 +134,61 @@ class UltimateREST:
             except ValueError:
                 return {"raw": r.text}
 
+    def read_memory(self, address: str | int, length: int = 1) -> bytes | None:
+        """Read C64 memory via ``/v1/machine:readmem``.
+
+        The firmware returns a raw binary attachment. ``None`` means the
+        connected firmware does not expose the endpoint (HTTP 404), allowing
+        callers to retain their legacy behaviour. JSON responses are decoded
+        defensively for patched or development firmware variants.
+        """
+        if isinstance(address, int):
+            address_text = f"{address & 0xFFFF:04X}"
+        else:
+            address_text = str(address or "").strip().upper()
+            if address_text.startswith("$"):
+                address_text = address_text[1:]
+            elif address_text.startswith("0X"):
+                address_text = address_text[2:]
+        if not address_text:
+            raise ValueError("address is required")
+        read_length = max(1, int(length))
+
+        with self._operation(f"REST readmem {address_text}"):
+            r = self._safe_get(
+                "/v1/machine:readmem",
+                params={"address": address_text, "length": str(read_length)},
+            )
+            if r.status_code == 404:
+                return None
+            self._check(r)
+            ctype = (r.headers.get("content-type") or "").casefold()
+            if "json" not in ctype:
+                return r.content
+            try:
+                payload = r.json()
+            except ValueError:
+                return r.content
+            data = payload.get("data") if isinstance(payload, dict) else payload
+            if isinstance(data, list):
+                try:
+                    return bytes(int(item) & 0xFF for item in data)
+                except (TypeError, ValueError):
+                    return r.content
+            if isinstance(data, str):
+                try:
+                    return bytes.fromhex(data.replace(" ", ""))
+                except ValueError:
+                    return r.content
+            return r.content
+
     def put(self, path: str, *, request_timeout: float | None = None, **params):
         with self._operation(f"REST PUT {path}"):
             kwargs = {"params": params or None}
             if request_timeout is not None:
                 kwargs["timeout"] = request_timeout
-            r = self._check(self.client.put(path, **kwargs))
+            with self._client_access() as client:
+                r = self._check(client.put(path, **kwargs))
             try:
                 return r.json()
             except ValueError:
@@ -104,13 +196,16 @@ class UltimateREST:
 
     def post_json(self, path: str, payload):
         with self._operation(f"REST POST {path}"):
-            r = self._check(self.client.post(path, json=payload))
+            with self._client_access() as client:
+                r = self._check(client.post(path, json=payload))
             return r.json()
 
     def post_file(self, path: str, filename: str, data: bytes, **params):
         with self._operation(f"REST upload {path}"):
             files = {"file": (filename, data, "application/octet-stream")}
-            r = self._check(self.client.post(path, params=params or None, files=files))
+            with self._client_access() as client:
+                r = self._check(client.post(
+                    path, params=params or None, files=files))
             try:
                 return r.json()
             except ValueError:
@@ -137,9 +232,10 @@ class UltimateREST:
                     "file",
                     (songlengths_filename, songlengths, "application/octet-stream"),
                 ))
-            r = self._check(self.client.post(
-                "/v1/runners:sidplay", params=params or None, files=files
-            ))
+            with self._client_access() as client:
+                r = self._check(client.post(
+                    "/v1/runners:sidplay", params=params or None, files=files
+                ))
             try:
                 return r.json()
             except ValueError:
@@ -148,6 +244,24 @@ class UltimateREST:
     # convenience wrappers ----------------------------------------------
     def info(self):
         return self.get_json("/v1/info")
+
+    def probe_info(self, request_timeout: float = 1.5):
+        """Probe ``/v1/info`` with a short one-shot connection.
+
+        A machine reboot can briefly drop or recycle the Ultimate's HTTP
+        listener.  Mount & Run uses this bounded probe while waiting for the
+        device to return, avoiding the normal long REST timeout on each poll
+        and avoiding reuse of a connection that existed before the reboot.
+        """
+        timeout = max(0.2, float(request_timeout))
+        with self._operation("REST probe /v1/info"):
+            with httpx.Client(base_url=self.base, timeout=timeout,
+                              headers=self._headers) as probe_client:
+                r = self._check(probe_client.get("/v1/info"))
+            try:
+                return r.json()
+            except ValueError:
+                return {"raw": r.text}
 
     def probe_machine_input(self):
         """Probe the firmware's CIA1 keyboard/joystick input endpoint.
@@ -263,6 +377,25 @@ class CommandSocket:
         and stream commands.
         """
         self._send(CMD_RESET)
+
+    def reset_fresh(self):
+        """Reset using a newly established port-64 connection.
+
+        An idle persistent TCP connection can become half-closed without the
+        next local ``sendall`` failing immediately. Jukebox Stop uses this path
+        so a successful return means the reset was written to a fresh socket,
+        rather than merely queued against stale connection state.
+        """
+        packet = struct.pack("<HH", CMD_RESET, 0)
+        with self._lock:
+            self.close_nolock()
+            try:
+                self._ensure()
+                self._sock.sendall(packet)
+            except OSError as exc:
+                self.close_nolock()
+                raise UltimateError(
+                    f"cannot reach command socket {self.host}:{self.port}") from exc
 
     def type_petscii(self, data: bytes, chunk: int = 8, delay: float = 0.02):
         """Inject PETSCII bytes into the KERNAL keyboard buffer in order.

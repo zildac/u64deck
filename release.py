@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-VERSION = "1.8.0"
-RELEASE_LABEL = "Public Beta 10.4"
+VERSION = "1.9.0"
+RELEASE_LABEL = "Release Candidate 13"
 
 
 def build_id(asset_root: Path, source_root: Path) -> str:
