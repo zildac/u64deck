@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.9.0 — Release Candidate 18
+
+- Fixed the confirmed Windows frozen-executable lifecycle issue where **Exit
+  u64deck** closed the dedicated Edge app but could leave `u64deck.exe` and its
+  console resident. The frozen build now waits for normal Uvicorn lifespan
+  cleanup and then retires the process explicitly through a bounded watchdog.
+- Added a canonical multi-resolution `u64deck.ico` and embedded it into the
+  PyInstaller executable instead of building with `icon=None`.
+- Updated `start.bat` so a normal source shutdown returns cleanly without an
+  unconditional `Press any key to continue`; genuine non-zero exits remain
+  visible for troubleshooting.
+- Strengthened the Windows workflow to verify PE icon resources and exercise
+  the normal dedicated Edge app path, confirming the HTTP exit response,
+  Edge-profile process closure, EXE termination and zero exit status.
+- Retained RC17's loopback/header protections, response-before-shutdown order
+  and graceful resource cleanup. No Finder, routing, Mount & Run, SID,
+  streaming, storage, settings or device-control behaviour changed.
+
 ## 1.9.0 — Release Candidate 17
 
 - Added a confirmed **Exit u64deck** action in the main header. It stops the
@@ -16,6 +34,7 @@
   screenshots or gallery ordering.
 - No discovery, connection, Mount & Run, SID, streaming, storage, settings or
   device-control behaviour changed from RC16.
+
 
 ## 1.9.0 — Release Candidate 16
 

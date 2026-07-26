@@ -26,7 +26,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt pyinstaller
+          pip install -r requirements-dev.txt pyinstaller pefile
 
       - name: Run tests
         run: pytest -q
@@ -38,12 +38,31 @@ jobs:
       - name: Build
         run: pyinstaller u64deck.spec
 
-      - name: Smoke test the exe
+      - name: Verify embedded executable icon
         shell: pwsh
         run: |
-          $p = Start-Process -FilePath "dist/u64deck.exe" -ArgumentList "--no-browser","--u64","203.0.113.9" -PassThru
+          @'
+          import pefile
+          pe = pefile.PE("dist/u64deck.exe")
+          types = set()
+          root = getattr(pe, "DIRECTORY_ENTRY_RESOURCE", None)
+          if root:
+              for entry in root.entries:
+                  if entry.id is not None:
+                      types.add(entry.id)
+          assert 3 in types, "RT_ICON resource is missing"
+          assert 14 in types, "RT_GROUP_ICON resource is missing"
+          print("embedded icon resources OK")
+          '@ | python -
+
+      - name: Smoke test normal Edge app exit
+        shell: pwsh
+        run: |
+          $profileNeedle = "u64deck\EdgeProfile"
+          $p = Start-Process -FilePath "dist/u64deck.exe" -ArgumentList "--u64","203.0.113.9" -PassThru
           $ready = $false
-          $deadline = (Get-Date).AddSeconds(30)
+          $edgeStarted = $false
+          $deadline = (Get-Date).AddSeconds(35)
           try {
             do {
               Start-Sleep -Milliseconds 500
@@ -57,25 +76,36 @@ jobs:
               } catch {
                 # Server may still be starting; retry until the deadline.
               }
-            } while (-not $ready -and (Get-Date) -lt $deadline)
+              $edgeStarted = [bool](Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
+                Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profileNeedle) })
+            } while ((-not $ready -or -not $edgeStarted) -and (Get-Date) -lt $deadline)
 
-            if (-not $ready) { throw "UI did not serve within 30 seconds" }
+            if (-not $ready) { throw "UI did not serve within 35 seconds" }
+            if (-not $edgeStarted) { throw "dedicated Edge app process was not observed" }
 
             $exit = Invoke-WebRequest -Uri "http://127.0.0.1:8064/api/app/exit" `
               -Method Post -Headers @{"X-U64deck-Local-Exit"="1"} `
               -UseBasicParsing -TimeoutSec 5
             if ($exit.StatusCode -ne 200) { throw "Exit endpoint returned $($exit.StatusCode)" }
 
-            $exitDeadline = (Get-Date).AddSeconds(15)
+            $exitDeadline = (Get-Date).AddSeconds(20)
             do {
               Start-Sleep -Milliseconds 250
               $p.Refresh()
-            } while (-not $p.HasExited -and (Get-Date) -lt $exitDeadline)
-            if (-not $p.HasExited) { throw "u64deck.exe did not stop after local Exit request" }
-            Write-Host "exe startup and graceful-exit smoke test OK"
+              $edgeRemaining = [bool](Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
+                Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profileNeedle) })
+            } while ((-not $p.HasExited -or $edgeRemaining) -and (Get-Date) -lt $exitDeadline)
+
+            if (-not $p.HasExited) { throw "u64deck.exe and its console remained after Exit u64deck" }
+            if ($edgeRemaining) { throw "dedicated Edge app process remained after Exit u64deck" }
+            if ($p.ExitCode -ne 0) { throw "u64deck.exe exited with code $($p.ExitCode)" }
+            Write-Host "normal Edge app, graceful cleanup, EXE exit and console retirement OK"
           } finally {
             $p.Refresh()
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+            Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
+              Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profileNeedle) } |
+              ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
           }
 
       - name: Upload artifact

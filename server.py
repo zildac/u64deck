@@ -378,6 +378,7 @@ CFG["browser_startup"] = _normalise_browser_startup(CFG.get("browser_startup"))
 _UVICORN_SERVER: uvicorn.Server | None = None
 _BROWSER_PROCESS: subprocess.Popen | None = None
 _APP_EXIT_REQUESTED = threading.Event()
+_APP_EXIT_CLEANUP_COMPLETE = threading.Event()
 _LOCAL_EXIT_HEADER = "X-U64deck-Local-Exit"
 
 
@@ -391,8 +392,15 @@ def _client_is_loopback(host: str | None) -> bool:
         return value.lower() == "localhost"
 
 
-def _schedule_app_exit(delay: float = 0.20) -> threading.Thread:
-    """Ask uvicorn to stop after the HTTP response has been returned."""
+def _schedule_app_exit(delay: float = 0.20, frozen_exit_timeout: float = 15.0) -> threading.Thread:
+    """Return the HTTP response, stop uvicorn, then retire a frozen EXE.
+
+    A normal source run exits naturally once ``Server.run()`` returns.  A
+    PyInstaller console build can remain resident after uvicorn has completed,
+    so the frozen build uses a bounded watchdog which waits for the lifespan
+    cleanup marker before terminating the process explicitly.  This preserves
+    graceful cleanup while guaranteeing that Windows removes the EXE console.
+    """
     def worker():
         time.sleep(max(0.0, delay))
         running = _UVICORN_SERVER
@@ -401,7 +409,19 @@ def _schedule_app_exit(delay: float = 0.20) -> threading.Thread:
             return
         running.should_exit = True
 
-    thread = threading.Thread(target=worker, daemon=True, name="app-exit")
+        if not FROZEN:
+            return
+
+        cleaned = _APP_EXIT_CLEANUP_COMPLETE.wait(timeout=max(1.0, frozen_exit_timeout))
+        if not cleaned:
+            _warn_event("app-exit-timeout", "graceful cleanup did not finish before the frozen-exit deadline")
+        # The response has already been returned and cleanup has either
+        # completed or exceeded its bounded deadline. os._exit avoids a
+        # lingering PyInstaller console caused by third-party shutdown state.
+        time.sleep(0.15)
+        os._exit(0 if cleaned else 1)
+
+    thread = threading.Thread(target=worker, daemon=not FROZEN, name="app-exit")
     thread.start()
     return thread
 
@@ -1333,36 +1353,39 @@ def api_connect(payload: dict = Body(...)):
 # --- basic / machine ----------------------------------------------------
 
 def _clean_shutdown():
-    _juke_cancel_timer()
-    _matrix_release_all(silent=True, cached_only=True, caller="shutdown")
-    global _INDEX_STORE, _INDEX_STORE_PATH, _INDEX_THREAD
-    if INDEXJOB.get("running"):
-        INDEXJOB["stop"] = True
-        DEVICE_OP.set_background_paused(False)
-        DEVICE_OP.wake()
-        if _INDEX_THREAD and _INDEX_THREAD.is_alive():
-            _INDEX_THREAD.join(timeout=2.0)
-    if _INDEX_STORE is not None:
-        try:
-            _INDEX_STORE.close()
-        except Exception:
-            pass
-        _INDEX_STORE = None
-        _INDEX_STORE_PATH = ""
-    for resource in (cmd, rest, video, audio):
-        try:
-            if resource:
-                resource.close() if hasattr(resource, "close") else resource.stop()
-        except Exception:
-            pass
-    for receiver in (video, audio):
-        try:
-            if receiver and receiver.is_alive():
-                receiver.join(timeout=1.5)
-        except Exception:
-            pass
-    if _APP_EXIT_REQUESTED.is_set():
-        _close_launched_edge_app()
+    try:
+        _juke_cancel_timer()
+        _matrix_release_all(silent=True, cached_only=True, caller="shutdown")
+        global _INDEX_STORE, _INDEX_STORE_PATH, _INDEX_THREAD
+        if INDEXJOB.get("running"):
+            INDEXJOB["stop"] = True
+            DEVICE_OP.set_background_paused(False)
+            DEVICE_OP.wake()
+            if _INDEX_THREAD and _INDEX_THREAD.is_alive():
+                _INDEX_THREAD.join(timeout=2.0)
+        if _INDEX_STORE is not None:
+            try:
+                _INDEX_STORE.close()
+            except Exception:
+                pass
+            _INDEX_STORE = None
+            _INDEX_STORE_PATH = ""
+        for resource in (cmd, rest, video, audio):
+            try:
+                if resource:
+                    resource.close() if hasattr(resource, "close") else resource.stop()
+            except Exception:
+                pass
+        for receiver in (video, audio):
+            try:
+                if receiver and receiver.is_alive():
+                    receiver.join(timeout=1.5)
+            except Exception:
+                pass
+    finally:
+        if _APP_EXIT_REQUESTED.is_set():
+            _close_launched_edge_app()
+            _APP_EXIT_CLEANUP_COMPLETE.set()
 
 
 @app.get("/api/app_config")
@@ -1387,6 +1410,7 @@ def app_exit(request: Request):
     first_request = not _APP_EXIT_REQUESTED.is_set()
     _APP_EXIT_REQUESTED.set()
     if first_request:
+        _APP_EXIT_CLEANUP_COMPLETE.clear()
         _diag_event("info", "Exit requested from the local u64deck UI")
         _schedule_app_exit()
     return {

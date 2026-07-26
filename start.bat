@@ -12,4 +12,10 @@ if "%~1"=="" (
 ) else (
   python server.py --u64 %1
 )
-pause
+set "rc=%errorlevel%"
+if not "%rc%"=="0" (
+  echo.
+  echo u64deck exited with error code %rc%.
+  pause
+)
+exit /b %rc%

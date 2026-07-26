@@ -30,7 +30,7 @@ when testing the Ethernet REST endpoint itself.
 
 # u64deck
 
-**v1.9.0 — Release Candidate 17**
+**v1.9.0 — Release Candidate 18**
 
 
 A lightweight, self-hosted control deck for the **Ultimate 64** (and, minus the
@@ -175,7 +175,7 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
 
 Download `u64deck.exe` from <https://github.com/zildac/u64deck/releases/latest>, put it in a folder of its own, double-click it, open http://localhost:8064 and hit **Select Ultimate…** in the header — it sweeps your local subnet(s) and lists every Ultimate it finds; click **Use** to connect. No IP required.
 
-The executable is fully self-contained and needs no Python installation. It creates and uses `config.json` and the SQLite index beside itself, exactly like the source version. Windows SmartScreen may warn on first run of an unsigned exe; the release page publishes the file's SHA-256 for verification.
+The executable is fully self-contained and needs no Python installation. It creates and uses `config.json` and the SQLite index beside itself, exactly like the source version. Use **Exit u64deck** in the top bar to close the dedicated Edge app, stop the server and remove the executable's console cleanly; the connected Ultimate continues running. Windows SmartScreen may warn on first run of an unsigned exe; the release page publishes the file's SHA-256 for verification.
 
 ### Tier 2 — Windows from source
 
@@ -456,13 +456,15 @@ The repo includes a PyInstaller spec and a GitHub Actions workflow
 1. Push this folder to a GitHub repo.
 2. The **build-exe** action runs on every push — grab `u64deck.exe` from the
    workflow's artifacts (Actions tab → latest run → *u64deck-windows*).
-3. Tag a release (`git tag v1.9.0-rc.17 && git push --tags`) and the exe is attached
+3. Tag a release (`git tag v1.9.0-rc.18 && git push --tags`) and the exe is attached
    to the GitHub Release automatically.
 
-Double-click the exe: it starts the server, opens your browser, and you hit
-**Select Ultimate…**. A `config.json` placed next to the exe is picked up for
-passwords/ports. (The workflow smoke-tests each build — starts the exe and
-checks the UI serves — before publishing.) To build locally instead:
+Double-click the exe: it starts the server, opens the dedicated Edge app, and
+you hit **Select Ultimate…**. A `config.json` placed next to the exe is picked
+up for passwords/ports. **Exit u64deck** closes that app, completes the normal
+server cleanup and retires the EXE console. The workflow verifies the embedded
+icon and exercises this full launch/exit path before publishing. To build
+locally instead:
 `pip install pyinstaller && pyinstaller u64deck.spec` → `dist/u64deck.exe`.
 
 Note: unsigned PyInstaller exes sometimes trip SmartScreen/AV heuristics —

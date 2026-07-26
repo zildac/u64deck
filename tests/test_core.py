@@ -1387,7 +1387,7 @@ def test_frontend_is_split_without_a_build_tool():
 def test_release_metadata_is_centralised():
     import release
     assert server.VERSION == release.VERSION == "1.9.0"
-    assert release.RELEASE_LABEL == "Release Candidate 17"
+    assert release.RELEASE_LABEL == "Release Candidate 18"
     assert server.BUILD == release.build_id(server.ASSETS, Path(server.__file__).parent)
 
 
@@ -2350,7 +2350,7 @@ def test_release_help_and_now_playing_star_are_present():
     assert "jkToggleNowFavourite" in js
     assert ".u64deck-index.sqlite3" in help_js
     assert "star beside the playback controls" in help_js
-    assert "v1.9.0 — Release Candidate 17" in readme
+    assert "v1.9.0 — Release Candidate 18" in readme
     assert ".u64deck-index.sqlite3" in readme
     assert "Install every release into a **new, empty folder**" in readme
     assert "Do not copy `*-wal`" in readme
@@ -5727,7 +5727,7 @@ def test_rc15_stream_control_no_longer_releases_matrix_on_stop():
 
 
 
-# --- v1.9.0 Release Candidate 17: local graceful exit ---
+# --- v1.9.0 Release Candidate 18: local graceful exit ---
 
 def test_rc17_exit_ui_and_help_are_present():
     static = Path(server.ASSETS) / "static"
@@ -5811,6 +5811,103 @@ def test_rc17_managed_server_exit_and_dedicated_edge_cleanup(monkeypatch):
     finally:
         server._UVICORN_SERVER = previous_server
         server._BROWSER_PROCESS = previous_process
+
+
+def test_rc18_frozen_exit_waits_for_cleanup_and_retires_process(monkeypatch):
+    class DummyServer:
+        should_exit = False
+
+    dummy_server = DummyServer()
+    previous_server = server._UVICORN_SERVER
+    previous_frozen = server.FROZEN
+    exits = []
+    server._UVICORN_SERVER = dummy_server
+    server.FROZEN = True
+    server._APP_EXIT_CLEANUP_COMPLETE.set()
+    monkeypatch.setattr(server.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(server.os, "_exit", lambda code: exits.append(code))
+    try:
+        thread = server._schedule_app_exit(frozen_exit_timeout=1.0)
+        assert thread.daemon is False
+        thread.join(timeout=1.0)
+        assert dummy_server.should_exit is True
+        assert exits == [0]
+    finally:
+        server._UVICORN_SERVER = previous_server
+        server.FROZEN = previous_frozen
+        server._APP_EXIT_CLEANUP_COMPLETE.clear()
+
+
+def test_rc18_cleanup_marks_completion_and_closes_owned_edge(monkeypatch):
+    closed = []
+    previous_requested = server._APP_EXIT_REQUESTED.is_set()
+    previous_store = server._INDEX_STORE
+    previous_store_path = server._INDEX_STORE_PATH
+    previous_thread = server._INDEX_THREAD
+    previous_running = server.INDEXJOB.get("running")
+    previous_resources = (server.cmd, server.rest, server.video, server.audio)
+    server._APP_EXIT_REQUESTED.set()
+    server._APP_EXIT_CLEANUP_COMPLETE.clear()
+    server._INDEX_STORE = None
+    server._INDEX_STORE_PATH = ""
+    server._INDEX_THREAD = None
+    server.INDEXJOB["running"] = False
+    server.cmd = server.rest = server.video = server.audio = None
+    monkeypatch.setattr(server, "_juke_cancel_timer", lambda: None)
+    monkeypatch.setattr(server, "_matrix_release_all", lambda **_kwargs: None)
+    monkeypatch.setattr(server, "_close_launched_edge_app", lambda: closed.append(True))
+    try:
+        server._clean_shutdown()
+        assert server._APP_EXIT_CLEANUP_COMPLETE.is_set()
+        assert closed == [True]
+    finally:
+        if not previous_requested:
+            server._APP_EXIT_REQUESTED.clear()
+        server._APP_EXIT_CLEANUP_COMPLETE.clear()
+        server._INDEX_STORE = previous_store
+        server._INDEX_STORE_PATH = previous_store_path
+        server._INDEX_THREAD = previous_thread
+        server.INDEXJOB["running"] = previous_running
+        server.cmd, server.rest, server.video, server.audio = previous_resources
+
+
+def test_rc18_executable_icon_and_launcher_exit_contract():
+    root = Path(server.ROOT)
+    icon = root / "u64deck.ico"
+    assert icon.is_file()
+    data = icon.read_bytes()
+    assert data[:4] == b"\x00\x00\x01\x00"
+    count = int.from_bytes(data[4:6], "little")
+    assert count == 6
+    sizes = []
+    for entry in range(count):
+        offset = 6 + (entry * 16)
+        width = data[offset] or 256
+        height = data[offset + 1] or 256
+        sizes.append((width, height))
+    assert sizes == [(16, 16), (32, 32), (48, 48),
+                     (64, 64), (128, 128), (256, 256)]
+
+    spec = (root / "u64deck.spec").read_text(encoding="utf-8")
+    assert 'icon="u64deck.ico"' in spec
+    assert "icon=None" not in spec
+
+    launcher = (root / "start.bat").read_text(encoding="utf-8").lower()
+    assert 'set "rc=%errorlevel%"' in launcher
+    assert 'if not "%rc%"=="0"' in launcher
+    assert launcher.rstrip().endswith("exit /b %rc%")
+    assert "\npause\n" not in launcher
+
+
+def test_rc18_windows_workflow_exercises_icon_and_normal_edge_exit():
+    workflow = (Path(server.ROOT) / ".github" / "workflows" / "build-exe.yml").read_text(encoding="utf-8")
+    assert "Verify embedded executable icon" in workflow
+    assert "RT_GROUP_ICON resource is missing" in workflow
+    assert "Smoke test normal Edge app exit" in workflow
+    assert 'ArgumentList "--u64","203.0.113.9"' in workflow
+    assert '"--no-browser"' not in workflow
+    assert "u64deck.exe and its console remained" in workflow
+    assert "dedicated Edge app process remained" in workflow
 
 
 def test_rc17_readme_carries_canonical_dual_interface_warnings_verbatim():

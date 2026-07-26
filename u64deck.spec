@@ -34,5 +34,5 @@ exe = EXE(
     name="u64deck",
     console=True,           # keep the console: shows the URL + any errors
     upx=False,
-    icon=None,
+    icon="u64deck.ico",
 )
