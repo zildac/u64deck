@@ -20,7 +20,7 @@ Ultimate Wi-Fi and power-cycle the device to restore normal wired REST latency
 when testing the Ethernet REST endpoint itself.
 # u64deck
 
-**v1.9.0 — Release Candidate 13**
+**v1.9.0 — Release Candidate 16**
 
 
 A lightweight, self-hosted control deck for the **Ultimate 64** (and, minus the
@@ -38,7 +38,7 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
     `LOAD"$",8`, no waiting for a 1541.
   - **Load** — same, but without RUN (handy for ML monitors / dev work).
   - **Mount & Load** — for multi-load software: mounts the image, resets, and
-    types `LOAD"name",8,1` + `RUN` into the keyboard buffer for you.
+    types `LOAD"name",8,1` + `RUN` through the supported input path for you.
   - **Create blank images** — create formatted D64/D71/D81/DNP files in an
     Ultimate storage folder. Enter USB0, SD, Flash, Temp or another mounted
     folder first; the top-level `/` is only a virtual device list.
@@ -99,9 +99,10 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
 - **Local USB index import** — remove a large collection stick from the Ultimate,
   connect it to the u64deck PC and build `/USB0` (or another mapped subtree)
   directly from local storage without FTP traffic.
-- **Verified interface-aware discovery** — *Select Ultimate…* checks previously
-  verified addresses first, then sends one bounded `/v1/info` request to every
-  remaining address on the local `/24`. There is no preliminary TCP port scan
+- **Verified interface-aware discovery** — *Select Ultimate…* places previously
+  verified addresses at the front of the same bounded concurrent `/v1/info` pass
+  as every address on the local `/24`, so stale history cannot delay the fresh
+  subnet scan. There is no preliminary TCP port scan
   and no retry storm. Ethernet and Wi-Fi responses are grouped into one physical
   device using the firmware `unique_id`, verified Ethernet is preferred, and a
   guarded **Clear discovered devices** action provides a clean recovery scan
@@ -236,19 +237,18 @@ This network identity drives visible application behaviour:
   Wi-Fi with **STREAMING NOT AVAILABLE OVER WI-FI**, while Storage, SID,
   Settings, Assembly64 and supported machine controls remain available.
 
-### Cached-first discovery
+### Prioritised single-pass discovery
 
 `config.json` retains previously verified addresses as discovery history. On a
-new scan, u64deck first tries addresses that still belong to the PC's current
-local `/24`, using a direct `GET /v1/info`. This makes the normal case fast, but
-history is never treated as proof that an interface is online: a cached address
-must answer during the current scan before it can be displayed, selected or
-recommended. Stale and off-subnet addresses remain history only.
+new scan, addresses that still belong to the PC's current local `/24` are placed
+at the front of the same 64-worker pass as the rest of the subnet. This keeps
+history useful without creating a separate blocking phase: a stale configured
+or remembered address cannot postpone the fresh `/24` scan.
 
-After the cached-first stage, every remaining address on the local `/24`
-receives exactly one direct `GET /v1/info` request. Both stages call the same
-production transport module: short-lived TCP sockets executed by a bounded
-`ThreadPoolExecutor` (4 cached workers, then 64 subnet workers).
+History is never treated as proof that an interface is online. Every address
+must answer the current scan before it can be displayed, selected or
+recommended, and every candidate receives exactly one direct `GET /v1/info`
+request through the shared production transport module.
 
 The transport deliberately separates connection time from response time:
 
@@ -405,9 +405,10 @@ Attribution: recommendation data and similarity analysis are provided by
 Use the text **Help** button in the top bar for searchable documentation, usage
 examples and troubleshooting across Screen & Recording, Storage, indexing, favourites,
 Assembly64, SID Jukebox and settings. **Export Diagnostics** under
-Settings → Diagnostics & Support downloads a ZIP containing version/build, sanitised
+Settings → Diagnostics & Support saves a ZIP containing version/build, sanitised
 configuration, device and runtime information, stream counters, index/cache
-statistics and recent errors. Passwords, secret/token/key fields and media
+statistics and recent errors. Supported browsers use an explicit write-and-close
+file flow; other browsers use the normal Downloads fallback. Passwords, secret/token/key fields and media
 content are excluded.
 
 ## Requirements
@@ -443,7 +444,7 @@ The repo includes a PyInstaller spec and a GitHub Actions workflow
 1. Push this folder to a GitHub repo.
 2. The **build-exe** action runs on every push — grab `u64deck.exe` from the
    workflow's artifacts (Actions tab → latest run → *u64deck-windows*).
-3. Tag a release (`git tag v1.9.0-rc.13 && git push --tags`) and the exe is attached
+3. Tag a release (`git tag v1.9.0-rc.16 && git push --tags`) and the exe is attached
    to the GitHub Release automatically.
 
 Double-click the exe: it starts the server, opens your browser, and you hit
@@ -469,10 +470,10 @@ Compunet Reborn CRT are someone else's software; the `.gitignore` excludes
 ### Discovery
 
 There's no broadcast/mDNS announce in the Ultimate firmware. Finder therefore
-checks live remembered addresses first, then sends one direct `GET /v1/info` to
-each remaining address on the local `/24`. It uses up to four cached-address
-workers and 64 subnet workers. Each address has a 1.5-second TCP-connect budget;
-only addresses that connect receive a separate 3.25-second HTTP-response budget.
+places live remembered addresses at the front of the same 64-worker direct
+`GET /v1/info` pass as the remaining local `/24`. Persisted history no longer
+forms a separate blocking stage. Each address has a 1.5-second TCP-connect
+budget; only addresses that connect receive a separate 3.25-second HTTP-response budget.
 It does not use a TCP port pre-scan and does not retry failed addresses during
 the same scan. Routine status and drive polling pause until the scan has
 finished.
@@ -562,23 +563,25 @@ started this way runs, the freezer is inactive until the next reset.
 
 ### Cartridge boot menus (Retro Replay etc.)
 
-Mount & Run and Mount & Load type into the keyboard buffer after a reset. With a
+Mount & Run and Mount & Load type through the supported input path after a reset. With a
 cartridge like **Retro Replay** active, reset lands in the cart's boot menu
 first — and if the typed `LOAD` characters arrive while that menu is up, the
 menu interprets them (that's how you end up staring at the MC monitor).
 
 Mount & Run now waits for the machine before typing. After the normal reset
 settle, u64deck polls the KERNAL readiness flag at zero-page `$CC` and requires
-two consecutive ready readings before sending the `LOAD` line through the
-established keyboard buffer. It applies the same gate after `LOAD`, so `RUN` is
-sent only when the screen editor is ready again rather than after a fixed
-delay. On CIA1-capable Ultimate 64 firmware the post-load `R`, `U`, `N` and
-Return are delivered as matrix key taps; Legacy/C64U sessions retain the
-keyboard-buffer RUN path. Each gate can wait for up to 2 minutes and records
-its result in Diagnostics, together with the RUN delivery method. If the
+two consecutive ready readings before sending the `LOAD` line. On CIA1-capable
+Ultimate 64 firmware, RC15 delivers the complete `LOAD"*",8,1` command as one
+ordered matrix-input event batch, followed by matrix `RUN` after the post-load
+readiness gate. This avoids the port-64 eight-byte boundary that could
+intermittently discard the first `LOAD"*",` part during immediate repeated
+launches. Legacy-only C64 Ultimate firmware retains its established one-shot
+KERNAL-buffer LOAD and RUN path unchanged. Each readiness gate can wait for up
+to 2 minutes and records its result and delivery method in Diagnostics. If the
 machine remains busy, nothing further is typed and the UI reports whether
-`LOAD` or `RUN` was withheld. Firmware without `machine:readmem` automatically
-retains the established complete fixed-delay buffer behaviour.
+`LOAD` or `RUN` was withheld. Firmware without `machine:readmem` retains the
+established fixed-delay readiness behaviour while still using the device's
+supported input transport.
 
 During a slow genuine-drive load the Ultimate's embedded HTTP service can be
 unavailable even though the machine and mounted drive are operating normally.

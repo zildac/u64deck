@@ -1,10 +1,10 @@
 """Interface-aware Ultimate discovery using the proven synchronous transport.
 
-Previously verified addresses on the current local /24 are checked first.
-Every remaining address then receives exactly one direct ``GET /v1/info``.
-Both stages call :mod:`discovery_transport`, the same split-timeout
-``ThreadPoolExecutor + socket`` implementation used by the successful hardware
-diagnostic. The transport allows 1.5 seconds for TCP connection establishment
+Previously verified addresses on the current local /24 are placed at the front
+of the same concurrent pass as every other address. Each candidate receives
+exactly one direct ``GET /v1/info`` through :mod:`discovery_transport`, the
+same split-timeout ``ThreadPoolExecutor + socket`` implementation used by the
+successful hardware diagnostic. The transport allows 1.5 seconds for TCP connection establishment
 and, only after connection, 3.25 seconds for the HTTP response. There is no TCP
 port pre-scan, asynchronous HTTP substitution, or same-scan retry pass.
 
@@ -34,7 +34,6 @@ from network_awareness import (
 
 CONNECT_TIMEOUT = 1.5
 RESPONSE_TIMEOUT = 3.25
-CACHED_CONCURRENCY = 4
 SCAN_CONCURRENCY = 64
 
 
@@ -286,13 +285,15 @@ async def discover(extra_subnets: list[str] | None = None, port: int = 80,
                    detector: LinkDetector | None = None,
                    candidate_ips: list[str] | None = None,
                    progress_callback: Callable[[dict], object] | None = None) -> dict:
-    """Return live Ultimate devices using cached-first direct REST discovery.
+    """Return live Ultimate devices using one prioritised direct REST pass.
 
-    Cached/configured addresses on the current scan networks are verified first
-    using at most four workers.  Every remaining address then receives exactly
-    one direct ``/v1/info`` request using at most 64 workers. Both stages use
-    :func:`discovery_transport.scan_direct` with separate TCP-connect and HTTP-
-    response deadlines, without a port pre-scan or retry.
+    Configured and remembered addresses are placed at the front of the same
+    64-worker scan as the remaining local-/24 candidates.  They therefore stay
+    useful without forming a separate blocking phase: a stale persisted address
+    can no longer delay the fresh subnet scan.  Every address still receives at
+    most one direct ``/v1/info`` request through
+    :func:`discovery_transport.scan_direct`, with the proven split TCP-connect
+    and HTTP-response deadlines and no retry.
     """
     started = time.perf_counter()
     networks = _scan_networks(extra_subnets)
@@ -327,54 +328,34 @@ async def discover(extra_subnets: list[str] | None = None, port: int = 80,
         await _publish_progress(progress_callback, result)
         return result
 
-    cached_started = time.perf_counter()
-    cached_results = await _scan_stage(
-        priority_ips, port, CACHED_CONCURRENCY, started, "cached-first")
-    cached_hits = _transport_hits(cached_results)
-    cached_elapsed = round((time.perf_counter() - cached_started) * 1000.0, 1)
-
-    partial_events: list[str] = []
-    partial_devices = await _group_hits(
-        cached_hits, known_devices, detector, events=partial_events)
-    partial = {
-        "subnets": [str(network) for network in networks],
-        "devices": partial_devices,
-        "candidate_count": len(all_candidates),
-        "verified_count": len(cached_hits),
-        "cached_candidate_count": len(priority_ips),
-        "cached_verified_count": len(cached_hits),
-        "complete": False,
-        "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 1),
-        "diagnostics": [
-            f"Discovery cached-first transport: {len(priority_ips)} candidates, "
-            f"{len(cached_hits)} Ultimate responses ({cached_elapsed} ms; "
-            f"{_counts_text(cached_results)})",
-            *partial_events,
-        ],
-    }
-    await _publish_progress(progress_callback, partial)
-
     priority_set = set(priority_ips)
     remaining_ips = sorted(
         (ip for ip in all_candidates if ip not in priority_set),
         key=ipaddress.ip_address,
     )
-    subnet_started = time.perf_counter()
-    subnet_results = await _scan_stage(
-        remaining_ips, port, SCAN_CONCURRENCY, started, "direct-subnet")
-    subnet_hits = _transport_hits(subnet_results)
-    subnet_elapsed = round((time.perf_counter() - subnet_started) * 1000.0, 1)
-
-    verified_by_ip = {
-        row["ip"]: row for row in [*cached_hits, *subnet_hits]
-    }
-    verified = [
-        verified_by_ip[ip]
-        for ip in sorted(verified_by_ip, key=ipaddress.ip_address)
-    ]
+    scan_order = [*priority_ips, *remaining_ips]
+    scan_started = time.perf_counter()
+    scan_results = await _scan_stage(
+        scan_order, port, SCAN_CONCURRENCY, started, "direct-all")
+    hits = _transport_hits(scan_results)
+    scan_elapsed = round((time.perf_counter() - scan_started) * 1000.0, 1)
 
     events: list[str] = []
-    devices = await _group_hits(verified, known_devices, detector, events=events)
+    if priority_ips:
+        by_ip = {str(row.get("ip") or ""): row for row in scan_results}
+        candidate_details = []
+        for ip in priority_ips:
+            row = by_ip.get(ip, {})
+            status = str(row.get("status") or "missing")
+            elapsed = row.get("elapsed_ms")
+            shown = f"{elapsed} ms" if elapsed is not None else "no timing"
+            candidate_details.append(f"{ip}={status} ({shown})")
+        events.append(
+            "Discovery persisted candidates (non-blocking): "
+            + "; ".join(candidate_details)
+        )
+
+    devices = await _group_hits(hits, known_devices, detector, events=events)
     for device in devices:
         label = str(
             device.get("hostname") or device.get("unique_id")
@@ -387,22 +368,24 @@ async def discover(extra_subnets: list[str] | None = None, port: int = 80,
             links.append(f"{shown} {row.get('ip', '')}")
         events.append(f"{label}: {', '.join(links) if links else 'no verified interfaces'}")
 
+    hit_ips = {str(row.get("ip") or "") for row in hits}
+    cached_verified = sum(1 for ip in priority_ips if ip in hit_ips)
     elapsed = round((time.perf_counter() - started) * 1000.0, 1)
     events.insert(
         0,
         f"Discovery scan: {len(all_candidates)} candidates, "
-        f"{len(verified)} Ultimate responses, {len(devices)} devices "
-        f"({elapsed} ms; cached {cached_elapsed} ms; subnet {subnet_elapsed} ms; "
-        f"cached outcomes {_counts_text(cached_results)}; "
-        f"subnet outcomes {_counts_text(subnet_results)})",
+        f"{len(hits)} Ultimate responses, {len(devices)} devices "
+        f"({elapsed} ms; one prioritised pass {scan_elapsed} ms; "
+        f"persisted {len(priority_ips)} candidates/{cached_verified} verified; "
+        f"outcomes {_counts_text(scan_results)})",
     )
     result = {
         "subnets": [str(network) for network in networks],
         "devices": devices,
         "candidate_count": len(all_candidates),
-        "verified_count": len(verified),
+        "verified_count": len(hits),
         "cached_candidate_count": len(priority_ips),
-        "cached_verified_count": len(cached_hits),
+        "cached_verified_count": cached_verified,
         "complete": True,
         "elapsed_ms": elapsed,
         "diagnostics": events,

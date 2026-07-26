@@ -1,5 +1,74 @@
 # Changelog
 
+## 1.9.0 — Release Candidate 16
+
+- Removed the separate blocking remembered-address phase from Finder. Configured
+  and historical candidates are now placed at the front of the same 64-worker
+  direct `/v1/info` pass as the local `/24`, so stale `config.json` entries can
+  no longer delay the fresh subnet scan. Each address is still requested once,
+  with the proven split connect/response deadlines and no retry storm.
+- Added per-candidate discovery diagnostics for persisted addresses, including
+  their outcome and elapsed time, while retaining verified-only display, device
+  grouping, DHCP replacement and historical-address safeguards. Opening Finder
+  now also pauses routine Info and Mounted Drives polling immediately.
+- Made SID Stop flush all browser-scheduled Web Audio immediately and capped the
+  amount of audio that can be queued ahead, preventing stale sound from
+  continuing while the fast backend reset completes.
+- Changed Diagnostics export to use an explicit save, write and close sequence
+  through the browser File System Access API where available, with a clean
+  abort/close failure path and download fallback for other browsers.
+- Added immediate **Connecting…** feedback and backend per-stage timings for
+  persisted-route lookup, client creation, Finder-result reuse/live verification,
+  coordinator wait, capability handling, backend replacement and cleanup.
+- Retained RC15's full CIA1 Mount & Run delivery, Legacy fallback, split routing,
+  cartridge-safe SID recovery, streaming cleanup and disk-swap behaviour.
+
+## 1.9.0 — Release Candidate 15
+
+- Replaced the mixed Mount & Run input path on CIA1-capable Ultimate 64
+  firmware. The complete `LOAD"*",8,1` line is now sent as one ordered CIA1
+  matrix event batch, followed by matrix `RUN` after the existing readiness
+  gate. This removes the port-64 eight-byte boundary that repeatedly left only
+  `8,1` on screen during immediate consecutive disk launches.
+- Kept the Legacy-only C64 Ultimate path unchanged: LOAD and RUN continue to
+  use the established one-shot KERNAL keyboard buffer delivery which did not
+  reproduce the failure in hardware testing.
+- Removed browser-side matrix-release requests from both audio and video
+  WebSocket close handlers. Audio disconnects no longer touch keyboard state;
+  video disconnects clear local browser state while the backend performs one
+  coalesced hardware safety release outside the asyncio event loop.
+- Removed matrix release from generic stream stop control, preventing explicit
+  stream stop plus WebSocket close from producing duplicate input cleanup
+  requests and avoidable timeout warnings.
+- Retained RC14 input serialisation and caller-labelled diagnostics, plus RC13
+  split routing, cartridge-safe SID Stop, post-SID recovery reboot, disk swap
+  and the frozen Finder implementation.
+
+## 1.9.0 — Release Candidate 14
+
+- Fixed an intermittent Mount & Run failure on CIA1-capable Ultimate 64
+  firmware where the first eight-byte `LOAD"*",` command-buffer chunk could be
+  replaced before the C64 consumed it, leaving only `8,1` on screen. On
+  firmware with `machine:readmem`, u64deck now verifies the KERNAL keyboard
+  buffer count at `$C6`, sends the LOAD line in bounded chunks and waits for
+  each chunk to drain before continuing.
+- Preserved the established one-shot Legacy KERNAL-buffer delivery on older
+  C64 Ultimate firmware where `machine:readmem` is unavailable. The hybrid
+  post-load RUN dispatcher remains unchanged: CIA1 matrix on supported U64
+  firmware and Legacy buffer delivery elsewhere.
+- Serialised CIA1 matrix actions and legacy keyboard-buffer writes through one
+  input lock so browser input, Auto-F7, Mount & Run and cleanup requests cannot
+  cross one another.
+- Removed unrelated matrix cleanup from the audio WebSocket. Video-disconnect
+  cleanup is now coalesced and executed in a worker thread, preventing an
+  Ultimate input timeout from blocking the asyncio server and making the whole
+  UI appear unresponsive.
+- Matrix-release warnings now identify their caller. Mount & Run aborts before
+  mounting or typing when a known CIA1 session cannot complete its initial
+  safety release, rather than continuing with uncertain held-key state.
+- Retained RC13 split routing, cartridge-safe SID Stop, post-SID recovery
+  reboot, disk-swap behaviour and the frozen Finder implementation.
+
 ## 1.9.0 — Release Candidate 13
 
 - Changed SID Jukebox Stop under split dual-interface routing to use the

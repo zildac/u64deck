@@ -1387,7 +1387,7 @@ def test_frontend_is_split_without_a_build_tool():
 def test_release_metadata_is_centralised():
     import release
     assert server.VERSION == release.VERSION == "1.9.0"
-    assert release.RELEASE_LABEL == "Release Candidate 13"
+    assert release.RELEASE_LABEL == "Release Candidate 16"
     assert server.BUILD == release.build_id(server.ASSETS, Path(server.__file__).parent)
 
 
@@ -2350,7 +2350,7 @@ def test_release_help_and_now_playing_star_are_present():
     assert "jkToggleNowFavourite" in js
     assert ".u64deck-index.sqlite3" in help_js
     assert "star beside the playback controls" in help_js
-    assert "v1.9.0 — Release Candidate 13" in readme
+    assert "v1.9.0 — Release Candidate 16" in readme
     assert ".u64deck-index.sqlite3" in readme
     assert "Install every release into a **new, empty folder**" in readme
     assert "Do not copy `*-wal`" in readme
@@ -3218,7 +3218,7 @@ def test_juke_stop_legacy_uses_rest_first_and_skips_command_socket(monkeypatch):
         server.juke_stop()
         assert calls[0][0:2] == ("rest", "/v1/machine:reset")
         assert calls[0][2]["request_timeout"] == 4.0
-        assert calls[1] == ("release", {"silent": True, "cached_only": True})
+        assert calls[1] == ("release", {"silent": True, "cached_only": True, "caller": "juke-stop"})
         assert "fresh-reset" not in calls
     finally:
         server.JUKE.clear(); server.JUKE.update(previous)
@@ -3749,7 +3749,7 @@ def test_mount_and_run_ready_path_types_exact_buffer_commands(monkeypatch):
     assert out == {"errors": [], "typed": 'LOAD"*",8,1 + RUN'}
 
 
-def test_mount_and_run_ready_path_uses_cia1_matrix_for_run(monkeypatch):
+def test_mount_and_run_ready_path_uses_cia1_matrix_for_load_and_run(monkeypatch):
     diagnostics = []
     monkeypatch.setattr(server, "_input_status",
                         lambda *args, **kwargs: {"available": True})
@@ -3758,9 +3758,15 @@ def test_mount_and_run_ready_path_uses_cia1_matrix_for_run(monkeypatch):
 
     typed, matrix_events, out = _mount_boot_harness(monkeypatch, ["ready", "ready"])
 
-    assert typed == [b'LOAD"*",8,1\r']
-    assert matrix_events == [((server._RUN_MATRIX_EVENTS,), {"client": server.rest})]
+    expected_load = server._mount_run_matrix_events('LOAD"*",8,1\r')
+    assert typed == []
+    assert matrix_events == [
+        ((expected_load,), {"client": server.rest}),
+        ((server._RUN_MATRIX_EVENTS,), {"client": server.rest}),
+    ]
     assert out == {"errors": [], "typed": 'LOAD"*",8,1 + RUN'}
+    assert any("Mount & Run LOAD delivery: CIA1 matrix" in message
+               for _level, message in diagnostics)
     assert ("info", "Mount & Run RUN delivery: CIA1 matrix") in diagnostics
 
 
@@ -3800,12 +3806,15 @@ def test_mount_and_run_load_timeout_withholds_run(monkeypatch):
     assert out["note"] == "load still running — RUN not sent"
 
 
-def test_mount_and_run_unsupported_readmem_keeps_beta11_delays(monkeypatch):
+def test_mount_and_run_unsupported_readmem_keeps_fixed_delay_but_uses_cia1(monkeypatch):
     monkeypatch.setattr(server, "_input_status",
                         lambda *args, **kwargs: {"available": True})
     typed, matrix_events, out = _mount_boot_harness(monkeypatch, ["unsupported"])
-    assert typed == [b'LOAD"*",8,1\r', b"RUN\r"]
-    assert matrix_events == []
+    assert typed == []
+    assert matrix_events == [
+        ((server._mount_run_matrix_events('LOAD"*",8,1\r'),), {"client": server.rest}),
+        ((server._RUN_MATRIX_EVENTS,), {"client": server.rest}),
+    ]
     assert out == {"errors": [], "typed": 'LOAD"*",8,1 + RUN'}
 
 
@@ -3973,7 +3982,7 @@ def test_discovery_dhcp_replacement_removes_superseded_ips_by_mac():
     assert sum("Discovery address replaced" in event for event in events) == 2
 
 
-def test_discovery_remembered_addresses_are_probe_candidates_not_results(monkeypatch):
+def test_discovery_remembered_addresses_are_prioritised_not_trusted(monkeypatch):
     import discovery
 
     stages = []
@@ -3987,12 +3996,17 @@ def test_discovery_remembered_addresses_are_probe_candidates_not_results(monkeyp
     known = {"uid:1": {"addresses": {"192.0.2.44": {"ip": "192.0.2.44"}}}}
     result = asyncio.run(discovery.discover(known_devices=known))
 
-    assert stages[0][0] == ["192.0.2.44"]
-    assert stages[0][4] == "cached-first"
-    assert "192.0.2.44" not in stages[1][0]
-    assert sum(len(stage[0]) for stage in stages) == 254
+    assert len(stages) == 1
+    ips, workers, connect_timeout, response_timeout, stage, port = stages[0]
+    assert ips[0] == "192.0.2.44"
+    assert len(ips) == len(set(ips)) == 254
+    assert (workers, connect_timeout, response_timeout, stage, port) == (
+        64, 1.5, 3.25, "direct-all", 80)
     assert result["devices"] == []
     assert result["candidate_count"] == 254
+    assert result["cached_candidate_count"] == 1
+    assert any("192.0.2.44" in line and "non-blocking" in line
+               for line in result["diagnostics"])
 
 def test_discovery_updates_saved_host_only_to_verified_active_identity(monkeypatch):
     original = dict(server.CFG)
@@ -4177,7 +4191,7 @@ def test_juke_stop_cia1_uses_fresh_reset_once_and_skips_rest(monkeypatch):
         server.juke_stop()
         assert calls == [
             "fresh-reset",
-            ("release", {"silent": True, "cached_only": True}),
+            ("release", {"silent": True, "cached_only": True, "caller": "juke-stop"}),
         ]
     finally:
         server.JUKE.clear(); server.JUKE.update(previous)
@@ -4211,7 +4225,7 @@ def test_juke_stop_cia1_fresh_failure_releases_matrix_then_uses_rest(monkeypatch
         server.juke_stop()
         assert calls[0:2] == [
             "fresh-reset",
-            ("release", {"silent": True, "cached_only": True}),
+            ("release", {"silent": True, "cached_only": True, "caller": "juke-stop"}),
         ]
         assert calls[2][0:2] == ("rest", "/v1/machine:reset")
     finally:
@@ -4243,7 +4257,7 @@ def test_juke_stop_legacy_rest_failure_falls_back_to_fresh_command(monkeypatch):
         monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
         server.juke_stop()
         assert calls[0][0:2] == ("rest", "/v1/machine:reset")
-        assert calls[1] == ("release", {"silent": True, "cached_only": True})
+        assert calls[1] == ("release", {"silent": True, "cached_only": True, "caller": "juke-stop"})
         assert calls[2] == "fresh-reset"
     finally:
         server.JUKE.clear(); server.JUKE.update(previous)
@@ -4694,13 +4708,14 @@ def test_rc4_mount_and_run_while_sid_is_playing_reboots_before_mount(monkeypatch
 
 # --- v1.9.0 Release Candidate 11: responsive Finder hand-off ---
 
-def test_rc11_discovery_files_remain_frozen():
+def test_rc16_discovery_files_match_release_checksums():
     root = Path(server.ROOT)
-    assert hashlib.sha256((root / "discovery.py").read_bytes()).hexdigest() == (
-        "635599ea8c31bfca0f9c8f6b5cc99cdff6ccfd6551a8df4d1c141708a8c89d25")
-    assert hashlib.sha256((root / "discovery_transport.py").read_bytes()).hexdigest() == (
-        "fb9c85791ea60a37c0931a01409845b7787f664be1db04ee9d16185df75d826d")
-
+    expected = {}
+    for line in (root / "DISCOVERY-FROZEN.sha256").read_text(encoding="utf-8").splitlines():
+        digest, filename = line.split(maxsplit=1)
+        expected[filename.strip()] = digest
+    assert hashlib.sha256((root / "discovery.py").read_bytes()).hexdigest() == expected["discovery.py"]
+    assert hashlib.sha256((root / "discovery_transport.py").read_bytes()).hexdigest() == expected["discovery_transport.py"]
 
 def test_rc11_connect_reuses_verified_discovery_and_skips_blocking_probes(monkeypatch):
     original_cfg = dict(server.CFG)
@@ -4818,7 +4833,6 @@ def test_discovery_constants_match_proven_direct_get_design():
 
     assert discovery.CONNECT_TIMEOUT == 1.5
     assert discovery.RESPONSE_TIMEOUT == 3.25
-    assert discovery.CACHED_CONCURRENCY == 4
     assert discovery.SCAN_CONCURRENCY == 64
     source = Path(discovery.__file__).read_text(encoding="utf-8")
     assert "discovery_transport.scan_direct" in source
@@ -4947,7 +4961,7 @@ def test_split_timeout_transport_distinguishes_connect_and_response_timeouts(mon
     assert "connect_ms" in row
 
 
-def test_cached_addresses_use_shared_transport_first_and_are_not_repeated(monkeypatch):
+def test_persisted_addresses_share_one_transport_pass_and_are_not_repeated(monkeypatch):
     import discovery
 
     ethernet = "192.0.2.10"
@@ -4974,38 +4988,39 @@ def test_cached_addresses_use_shared_transport_first_and_are_not_repeated(monkey
         candidate_ips=[ethernet, wifi], detector=detector,
         progress_callback=lambda row: progress.append(row)))
 
-    assert stages[0][0] == [ethernet, wifi]
-    assert stages[0][1:] == (4, 1.5, 3.25, "cached-first", 80)
-    assert ethernet not in stages[1][0]
-    assert wifi not in stages[1][0]
-    assert stages[1][1:] == (64, 1.5, 3.25, "direct-subnet", 80)
-    assert sum(len(stage[0]) for stage in stages) == 254
-    assert progress[0]["complete"] is False
+    assert len(stages) == 1
+    ips, workers, connect_timeout, response_timeout, stage, port = stages[0]
+    assert ips[:2] == [ethernet, wifi]
+    assert len(ips) == len(set(ips)) == 254
+    assert (workers, connect_timeout, response_timeout, stage, port) == (
+        64, 1.5, 3.25, "direct-all", 80)
+    assert len(progress) == 1 and progress[0]["complete"] is True
     assert progress[0]["cached_verified_count"] == 2
-    assert progress[-1]["complete"] is True
     assert result["verified_count"] == 2
     assert result["devices"][0]["preferred_ip"] == ethernet
+    assert any("persisted candidates" in line.lower() and ethernet in line and wifi in line
+               for line in result["diagnostics"])
 
-
-def test_off_subnet_cached_address_is_skipped(monkeypatch):
+def test_off_subnet_persisted_address_is_skipped(monkeypatch):
     import discovery
 
     stages = []
     monkeypatch.setattr(discovery, "local_subnets", lambda: ["192.0.2."])
 
     def scan_direct(ips, workers, connect_timeout, response_timeout, overall_started, stage, port=80):
-        stages.append((list(ips), stage))
+        stages.append((list(ips), workers, stage))
         return []
 
     monkeypatch.setattr(discovery.discovery_transport, "scan_direct", scan_direct)
     result = asyncio.run(discovery.discover(
         candidate_ips=["198.51.100.44"], detector=_MappedLinkDetector({})))
 
-    assert stages[0] == ([], "cached-first")
-    assert "198.51.100.44" not in stages[1][0]
+    assert len(stages) == 1
+    assert len(stages[0][0]) == 254
+    assert stages[0][1:] == (64, "direct-all")
+    assert "198.51.100.44" not in stages[0][0]
     assert result["cached_candidate_count"] == 0
     assert result["candidate_count"] == 254
-
 
 def test_fresh_shared_transport_scan_groups_interfaces_and_prefers_ethernet(monkeypatch):
     import discovery
@@ -5031,10 +5046,9 @@ def test_fresh_shared_transport_scan_groups_interfaces_and_prefers_ethernet(monk
 
     result = asyncio.run(discovery.discover(detector=detector))
 
-    assert stages[0][0] == []
-    assert len(stages[1][0]) == 254
-    assert stages[1][1:] == (64, 1.5, 3.25, "direct-subnet", 80)
-    assert len(set(stages[1][0])) == 254
+    assert len(stages) == 1
+    assert len(stages[0][0]) == len(set(stages[0][0])) == 254
+    assert stages[0][1:] == (64, 1.5, 3.25, "direct-all", 80)
     assert result["verified_count"] == 2
     assert len(result["devices"]) == 1
     device = result["devices"][0]
@@ -5042,7 +5056,6 @@ def test_fresh_shared_transport_scan_groups_interfaces_and_prefers_ethernet(monk
     assert [(row["ip"], row["link_type"]) for row in device["addresses"]] == [
         (ethernet, "ethernet"), (wifi, "wifi"),
     ]
-
 
 def test_discovery_classification_issues_no_latency_rest_requests(monkeypatch):
     import discovery
@@ -5146,8 +5159,8 @@ def test_discovery_scan_gate_rejects_overlap(monkeypatch):
 
 def test_discovery_frontend_pauses_polling_and_uses_bounded_window():
     js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
-    assert "let DISCOVERY_SCAN_ACTIVE=false;" in js
-    assert "if(DISCOVERY_SCAN_ACTIVE||uiInteractive()||INFO_IN_FLIGHT)return;" in js
+    assert "let DISCOVERY_SCAN_ACTIVE=false,DISCOVERY_DIALOG_OPEN=false;" in js
+    assert "if(DISCOVERY_SCAN_ACTIVE||DISCOVERY_DIALOG_OPEN||uiInteractive()||INFO_IN_FLIGHT)return;" in js
     assert 'api("/api/discover"+' in js and "{timeoutMs:30000}" in js
     assert 'api("/api/discover/clear"+' in js and 'method:"POST",timeoutMs:30000' in js
     assert 'let DEVICE_REQUEST_TIMEOUT_MS=15000;' in js
@@ -5158,11 +5171,11 @@ def test_rc8_discovery_documentation_covers_identity_and_rest_etiquette():
     help_js = (Path(server.ASSETS) / "static" / "help_content.js").read_text(encoding="utf-8")
     for text in (
         "Interface-aware Ultimate discovery",
-        "Cached-first discovery",
+        "Prioritised single-pass discovery",
         "REST service etiquette",
         "U64 Manager",
         "Assembly64",
-        "exactly one direct `GET /v1/info` request",
+        "every candidate receives exactly one direct",
     ):
         assert text in readme
     assert "one direct <code>GET /v1/info</code> request" in help_js
@@ -5295,7 +5308,7 @@ def test_rc12_ui_explains_split_route():
     assert "REST control via "+"" in js
 
 
-# --- v1.9.0 Release Candidate 13: split SID play/stop routing ---
+# --- v1.9.0 Release Candidate 14: split SID play/stop routing ---
 
 def test_rc13_split_juke_stop_parks_cartridge_and_uses_wifi_rest_first(monkeypatch):
     previous_cfg = dict(server.CFG)
@@ -5348,7 +5361,7 @@ def test_rc13_split_juke_stop_parks_cartridge_and_uses_wifi_rest_first(monkeypat
             ("put", "/v1/machine:reset", {"request_timeout": 4.0}),
             ("put", f"/v1/configs/{server._CART_CAT}/{server._CART_ITEM}",
              {"value": cartridge, "request_timeout": 4.0}),
-            ("release", {"silent": True, "cached_only": True}),
+            ("release", {"silent": True, "cached_only": True, "caller": "juke-stop"}),
         ]
         assert "fresh-reset" not in calls
         assert wifi in server.SID_RUNNER_REBOOT_REQUIRED
@@ -5411,7 +5424,7 @@ def test_rc13_split_juke_stop_rest_failure_restores_cart_then_falls_back(monkeyp
             "put", f"/v1/configs/{server._CART_CAT}/{server._CART_ITEM}",
             {"value": cartridge, "request_timeout": 4.0},
         ))
-        release_index = calls.index(("release", {"silent": True, "cached_only": True}))
+        release_index = calls.index(("release", {"silent": True, "cached_only": True, "caller": "juke-stop"}))
         fallback_index = calls.index("fresh-reset")
         assert reset_index < restore_index < release_index < fallback_index
     finally:
@@ -5457,3 +5470,258 @@ def test_rc13_juke_play_returns_stage_timings_and_logs_them(monkeypatch):
     finally:
         server.JUKE.clear(); server.JUKE.update(previous_juke)
         server.CFG.clear(); server.CFG.update(previous_cfg)
+
+
+# --- v1.9.0 Release Candidate 16: persisted Finder state and UI responsiveness ---
+
+def test_rc16_frontend_flushes_scheduled_audio_and_caps_queue_ahead():
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    assert "const AUDIO_SOURCES=new Set(),AUDIO_MAX_AHEAD=0.32" in js
+    assert "AUDIO_JUKE_STOP_MUTED" in js
+    assert "function flushBrowserAudio()" in js
+    assert "if(nextT>now+AUDIO_MAX_AHEAD)return" in js
+    stop = js[js.index("async function jkStop()") : js.index("async function jk(a)")]
+    assert "flushBrowserAudio();" in stop
+    assert "AUDIO_JUKE_STOP_MUTED=true" in stop
+    assert "AUDIO_JUKE_STOP_MUTED=false" in stop
+    audio_stop = js[js.index("async function toggleAudio()") : js.index("/* ---------- flexible video")]
+    assert "flushBrowserAudio();" in audio_stop
+
+
+def test_rc16_diagnostics_export_explicitly_writes_and_closes_file_handle():
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    block = js[js.index("async function downloadDiagnostics()") : js.index("/* ---------- discovery ----------")]
+    assert "showSaveFilePicker" in block
+    assert "handle.createWritable()" in block
+    assert "await writable.write(blob)" in block
+    assert "await writable.close()" in block
+    assert "await writable.abort()" in block
+    assert "document.body.appendChild(a);a.click();a.remove()" in block
+
+
+def test_rc16_connect_ui_is_immediate_and_backend_returns_stage_timings(monkeypatch):
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    connect_block = js[js.index("async function connectTo(host)") : js.index("/* ---------- stream quality")]
+    assert 'toast("Connecting to "+host+"…","ok")' in connect_block
+    assert "connect_timing?.total_ms" in connect_block
+
+    calls = []
+    class FakeRest:
+        def __init__(self, host, password, coordinator=None): self.host = host
+        def info(self): calls.append("info"); return {"product": "Ultimate 64", "unique_id": "rc16"}
+        def close(self): calls.append("close-rest")
+        def set_timeout(self, timeout): pass
+    class FakeCmd:
+        def __init__(self, host, coordinator=None): self.host = host
+        def close(self): calls.append("close-cmd")
+    class FakeFS:
+        def __init__(self, *args, **kwargs): pass
+        def close(self): calls.append("close-fs")
+    class FakeCoordinator:
+        @contextmanager
+        def operation(self, *args, **kwargs): yield
+
+    original_cfg = dict(server.CFG)
+    events = []
+    try:
+        server.CFG["u64_host"] = ""
+        server.CFG["rest_control_host"] = ""
+        server.CFG["known_devices"] = {}
+        monkeypatch.setattr(server, "UltimateREST", FakeRest)
+        monkeypatch.setattr(server, "CommandSocket", FakeCmd)
+        monkeypatch.setattr(server, "DeviceFS", FakeFS)
+        monkeypatch.setattr(server, "DEVICE_OP", FakeCoordinator())
+        monkeypatch.setattr(server, "rest", None)
+        monkeypatch.setattr(server, "cmd", None)
+        monkeypatch.setattr(server, "devfs", None)
+        monkeypatch.setattr(server, "save_config", lambda: None)
+        monkeypatch.setattr(server.LINK_DETECTOR, "detect", lambda host, force=False: LinkObservation(host, "unknown", "", "unknown"))
+        monkeypatch.setattr(server, "_diag_event", lambda level, message, **extra: events.append((level, message)))
+        result = server.api_connect({"host": "198.51.100.64"})
+        assert result["connected"] is True
+        timing = result["connect_timing"]
+        for key in (
+            "persisted_route_lookup_ms", "client_creation_ms", "verified_result_lookup_ms",
+            "live_verification_ms", "coordinator_wait_ms", "capability_handling_ms",
+            "backend_replace_commit_ms", "old_client_cleanup_ms", "total_ms",
+        ):
+            assert key in timing and timing[key] >= 0
+        assert timing["success"] is True
+        assert any("Connect timing:" in message for _level, message in events)
+    finally:
+        server.CFG.clear(); server.CFG.update(original_cfg)
+
+
+def test_rc16_finder_dialog_pauses_routine_browser_polling():
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    assert "DISCOVERY_DIALOG_OPEN=true" in js
+    assert "function closeDiscover(resumePolling=true)" in js
+    assert "DISCOVERY_SCAN_ACTIVE||DISCOVERY_DIALOG_OPEN||uiInteractive()||INFO_IN_FLIGHT" in js
+    assert "DISCOVERY_SCAN_ACTIVE||DISCOVERY_DIALOG_OPEN||uiInteractive()||DRIVES_IN_FLIGHT" in js
+
+
+def test_rc16_discovery_diagnostic_uses_one_production_pass():
+    source = (Path(server.ROOT) / "discovery_diagnostic.py").read_text(encoding="utf-8")
+    assert "ONE PASS" in source
+    assert 'started, "direct-all"' in source
+    assert '"cached-first"' not in source
+    assert '"direct-subnet"' not in source
+
+# --- v1.9.0 Release Candidate 15: full CIA1 Mount & Run command delivery ---
+
+def test_rc15_mount_run_matrix_events_encode_complete_load_line_in_one_batch():
+    events = server._mount_run_matrix_events('LOAD"*",8,1\r')
+
+    assert events[0] == {"kind": "release_all"}
+    assert events[1:5] == [
+        {"kind": "keyboard", "inputs": ["l"], "transition": "tap"},
+        {"kind": "keyboard", "inputs": ["o"], "transition": "tap"},
+        {"kind": "keyboard", "inputs": ["a"], "transition": "tap"},
+        {"kind": "keyboard", "inputs": ["d"], "transition": "tap"},
+    ]
+    assert {"kind": "keyboard", "inputs": ["left_shift", "2"], "transition": "tap"} in events
+    assert {"kind": "keyboard", "inputs": ["star"], "transition": "tap"} in events
+    assert events[-1] == {"kind": "keyboard", "inputs": ["return"], "transition": "tap"}
+    assert len(events) == 13  # release_all plus 12 key taps
+
+
+def test_rc15_mount_run_load_uses_one_matrix_request_and_never_legacy(monkeypatch):
+    matrix_calls = []
+    typed = []
+    diagnostics = []
+    monkeypatch.setattr(server, "_input_status", lambda *args, **kwargs: {"available": True})
+    monkeypatch.setattr(server, "_matrix_send",
+                        lambda events, **kwargs: matrix_calls.append((events, kwargs)))
+    monkeypatch.setattr(server, "_legacy_type", lambda data, **kwargs: typed.append(bytes(data)))
+    monkeypatch.setattr(server, "_diag_event",
+                        lambda level, message, **kwargs: diagnostics.append((level, message)))
+
+    ok, delivery = server._type_mount_run_load(b'LOAD"*",8,1\r')
+
+    assert ok is True
+    assert delivery == "CIA1 matrix"
+    assert typed == []
+    assert matrix_calls == [
+        (server._mount_run_matrix_events('LOAD"*",8,1\r'), {"client": server.rest})
+    ]
+    assert any("12 ordered key taps" in message for _level, message in diagnostics)
+
+
+def test_rc15_matrix_load_failure_is_not_resent_through_legacy(monkeypatch):
+    typed = []
+    warnings = []
+    monkeypatch.setattr(server, "_input_status", lambda *args, **kwargs: {"available": True})
+    monkeypatch.setattr(
+        server, "_matrix_send",
+        lambda *args, **kwargs: (_ for _ in ()).throw(httpx.ReadTimeout("ambiguous timeout")),
+    )
+    monkeypatch.setattr(server, "_legacy_type", lambda data, **kwargs: typed.append(bytes(data)))
+    monkeypatch.setattr(server, "_warn_event",
+                        lambda kind, message, **kwargs: warnings.append((kind, message)))
+    monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+
+    ok, note = server._type_mount_run_load(b'LOAD"*",8,1\r')
+
+    assert ok is False
+    assert typed == []
+    assert "LOAD not resent" in note
+    assert warnings and warnings[0][0] == "mount-load-delivery"
+
+
+def test_rc15_legacy_mount_run_load_retains_one_shot_buffer_path(monkeypatch):
+    typed = []
+    matrix_calls = []
+    monkeypatch.setattr(server, "_input_status", lambda *args, **kwargs: {"available": False})
+    monkeypatch.setattr(server, "_matrix_send", lambda *args, **kwargs: matrix_calls.append(args))
+    monkeypatch.setattr(server, "_legacy_type", lambda data, **kwargs: typed.append(bytes(data)))
+    monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+
+    ok, delivery = server._type_mount_run_load(b'LOAD"*",8,1\r')
+
+    assert ok is True
+    assert delivery == "Legacy KERNAL buffer"
+    assert typed == [b'LOAD"*",8,1\r']
+    assert matrix_calls == []
+
+
+def test_rc14_mount_run_aborts_when_known_matrix_release_fails(monkeypatch):
+    calls = []
+    monkeypatch.setattr(server, "_cached_input_status", lambda client=None: {"available": True})
+    monkeypatch.setattr(server, "_matrix_release_all", lambda **kwargs: False)
+    monkeypatch.setattr(server, "_juke_disarm_machine_takeover", lambda reason: calls.append("disarm"))
+    monkeypatch.setattr(server, "_warn_event", lambda *args, **kwargs: calls.append("warn"))
+
+    class FakeRest:
+        host = "192.0.2.140"
+        def mount_path(self, *args, **kwargs):
+            calls.append("mount")
+
+    previous = server.rest
+    try:
+        server.rest = FakeRest()
+        out = server._mount_and_boot("a", "unlinked", device_path="/Usb0/test.d64")
+    finally:
+        server.rest = previous
+
+    assert out["typed"] == ""
+    assert "matrix release failed" in out["note"]
+    assert calls == ["disarm", "warn"]
+
+
+def test_rc14_matrix_cleanup_coalesces_duplicate_request(monkeypatch):
+    called = []
+    monkeypatch.setattr(server, "_matrix_release_all", lambda **kwargs: called.append(kwargs) or True)
+    assert server.MATRIX_CLEANUP_LOCK.acquire(blocking=False)
+    try:
+        assert server._matrix_release_cleanup(caller="duplicate") is False
+    finally:
+        server.MATRIX_CLEANUP_LOCK.release()
+    assert called == []
+
+
+def test_rc14_matrix_release_warning_identifies_caller(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(server, "_input_status", lambda *args, **kwargs: {"available": True})
+    monkeypatch.setattr(
+        server, "_matrix_send",
+        lambda *args, **kwargs: (_ for _ in ()).throw(httpx.ReadTimeout("timed out")),
+    )
+    monkeypatch.setattr(
+        server, "_warn_event",
+        lambda kind, message, **kwargs: warnings.append((kind, message)),
+    )
+
+    assert server._matrix_release_all(silent=True, caller="unit-test") is False
+    assert warnings == [
+        ("matrix-release-all", "could not release matrix input (unit-test): timed out")
+    ]
+
+
+def test_rc14_audio_disconnect_no_longer_releases_matrix_and_video_offloads_cleanup():
+    import inspect
+    audio_source = inspect.getsource(server.ws_audio)
+    video_source = inspect.getsource(server.ws_video)
+
+    assert "_matrix_release_all" not in audio_source
+    assert "_matrix_release_cleanup" not in audio_source
+    assert "run_in_threadpool" in video_source
+    assert "_matrix_release_cleanup" in video_source
+    assert "ws-video-disconnect" in video_source
+
+def test_rc15_browser_socket_closes_do_not_issue_matrix_release_requests():
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    video_close = js[js.index("wsV.onclose"):js.index("async function toggleVideo")]
+    audio_close = js[js.index("wsA.onclose"):js.index("async function toggleAudio")]
+
+    assert 'matrixReleaseAll("video WebSocket closed")' not in video_close
+    assert "matrixClearLocalState()" in video_close
+    assert 'matrixReleaseAll("audio WebSocket closed")' not in audio_close
+    assert "matrixClearLocalState()" not in audio_close
+
+
+def test_rc15_stream_control_no_longer_releases_matrix_on_stop():
+    import inspect
+    source = inspect.getsource(server._stream_ctl)
+    assert "_matrix_release_all" not in source
+    assert "_matrix_release_cleanup" not in source
+

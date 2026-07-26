@@ -259,6 +259,15 @@ MATRIX_KEYBOARD_INPUTS = {
 MATRIX_TRANSITIONS = {"press", "release", "tap"}
 INPUT_CAPABILITIES: dict[str, dict] = {}
 INPUT_CAP_LOCK = threading.Lock()
+# Serialise every CIA1 matrix action and legacy keyboard-buffer write through
+# one re-entrant lock.  The device coordinator protects the wider Ultimate
+# network stack, but browser keyboard events, Mount & Run and WebSocket safety
+# cleanup can originate on different worker threads.  This lock prevents an
+# input cleanup or matrix tap from crossing a legacy command-buffer sequence.
+INPUT_IO_LOCK = threading.RLock()
+# Video disconnect cleanup is a safety action, not a reason to queue repeated
+# release_all calls.  Keep at most one cleanup request in flight.
+MATRIX_CLEANUP_LOCK = threading.Lock()
 
 # Ethernet/Wi-Fi awareness. The optional Wireshark cache is additive-only;
 # the bundled 2026-07 Espressif list remains the permanent floor.
@@ -789,39 +798,73 @@ def _validate_matrix_events(events) -> list[dict]:
 
 def _matrix_send(events, *, client: UltimateREST | None = None,
                  force_probe: bool = False):
-    client = client or rest
-    status = _input_status(client, force=force_probe)
-    if not status.get("available"):
-        raise UltimateError("CIA1 matrix input is not available on this device")
-    clean = _validate_matrix_events(events)
-    try:
-        return client.machine_input(clean)
-    except Exception:
-        # Re-probe after the next successful reconnect rather than trusting a
-        # stale capability entry after a firmware/device restart.
-        with INPUT_CAP_LOCK:
-            INPUT_CAPABILITIES.pop(_input_cache_key(client), None)
-        raise
+    with INPUT_IO_LOCK:
+        client = client or rest
+        status = _input_status(client, force=force_probe)
+        if not status.get("available"):
+            raise UltimateError("CIA1 matrix input is not available on this device")
+        clean = _validate_matrix_events(events)
+        try:
+            return client.machine_input(clean)
+        except Exception:
+            # Re-probe after the next successful reconnect rather than trusting a
+            # stale capability entry after a firmware/device restart.
+            with INPUT_CAP_LOCK:
+                INPUT_CAPABILITIES.pop(_input_cache_key(client), None)
+            raise
 
 
 def _matrix_release_all(*, client: UltimateREST | None = None,
-                        silent: bool = True, cached_only: bool = False) -> bool:
-    client = client or rest
-    try:
-        if cached_only:
-            with INPUT_CAP_LOCK:
-                status = dict(INPUT_CAPABILITIES.get(_input_cache_key(client)) or {})
-        else:
-            status = _input_status(client)
-        if not status.get("available"):
+                        silent: bool = True, cached_only: bool = False,
+                        caller: str = "unspecified") -> bool:
+    with INPUT_IO_LOCK:
+        client = client or rest
+        try:
+            if cached_only:
+                with INPUT_CAP_LOCK:
+                    status = dict(INPUT_CAPABILITIES.get(_input_cache_key(client)) or {})
+            else:
+                status = _input_status(client)
+            if not status.get("available"):
+                return False
+            _matrix_send([{"kind": "release_all"}], client=client)
+            return True
+        except Exception as exc:
+            if not silent:
+                raise
+            label = str(caller or "unspecified")
+            _warn_event(
+                "matrix-release-all",
+                f"could not release matrix input ({label}): {exc}",
+            )
             return False
-        _matrix_send([{"kind": "release_all"}], client=client)
-        return True
-    except Exception as exc:
-        if not silent:
-            raise
-        _warn_event("matrix-release-all", f"could not release matrix input: {exc}")
+
+
+def _matrix_release_cleanup(*, caller: str) -> bool:
+    """Run one non-blocking, coalesced WebSocket safety release.
+
+    This helper is called from a worker thread so an Ultimate timeout cannot
+    block the asyncio event loop and make the entire UI appear unresponsive.
+    """
+    if not MATRIX_CLEANUP_LOCK.acquire(blocking=False):
+        _diag_event("info", f"matrix release cleanup skipped ({caller}) — already active")
         return False
+    try:
+        return _matrix_release_all(
+            silent=True,
+            cached_only=True,
+            caller=caller,
+        )
+    finally:
+        MATRIX_CLEANUP_LOCK.release()
+
+
+def _legacy_type(data: bytes, *, chunk: int = 8, delay: float = 0.02):
+    """Serialised wrapper for legacy KERNAL keyboard-buffer injection."""
+    with INPUT_IO_LOCK:
+        if chunk == 8 and abs(float(delay) - 0.02) < 0.0001:
+            return cmd.type_petscii(data)
+        return cmd.type_petscii(data, chunk=chunk, delay=delay)
 
 
 def cache_image(name: str, data: bytes) -> dict:
@@ -995,7 +1038,7 @@ def _disconnect_discovery_session() -> None:
         old_rest, old_cmd = rest, cmd
         try:
             if old_rest:
-                _matrix_release_all(client=old_rest, silent=True, cached_only=True)
+                _matrix_release_all(client=old_rest, silent=True, cached_only=True, caller="disconnect-session")
         except Exception:
             pass
         if old_rest and "STREAM_STATE" in globals():
@@ -1053,7 +1096,23 @@ async def api_discover_clear(subnet: str = Query(""), port: int = Query(80)):
 
 @app.post("/api/connect")
 def api_connect(payload: dict = Body(...)):
-    """Switch device and use a verified Wi-Fi REST control path when useful."""
+    """Switch device and report timing for each connection stage."""
+    started = time.perf_counter()
+    timing: dict[str, float | bool | str] = {}
+
+    def mark(name: str, stage_started: float) -> float:
+        now = time.perf_counter()
+        timing[name] = round((now - stage_started) * 1000.0, 1)
+        return now
+
+    def finish(success: bool, *, error: str = "") -> None:
+        timing["success"] = bool(success)
+        timing["total_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+        if error:
+            timing["error"] = str(error)[:500]
+        rendered = ", ".join(f"{key}={value}" for key, value in timing.items())
+        _diag_event("info" if success else "warning", f"Connect timing: {rendered}")
+
     host = (payload.get("host") or "").strip()
     if not host:
         raise HTTPException(400, "host required")
@@ -1061,22 +1120,45 @@ def api_connect(payload: dict = Body(...)):
         raise HTTPException(409, "stop the storage index before switching devices")
     global rest, cmd, devfs
     password = payload.get("password", CFG.get("password", ""))
+
+    stage = time.perf_counter()
     control_host = _verified_control_host_for_selected(host)
     if control_host == host:
         control_host = _saved_control_host_for_selected(host)
+    mark("persisted_route_lookup_ms", stage)
+    timing["selected_host"] = host
+    timing["control_host"] = control_host
+
+    stage = time.perf_counter()
+    new_rest = new_cmd = new_devfs = None
     try:
         new_rest = UltimateREST(control_host, password, coordinator=DEVICE_OP)
         new_cmd = CommandSocket(host, coordinator=DEVICE_OP)
         new_devfs = DeviceFS(host, CFG.get("ftp_user", "anonymous"),
                              CFG.get("ftp_password", ""), coordinator=DEVICE_OP)
     except Exception as e:
-        return {"connected": False, "host": host, "error": str(e)}
+        mark("client_creation_ms", stage)
+        for resource in (new_devfs, new_cmd, new_rest):
+            try:
+                if resource and hasattr(resource, "close"):
+                    resource.close()
+            except Exception:
+                pass
+        finish(False, error=str(e))
+        return {"connected": False, "host": host, "error": str(e),
+                "connect_timing": timing}
+    mark("client_creation_ms", stage)
 
     # Finder has already verified both addresses of the grouped device. Reuse
     # either live result; manual addresses retain the original verification.
+    stage = time.perf_counter()
     device_info = (_discovery_info_for_host(host)
                    or _discovery_info_for_host(control_host))
     reused_discovery = bool(device_info)
+    mark("verified_result_lookup_ms", stage)
+    timing["reused_discovery"] = reused_discovery
+
+    stage = time.perf_counter()
     if not device_info:
         try:
             device_info = new_rest.info()
@@ -1088,20 +1170,41 @@ def api_connect(payload: dict = Body(...)):
                 try:
                     new_rest.close()
                     control_host = host
+                    timing["control_host"] = control_host
+                    timing["alternate_fallback"] = True
                     new_rest = UltimateREST(host, password, coordinator=DEVICE_OP)
                     device_info = new_rest.info()
                 except Exception as fallback_error:
-                    new_rest.close()
-                    new_cmd.close()
+                    mark("live_verification_ms", stage)
+                    for resource in (new_devfs, new_cmd, new_rest):
+                        try:
+                            if resource and hasattr(resource, "close"):
+                                resource.close()
+                        except Exception:
+                            pass
+                    finish(False, error=str(fallback_error))
                     return {"connected": False, "host": host,
                             "error": str(fallback_error),
-                            "alternate_error": str(first_error)}
+                            "alternate_error": str(first_error),
+                            "connect_timing": timing}
             else:
-                new_rest.close()
-                new_cmd.close()
-                return {"connected": False, "host": host, "error": str(first_error)}
+                mark("live_verification_ms", stage)
+                for resource in (new_devfs, new_cmd, new_rest):
+                    try:
+                        if resource and hasattr(resource, "close"):
+                            resource.close()
+                    except Exception:
+                        pass
+                finish(False, error=str(first_error))
+                return {"connected": False, "host": host, "error": str(first_error),
+                        "connect_timing": timing}
+    mark("live_verification_ms", stage)
 
+    wait_started = time.perf_counter()
     with DEVICE_OP.operation("interactive", "switching Ultimate device"):
+        acquired = time.perf_counter()
+        timing["coordinator_wait_ms"] = round((acquired - wait_started) * 1000.0, 1)
+        commit_started = acquired
         old_rest, old_cmd, old_devfs = rest, cmd, devfs
         old_selected_host = str(CFG.get("u64_host", "") or "").strip()
         old_control_host = str(getattr(old_rest, "host", "") or old_selected_host).strip()
@@ -1123,19 +1226,29 @@ def api_connect(payload: dict = Body(...)):
                     STREAM_STATE[stream_name] = False
 
         if host_changed and old_rest and not same_device:
-            _matrix_release_all(client=old_rest, silent=True, cached_only=True)
+            _matrix_release_all(
+                client=old_rest,
+                silent=True,
+                cached_only=True,
+                caller="connect-device-switch",
+            )
 
         rest, cmd, devfs = new_rest, new_cmd, new_devfs
         if host_changed or old_control_host != control_host:
             _reset_readmem_support(control_host)
+        capability_started = time.perf_counter()
         input_status = (_transfer_input_capability(old_control_host, control_host)
                         if same_device else _cached_input_status(new_rest))
+        timing["capability_handling_ms"] = round(
+            (time.perf_counter() - capability_started) * 1000.0, 1)
         CFG["u64_host"] = host
         CFG["rest_control_host"] = control_host
         CFG["password"] = password
         link_status = _link_payload(host, info_payload=device_info, force=False,
                                     persist=True, client=new_rest)
         save_config()
+        timing["backend_replace_commit_ms"] = round(
+            (time.perf_counter() - commit_started) * 1000.0, 1)
         if control_host != host:
             _diag_event(
                 "info",
@@ -1143,6 +1256,7 @@ def api_connect(payload: dict = Body(...)):
                 f"REST control via verified Wi-Fi {control_host}; "
                 "streams and command socket remain on Ethernet",
             )
+        cleanup_started = time.perf_counter()
         try:
             if old_cmd and old_cmd is not new_cmd:
                 old_cmd.close()
@@ -1152,11 +1266,15 @@ def api_connect(payload: dict = Body(...)):
                 old_devfs.close()
         except Exception:
             pass
+        timing["old_client_cleanup_ms"] = round(
+            (time.perf_counter() - cleanup_started) * 1000.0, 1)
+
+    finish(True)
     return {
         "connected": True, "host": host, "control_host": control_host,
         "rest_via_alternate": control_host != host,
         "info": device_info, "input": input_status, "link": link_status,
-        "reused_discovery": reused_discovery,
+        "reused_discovery": reused_discovery, "connect_timing": timing,
     }
 
 
@@ -1164,7 +1282,7 @@ def api_connect(payload: dict = Body(...)):
 
 def _clean_shutdown():
     _juke_cancel_timer()
-    _matrix_release_all(silent=True, cached_only=True)
+    _matrix_release_all(silent=True, cached_only=True, caller="shutdown")
     global _INDEX_STORE, _INDEX_STORE_PATH, _INDEX_THREAD
     if INDEXJOB.get("running"):
         INDEXJOB["stop"] = True
@@ -1392,7 +1510,7 @@ def machine(action: str):
         with DEVICE_OP.operation("interactive", f"machine {action}"):
             if action in {"reset", "reboot"}:
                 _juke_disarm_machine_takeover(f"machine {action}")
-                _matrix_release_all(silent=True)
+                _matrix_release_all(silent=True, caller=f"machine-{action}")
             result = rest.put(f"/v1/machine:{action}")
             if action == "reboot":
                 _sid_runner_clear_reboot_required(rest)
@@ -1613,7 +1731,7 @@ async def mount_upload(drive: str = Form("a"), mode: str = Form("readwrite"),
     drive, mode = _drive_key(drive), _mount_mode(mode)
     name, data = await _read_upload(file, MAX_MOUNT_UPLOAD)
     try:
-        _matrix_release_all(silent=True)
+        _matrix_release_all(silent=True, caller="mount-upload")
         out = await run_in_threadpool(rest.mount_attachment, drive, name, data,
                                       mode=mode)
         _remember_mount(drive, mode, name=name)
@@ -1627,7 +1745,7 @@ def mount_device(drive: str = "a", mode: str = "readwrite", image: str = Query(.
     drive, mode = _drive_key(drive), _mount_mode(mode)
     _swap_build_from_device(image, drive, mode)
     try:
-        _matrix_release_all(silent=True)
+        _matrix_release_all(silent=True, caller="mount-device")
         out = rest.mount_path(drive, image, mode=mode)
         _remember_mount(drive, mode, path=image, name=image.rsplit("/", 1)[-1])
         return _swap_response(out)
@@ -1694,7 +1812,7 @@ def _copy_device_file(source: str, destination: str | None = None, tag: str = "c
     if destination == source:
         raise HTTPException(400, "destination must differ from source")
     with DEVICE_OP.operation("interactive", f"copying {source}"):
-        _matrix_release_all(silent=True)
+        _matrix_release_all(silent=True, caller="copy-device-file")
         data = devfs.fetch(source, max_size=MAX_MOUNT_UPLOAD)
         devfs.upload(destination, data)
     parent = destination.rsplit("/", 1)[0] or "/"
@@ -1720,7 +1838,7 @@ def mount_backup_then_rw(payload: dict = Body(...)):
     drive = _drive_key(payload.get("drive", "a"))
     try:
         backup = _copy_device_file(source, None, "backup")
-        _matrix_release_all(silent=True)
+        _matrix_release_all(silent=True, caller="backup-then-rw")
         out = rest.mount_path(drive, source, mode="readwrite")
         _remember_mount(drive, "readwrite", path=source, name=source.rsplit("/", 1)[-1])
         _swap_build_from_device(source, drive, "readwrite")
@@ -1813,7 +1931,7 @@ def image_mount_load(token: str, index: int = Query(...), drive: str = Query("a"
     try:
         with DEVICE_OP.operation("interactive", "mounting and loading disk file"):
             _juke_disarm_machine_takeover("Mount & Load")
-            _matrix_release_all(silent=True)
+            _matrix_release_all(silent=True, caller="mount-load")
             if device_path:
                 rest.mount_path(drive, device_path, mode=mode)
             else:
@@ -1825,9 +1943,9 @@ def image_mount_load(token: str, index: int = Query(...), drive: str = Query("a"
             _boot_settle()
             bus_id = _bus_id_for(drive)
             line = b'LOAD"' + f.raw_name + b'"' + f',{bus_id},1\r'.encode()
-            cmd.type_petscii(line)
+            _legacy_type(line)
             time.sleep(0.4)
-            cmd.type_petscii(b"RUN\r")
+            _legacy_type(b"RUN\r")
             return _swap_response({"errors": [], "typed": f'LOAD"{f.name}",{bus_id},1 + RUN'}) if device_path else {"errors": [], "typed": f'LOAD"{f.name}",{bus_id},1 + RUN'}
     except (UltimateError, httpx.HTTPError) as e:
         err(e)
@@ -1870,7 +1988,7 @@ def _send_boot_prekey(delay: float = 1.0, retry_window: float = 0.0) -> str | No
                                "transition": "tap"}],
                              force_probe=attempts > 0)
             else:
-                cmd.type_petscii(bytes([_PREKEYS[prekey]]))
+                _legacy_type(bytes([_PREKEYS[prekey]]))
             return prekey
         except (UltimateError, httpx.HTTPError):
             if time.monotonic() >= deadline:
@@ -1902,6 +2020,12 @@ def _boot_settle():
 _BASIC_GATE_POLL = 0.5
 _BASIC_GATE_TIMEOUT = 120.0
 _READMEM_SUPPORT: dict[str, bool] = {}
+
+# Hardware diagnostics showed that the CIA1-capable U64 could acknowledge
+# port-64 keyboard-buffer writes while discarding the first eight-byte LOAD
+# chunk. RC15 therefore uses one ordered matrix-input batch for the complete
+# command on CIA1 firmware and retains the proven one-shot buffer path only for
+# Legacy devices.
 
 
 def _readmem_cache_key() -> str:
@@ -1937,6 +2061,77 @@ def _read_basic_ready_flag() -> int | None:
     if key:
         _READMEM_SUPPORT[key] = True
     return data[0] if data else -1
+
+
+_MOUNT_RUN_MATRIX_CHAR_INPUTS = {
+    '"': ["left_shift", "2"],
+    "*": ["star"],
+    ",": ["comma"],
+    "\r": ["return"],
+    "\n": ["return"],
+}
+
+
+def _mount_run_matrix_events(text: str, *, release_first: bool = True) -> list[dict]:
+    """Translate the small BASIC command subset used by Mount & Run.
+
+    CIA1-capable firmware receives the complete LOAD/RUN line as one ordered
+    ``machine:input`` event batch.  This deliberately avoids the port-64
+    KERNAL-buffer boundary which hardware diagnostics showed could discard the
+    first eight-byte LOAD chunk on repeated launches.
+    """
+    events: list[dict] = []
+    if release_first:
+        events.append({"kind": "release_all"})
+    for char in str(text):
+        lower = char.lower()
+        if "a" <= lower <= "z" or "0" <= char <= "9":
+            inputs = [lower if char.isalpha() else char]
+        else:
+            inputs = _MOUNT_RUN_MATRIX_CHAR_INPUTS.get(char)
+        if not inputs:
+            raise ValueError(f"unsupported Mount & Run matrix character {char!r}")
+        events.append({"kind": "keyboard", "inputs": list(inputs), "transition": "tap"})
+    return events
+
+
+def _type_mount_run_load(data: bytes) -> tuple[bool, str]:
+    """Deliver the complete Mount & Run LOAD line on the proven device path.
+
+    CIA1-capable Ultimate 64 firmware uses one ordered matrix-input batch for
+    the entire command.  Legacy-only C64 Ultimate firmware retains the exact
+    established one-shot KERNAL-buffer path that did not reproduce the fault.
+    An ambiguous matrix failure is never followed by a Legacy resend.
+    """
+    payload = bytes(data)
+    if not payload:
+        return False, "LOAD command is empty"
+
+    status = _input_status(rest)
+    if status.get("available"):
+        try:
+            command = payload.decode("ascii")
+            events = _mount_run_matrix_events(command)
+            _matrix_send(events, client=rest)
+        except Exception as exc:
+            note = f"CIA1 matrix LOAD delivery failed — LOAD not resent ({exc})"
+            _warn_event("mount-load-delivery", f"Mount & Run: {note}")
+            _diag_event("warning", "Mount & Run LOAD delivery: CIA1 matrix failed")
+            return False, note
+        taps = sum(1 for event in events if event.get("kind") == "keyboard")
+        _diag_event(
+            "info",
+            f"Mount & Run LOAD delivery: CIA1 matrix ({taps} ordered key taps)",
+        )
+        return True, "CIA1 matrix"
+
+    _legacy_type(payload)
+    _diag_event(
+        "info",
+        "Mount & Run LOAD delivery: Legacy KERNAL buffer "
+        "(established one-shot path retained)",
+    )
+    return True, "Legacy KERNAL buffer"
 
 
 def _basic_ready_gate(stage: str, *, timeout: float = _BASIC_GATE_TIMEOUT,
@@ -2003,12 +2198,10 @@ _RUN_MATRIX_EVENTS = [
 def _dispatch_run_after_gate() -> tuple[bool, str]:
     """Deliver RUN after the load gate using the best proven transport.
 
-    LOAD deliberately remains on the established command-buffer path. On a
-    CIA1-capable U64, the post-load RUN line uses matrix key taps because bench
-    testing showed that a fresh buffer write can be acknowledged without being
-    consumed after a genuine drive load. Legacy/C64U sessions keep the existing
-    command-buffer delivery. A failed matrix request is not followed by a
-    second transport, avoiding a late duplicate RUN after an ambiguous timeout.
+    CIA1-capable U64 sessions use matrix key taps for both LOAD and RUN. Legacy
+    C64U sessions keep the established command-buffer delivery. A failed matrix
+    request is not followed by a second transport, avoiding a late duplicate
+    command after an ambiguous timeout.
     """
     status = _input_status(rest)
     if status.get("available"):
@@ -2022,7 +2215,7 @@ def _dispatch_run_after_gate() -> tuple[bool, str]:
         _diag_event("info", "Mount & Run RUN delivery: CIA1 matrix")
         return True, "CIA1 matrix"
 
-    cmd.type_petscii(b"RUN\r")
+    _legacy_type(b"RUN\r")
     _diag_event("info", "Mount & Run RUN delivery: Legacy KERNAL buffer")
     return True, "Legacy KERNAL buffer"
 
@@ -2031,15 +2224,25 @@ def _mount_and_boot(drive: str, mode: str, *, device_path: str = None,
                     name: str = None, data: bytes = None):
     """Mount an image and autostart it: reset, LOAD"*",{bus},1 + RUN.
 
-    LOAD uses the established keyboard-buffer path. On firmware with
-    machine:readmem, readiness gates protect both stages and CIA1-capable U64s
-    deliver the final RUN line through matrix key taps. Legacy devices keep the
-    buffer path; a readmem 404 retains the established fixed-delay behaviour.
+    Readiness gates protect both stages when machine:readmem is available.
+    CIA1-capable U64s deliver the complete LOAD and RUN lines through ordered
+    matrix key taps. Legacy devices retain the established one-shot KERNAL
+    buffer path; a readmem 404 retains the fixed-delay readiness behaviour.
     """
     drive, mode = _drive_key(drive), _mount_mode(mode)
     with DEVICE_OP.operation("interactive", "mounting and booting disk"):
         _juke_disarm_machine_takeover("Mount & Run")
-        _matrix_release_all(silent=True)
+        cached_input = _cached_input_status(rest)
+        matrix_expected = cached_input.get("available") is True
+        released = _matrix_release_all(
+            silent=True,
+            cached_only=True,
+            caller="mount-run-start",
+        )
+        if matrix_expected and not released:
+            note = "CIA1 matrix release failed — Mount & Run aborted"
+            _warn_event("mount-input-release", f"Mount & Run: {note}")
+            return {"errors": [], "typed": "", "note": note}
         _sid_runner_reboot_before_mount_run()
         if device_path:
             rest.mount_path(drive, device_path, mode=mode)
@@ -2057,12 +2260,20 @@ def _mount_and_boot(drive: str, mode: str, *, device_path: str = None,
             _warn_event("mount-boot-gate", f"Mount & Run: {note}")
             return {"errors": [], "typed": "", "note": note}
 
-        cmd.type_petscii((load_line + "\r").encode())
+        load_sent, load_delivery = _type_mount_run_load(
+            (load_line + "\r").encode()
+        )
+        if not load_sent:
+            note = f"LOAD not completed — {load_delivery}"
+            _warn_event("mount-load-delivery", f"Mount & Run: {note}")
+            return {"errors": [], "typed": "", "note": note}
 
         if boot_gate == "unsupported":
             time.sleep(0.4)
-            cmd.type_petscii(b"RUN\r")
-            return {"errors": [], "typed": f"{load_line} + RUN"}
+            delivered, delivery = _dispatch_run_after_gate()
+            if delivered:
+                return {"errors": [], "typed": f"{load_line} + RUN"}
+            return {"errors": [], "typed": load_line, "note": delivery}
 
         load_gate = _basic_ready_gate("load", grace=1.0)
         if load_gate == "ready":
@@ -2073,8 +2284,10 @@ def _mount_and_boot(drive: str, mode: str, *, device_path: str = None,
                     "note": delivery}
         if load_gate == "unsupported":
             time.sleep(0.4)
-            cmd.type_petscii(b"RUN\r")
-            return {"errors": [], "typed": f"{load_line} + RUN"}
+            delivered, delivery = _dispatch_run_after_gate()
+            if delivered:
+                return {"errors": [], "typed": f"{load_line} + RUN"}
+            return {"errors": [], "typed": load_line, "note": delivery}
 
         note = "load still running — RUN not sent"
         _warn_event("mount-load-gate", f"Mount & Run: {note}")
@@ -2423,7 +2636,7 @@ def keys(payload: dict = Body(...)):
     if len(data) > 512:
         raise HTTPException(400, "too much text at once")
     try:
-        cmd.type_petscii(data)
+        _legacy_type(data)
         return {"errors": [], "sent": len(data)}
     except UltimateError as e:
         err(e)
@@ -2439,8 +2652,6 @@ def _stream_ctl(name: str, on: bool):
     if on and _current_link_payload().get("link_type") == LINK_WIFI:
         raise UltimateError(
             "Streaming is not available over the Ultimate Wi-Fi interface; connect using Ethernet")
-    if not on:
-        _matrix_release_all(silent=True)
     stream_id = {"video": 0, "audio": 1}[name]
     port = CFG["video_port"] if name == "video" else CFG["audio_port"]
     recv = video if name == "video" else audio
@@ -2604,7 +2815,12 @@ async def ws_video(ws: WebSocket, buffer: int = 1):
         pass                                   # client gone or server stopping
     finally:
         video.unsubscribe(on_frame)
-        _matrix_release_all(silent=True)
+        # Keyboard capture is associated with the screen/video session.  Run
+        # the safety release in a worker thread so an Ultimate REST timeout
+        # cannot block the asyncio event loop and freeze the whole UI.
+        await run_in_threadpool(
+            lambda: _matrix_release_cleanup(caller="ws-video-disconnect")
+        )
 
 
 @app.websocket("/ws/audio")
@@ -2634,7 +2850,9 @@ async def ws_audio(ws: WebSocket):
         pass                                   # client gone or server stopping
     finally:
         audio.unsubscribe(on_chunk)
-        _matrix_release_all(silent=True)
+        # Audio has no keyboard ownership.  Releasing matrix input here caused
+        # duplicate cleanup requests when video and audio sockets closed
+        # together, so only the video session performs the safety release.
 
 
 # --- Assembly64 ----------------------------------------------------------
@@ -2776,7 +2994,7 @@ def _asm_deploy_bytes(filename: str, action: str, data: bytes):
         return cache_image(filename, data)
     if action in ("mount_a", "mount_b"):
         drive, mode = action[-1], _mount_mode(None)
-        _matrix_release_all(silent=True)
+        _matrix_release_all(silent=True, caller=f"assembly64-{action}")
         out = rest.mount_attachment(drive, filename, data, mode=mode)
         _remember_mount(drive, mode, name=filename)
         return out
@@ -2787,7 +3005,7 @@ def _asm_deploy_bytes(filename: str, action: str, data: bytes):
     if low.endswith((".d64", ".d71", ".d81", ".g64")):
         mode = _mount_mode(None)
         def mount_and_reset():
-            _matrix_release_all(silent=True)
+            _matrix_release_all(silent=True, caller="assembly64-disk-run")
             out = rest.mount_attachment("a", filename, data, mode=mode)
             _remember_mount("a", mode, name=filename)
             rest.put("/v1/machine:reset")
@@ -4238,7 +4456,7 @@ def _swap_go(index: int):
     index = index % len(SWAP["items"])
     it = SWAP["items"][index]
     try:
-        _matrix_release_all(silent=True)
+        _matrix_release_all(silent=True, caller="disk-swap")
         if it["kind"] == "device":
             rest.mount_path(SWAP["drive"], it["path"], mode=SWAP["mode"])
         else:
@@ -6315,7 +6533,7 @@ def _juke_stop_impl():
         primary_route = "REST"
 
     try:
-        _matrix_release_all(silent=True, cached_only=True)
+        _matrix_release_all(silent=True, cached_only=True, caller="juke-stop")
     except Exception:
         pass
 
@@ -6468,7 +6686,7 @@ def library_run(name: str = Query(...), drive: str = Query("a")):
             drive, mode = _drive_key(drive), _mount_mode(None)
             with DEVICE_OP.operation("interactive", "launching library disk"):
                 _juke_disarm_machine_takeover("launching library disk")
-                _matrix_release_all(silent=True)
+                _matrix_release_all(silent=True, caller="library-disk-run")
                 out = rest.mount_attachment(drive, p.name, data, mode=mode)
                 _remember_mount(drive, mode, name=p.name)
                 rest.put("/v1/machine:reset")

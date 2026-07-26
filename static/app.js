@@ -190,9 +190,21 @@ function renderHelp(){
   $("#helpContent").innerHTML=active?`<h2>${esc(active.title)}</h2>${active.body}`:'<div class="help-empty">No help topics match that search.</div>';
 }
 document.addEventListener("keydown",e=>{if(e.key==="Escape"&&$("#helpOverlay")?.style.display!=="none"){e.preventDefault();closeHelp()}});
+function diagnosticsSuggestedName(){
+  const d=new Date(),pad=n=>String(n).padStart(2,"0");
+  return `u64deck-diagnostics-${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.zip`;
+}
 async function downloadDiagnostics(){
-  toast("building sanitised diagnostics…","ok");
+  let handle=null,writable=null;
   try{
+    // Ask for the destination while this function still has the original click
+    // activation. The writable stream is explicitly committed and closed after
+    // the diagnostics ZIP has been received.
+    if(window.showSaveFilePicker){
+      try{handle=await showSaveFilePicker({suggestedName:diagnosticsSuggestedName(),types:[{description:"ZIP archive",accept:{"application/zip":[".zip"]}}]})}
+      catch(e){if(e.name==="AbortError")return;throw e}
+    }
+    toast("building sanitised diagnostics…","ok");
     const payload={browser:{userAgent:navigator.userAgent,language:navigator.language,platform:navigator.platform,
       hardwareConcurrency:navigator.hardwareConcurrency||"",mediaRecorder:typeof MediaRecorder!=="undefined",
       showSaveFilePicker:typeof showSaveFilePicker!=="undefined",location:location.origin,recording:recSettings(),
@@ -200,29 +212,45 @@ async function downloadDiagnostics(){
         selected:chooseRecordingFormat(recSettings().mode,recSettings().format)?.mime||"unsupported"}}};
     const r=await fetch("/api/diagnostics/export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
     if(!r.ok){let j={};try{j=await r.json()}catch(e){}throw new Error(j.detail||r.statusText)}
-    const blob=await r.blob(),cd=r.headers.get("content-disposition")||"",m=cd.match(/filename="([^"]+)"/),name=m?m[1]:"u64deck-diagnostics.zip";
-    const url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),30000);
+    const blob=await r.blob(),cd=r.headers.get("content-disposition")||"",m=cd.match(/filename="([^"]+)"/),name=m?m[1]:diagnosticsSuggestedName();
+    if(handle){
+      try{writable=await handle.createWritable();await writable.write(blob);await writable.close();writable=null}
+      catch(e){
+        if(writable){try{if(typeof writable.abort==="function")await writable.abort();else await writable.close()}catch(closeError){}writable=null}
+        throw e;
+      }
+    }else{
+      const url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=name;
+      document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);
+    }
     toast("diagnostics exported ✓","ok");
-  }catch(e){toast(e.message,"err")}
+  }catch(e){
+    if(writable){try{if(typeof writable.abort==="function")await writable.abort();else await writable.close()}catch(closeError){}}
+    toast(e.message,"err");
+  }
 }
 
 /* ---------- discovery ---------- */
-let DISCOVERY_SCAN_ACTIVE=false;
+let DISCOVERY_SCAN_ACTIVE=false,DISCOVERY_DIALOG_OPEN=false;
 const DISCOVERY_SELECTION={};
+function closeDiscover(resumePolling=true){
+  DISCOVERY_DIALOG_OPEN=false;const ov=$("#discOverlay");if(ov)ov.remove();
+  if(resumePolling&&!DISCOVERY_SCAN_ACTIVE)setTimeout(()=>{loadInfo();refreshDrives()},0);
+}
 function openDiscover(){
-  let ov=$("#discOverlay");
+  DISCOVERY_DIALOG_OPEN=true;let ov=$("#discOverlay");
   if(!ov){
     ov=document.createElement("div");ov.id="discOverlay";
     ov.style.cssText="position:fixed;inset:0;background:rgba(0,0,0,.72);display:flex;align-items:flex-start;justify-content:center;padding-top:9vh;z-index:50";
     ov.innerHTML=`<div class="panel" style="width:min(620px,92vw)">
       <h2>FIND ULTIMATE DEVICES</h2>
-      <div id="discBody" class="hint">Checks previously verified addresses first, then sends one bounded
-        Ultimate <code>/v1/info</code> request to each remaining address on the local /24. Ethernet and Wi-Fi
-        interfaces are grouped into one physical device. Only interfaces verified during this scan are shown.</div>
+      <div id="discBody" class="hint">Includes previously verified addresses at the front of the same bounded
+        concurrent <code>/v1/info</code> pass as the local /24, so stale history cannot delay the fresh scan.
+        Ethernet and Wi-Fi interfaces are grouped into one physical device. Only interfaces verified during this scan are shown.</div>
       <div class="row" style="margin-top:10px">
         <button class="primary" id="discGo" onclick="runDiscover()">Scan network</button>
         <input id="discSubnet" placeholder="extra subnet e.g. 192.168.50." style="flex:1">
-        <button onclick="$('#discOverlay').remove()">Close</button>
+        <button onclick="closeDiscover()">Close</button>
       </div>
       <div class="row" style="margin-top:10px">
         <input id="discManual" placeholder="…or type an IP manually" style="flex:1"
@@ -233,7 +261,7 @@ function openDiscover(){
         <button class="danger" id="discClear" onclick="clearDiscoveredDevices()">Clear discovered devices</button>
         <span class="hint">Recovery option: clears remembered hosts only, then performs a fresh scan.</span>
       </div></div>`;
-    ov.addEventListener("click",e=>{if(e.target===ov)ov.remove()});
+    ov.addEventListener("click",e=>{if(e.target===ov)closeDiscover()});
     document.body.appendChild(ov);
   }
 }
@@ -271,7 +299,7 @@ function renderDiscoveryResults(r){
 async function runDiscover(){
   const body=$("#discBody"),btn=$("#discGo"),clear=$("#discClear");
   btn.disabled=true;if(clear)clear.disabled=true;DISCOVERY_SCAN_ACTIVE=true;
-  body.innerHTML="Checking known addresses, then scanning the local /24… <span class='cursor'></span>";
+  body.innerHTML="Scanning remembered and local-/24 addresses together… <span class='cursor'></span>";
   try{
     const sub=$("#discSubnet").value.trim();
     const r=await api("/api/discover"+(sub?"?subnet="+encodeURIComponent(sub):""),{timeoutMs:30000});
@@ -279,6 +307,7 @@ async function runDiscover(){
   }catch(e){body.innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`}
   finally{
     DISCOVERY_SCAN_ACTIVE=false;btn.disabled=false;if(clear)clear.disabled=false;
+    if(!DISCOVERY_DIALOG_OPEN)setTimeout(()=>{loadInfo();refreshDrives()},0);
   }
 }
 async function clearDiscoveredDevices(){
@@ -298,7 +327,8 @@ async function clearDiscoveredDevices(){
     toast("Discovery history cleared — scanning for Ultimate devices.","ok");
     renderDiscoveryResults(r);
   }catch(e){body.innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`}
-  finally{DISCOVERY_SCAN_ACTIVE=false;if(btn)btn.disabled=false;if(clear)clear.disabled=false}
+  finally{DISCOVERY_SCAN_ACTIVE=false;if(btn)btn.disabled=false;if(clear)clear.disabled=false;
+    if(!DISCOVERY_DIALOG_OPEN)setTimeout(()=>{loadInfo();refreshDrives()},0)}
 }
 function scheduleInputProbe(delay=2500){
   clearTimeout(INPUT_PROBE_TIMER);INPUT_PROBE_TIMER=setTimeout(()=>{
@@ -309,19 +339,26 @@ function scheduleInputProbe(delay=2500){
 }
 async function connectTo(host){
   host=(host||"").trim();if(!host||uiInteractive())return;
+  const connectStarted=performance.now(),body=$("#discBody");
+  if(body)body.innerHTML=`Connecting to <b>${esc(host)}</b>… <span class='cursor'></span>`;
+  toast("Connecting to "+host+"…","ok");
   uiInteractiveStart();
   try{
     const r=await api("/api/connect",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({host}),timeoutMs:30000});
     if(r.connected){
-      toast("Connected to "+host+(r.rest_via_alternate?" · REST control via "+r.control_host:""),"ok");
+      const elapsed=Math.round(Number(r.connect_timing?.total_ms)||performance.now()-connectStarted);
+      toast("Connected to "+host+(r.rest_via_alternate?" · REST control via "+r.control_host:"")+` · ${elapsed} ms`,"ok");
       if(r.input){INPUT_STATUS=r.input;renderInputMode()}
       if(r.link)applyLinkStatus(r.link);
       if(r.info){LAST_DEVICE_INFO=r.info;INFO_FAILURES=0;renderDeviceInfo(r.info)}
-      matrixClearLocalState();const ov=$("#discOverlay");if(ov)ov.remove();
+      matrixClearLocalState();closeDiscover(false);
       if(INPUT_STATUS.pending||INPUT_STATUS.available===null)scheduleInputProbe();
-    }else toast("Could not connect to "+host+": "+r.error,"err");
-  }catch(e){toast(e.message,"err")}
+    }else{
+      if(body)body.innerHTML=`<span style="color:var(--err)">Could not connect to ${esc(host)}: ${esc(r.error||"unknown error")}</span>`;
+      toast("Could not connect to "+host+": "+r.error,"err");
+    }
+  }catch(e){if(body)body.innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`;toast(e.message,"err")}
   finally{uiInteractiveEnd()}
 }
 
@@ -405,7 +442,7 @@ function linkBadgeHtml(){
 function closeLocalStreamsForLinkChange(){
   clearTimeout(VIDEO_NO_FRAME_TIMER);VIDEO_NO_FRAME_TIMER=null;
   videoWanted=false;videoOn=false;if(wsV){const old=wsV;wsV=null;old.onclose=null;old.close()}
-  audioWanted=false;audioOn=false;clearTimeout(audioReconnectTimer);audioReconnectTimer=null;if(wsA){const old=wsA;wsA=null;old.onclose=null;old.close()}
+  audioWanted=false;audioOn=false;clearTimeout(audioReconnectTimer);audioReconnectTimer=null;flushBrowserAudio();if(wsA){const old=wsA;wsA=null;old.onclose=null;old.close()}
   $("#btnVideo").textContent="Start video";$("#btnVideo").classList.add("primary");setAudioState("off",0);
 }
 function renderLinkState(){
@@ -480,7 +517,7 @@ async function loadInputStatus(refresh=false){
   }finally{INPUT_STATUS_IN_FLIGHT=false}
 }
 async function loadInfo(){
-  if(DISCOVERY_SCAN_ACTIVE||uiInteractive()||INFO_IN_FLIGHT)return;
+  if(DISCOVERY_SCAN_ACTIVE||DISCOVERY_DIALOG_OPEN||uiInteractive()||INFO_IN_FLIGHT)return;
   INFO_IN_FLIGHT=true;
   try{
     if(!VER_SHOWN){try{const c=await api("/api/app_config");
@@ -807,6 +844,8 @@ let wsV=null,frames=0,videoOn=false,videoWanted=false,videoHasFrame=false,videoP
 let VIDEO_NO_FRAME_TIMER=null;
 let wsA=null,actx=null,nextT=0,audioOn=false,audioWanted=false,audioState="off",audioRate=0;
 let audioReconnectTimer=null;
+const AUDIO_SOURCES=new Set(),AUDIO_MAX_AHEAD=0.32,AUDIO_START_LEAD=0.04;
+let AUDIO_JUKE_STOP_MUTED=false;
 
 setInterval(()=>{
   $("#fps").textContent=frames+" fps";
@@ -874,7 +913,10 @@ function openVideoWS(){
   wsV.onmessage=ev=>drawFrame(ev.data);
   wsV.onerror=()=>{};
   wsV.onclose=()=>{
-    matrixReleaseAll("video WebSocket closed");
+    // The backend video disconnect handler performs the single coalesced
+    // hardware release. Clear only browser-side held/queued state here so the
+    // same socket close cannot create a second matrix REST request.
+    matrixClearLocalState();
     const unexpected=videoWanted;
     videoOn=false;videoWanted=false;wsV=null;
     $("#btnVideo").textContent="Start video";$("#btnVideo").classList.add("primary");
@@ -900,13 +942,20 @@ async function toggleVideo(){
   screenEl.focus()}
 
 /* ---------- audio ---------- */
-function playChunk(ab){const i16=new Int16Array(ab);const n=i16.length>>1;if(!n)return;
+function flushBrowserAudio(){
+  for(const src of [...AUDIO_SOURCES]){try{src.onended=null;src.stop()}catch(e){}try{src.disconnect()}catch(e){}}
+  AUDIO_SOURCES.clear();nextT=actx?actx.currentTime:0;achunks=0;
+}
+function playChunk(ab){if(!actx||!audioWanted||AUDIO_JUKE_STOP_MUTED)return;const i16=new Int16Array(ab);const n=i16.length>>1;if(!n)return;
+  const now=actx.currentTime;if(nextT>now+AUDIO_MAX_AHEAD)return;
   const buf=actx.createBuffer(2,n,47983);
   const L=buf.getChannelData(0),R=buf.getChannelData(1);
   for(let i=0;i<n;i++){L[i]=i16[2*i]/32768;R[i]=i16[2*i+1]/32768}
   const src=actx.createBufferSource();src.buffer=buf;src.connect(actx.destination);
   if(REC.audioDest)src.connect(REC.audioDest);
-  const t=Math.max(actx.currentTime+0.08,nextT);src.start(t);nextT=t+n/47983}
+  const t=Math.max(now+AUDIO_START_LEAD,nextT);if(t>now+AUDIO_MAX_AHEAD){try{src.disconnect()}catch(e){}return}
+  AUDIO_SOURCES.add(src);src.onended=()=>{AUDIO_SOURCES.delete(src);try{src.disconnect()}catch(e){}};
+  src.start(t);nextT=t+n/47983}
 function setAudioState(state,rate=audioRate){
   audioState=state;audioRate=rate;
   const badge=$("#aud"),button=$("#btnAudio");
@@ -928,7 +977,8 @@ function openAudioWS(reconnecting=false){
   wsA.onmessage=ev=>{audioOn=true;achunks++;if(audioState!=="live")setAudioState("live",Math.max(1,audioRate));playChunk(ev.data)};
   wsA.onerror=()=>{};
   wsA.onclose=()=>{
-    matrixReleaseAll("audio WebSocket closed");
+    // Audio has no relationship to keyboard capture; never release CIA1 input
+    // merely because the audio stream reconnects or stops.
     wsA=null;
     if(!audioWanted){audioOn=false;setAudioState("off",0);return}
     audioOn=false;setAudioState("reconnecting",0);
@@ -938,15 +988,15 @@ function openAudioWS(reconnecting=false){
 async function toggleAudio(){
   if(LINK_STATUS.link_type==="wifi"){toast("Streaming is not available over Wi-Fi. Switch to Ethernet to start audio.","err");return}
   if(REC.active&&REC.mode!=="video"&&audioWanted){toast("Stop recording before stopping audio","err");return}
-  if(audioWanted){audioWanted=false;clearTimeout(audioReconnectTimer);audioReconnectTimer=null;
+  if(audioWanted){audioWanted=false;clearTimeout(audioReconnectTimer);audioReconnectTimer=null;flushBrowserAudio();
     uiInteractiveStart();try{await put("/api/stream/audio/stop")}catch(e){}finally{uiInteractiveEnd()}
-    if(wsA){const old=wsA;wsA=null;old.close()}audioOn=false;achunks=0;nextT=0;setAudioState("off",0);return}
+    if(wsA){const old=wsA;wsA=null;old.close()}audioOn=false;setAudioState("off",0);return}
   audioWanted=true;setAudioState("connecting",0);
   try{
     const AudioCtor=window.AudioContext||window.webkitAudioContext;
     if(!AudioCtor)throw new Error("This browser does not support Web Audio");
     if(!actx)actx=new AudioCtor();
-    await actx.resume();nextT=0;
+    await actx.resume();flushBrowserAudio();
   }catch(e){audioWanted=false;audioOn=false;setAudioState("error",0);toast(e.message,"err");return}
   if(actx.state!=="running")
     toast("Browser blocked audio playback (AudioContext: "+actx.state+")","err");
@@ -1624,7 +1674,7 @@ function jumpToMountedDrives(){
   requestAnimationFrame(()=>$("#mountedDrivesPanel")?.scrollIntoView({behavior:"smooth",block:"start"}));
 }
 async function refreshDrives(){
-  if(DISCOVERY_SCAN_ACTIVE||uiInteractive()||DRIVES_IN_FLIGHT)return;
+  if(DISCOVERY_SCAN_ACTIVE||DISCOVERY_DIALOG_OPEN||uiInteractive()||DRIVES_IN_FLIGHT)return;
   DRIVES_IN_FLIGHT=true;
   try{const r=await api("/api/drives");
     if(r?.u64deck_discovery_busy||r?.u64deck_operation_busy){
@@ -2618,14 +2668,18 @@ function jkPlayCurrent(){jkPlay(Math.max(0,(JK.state||{}).index||0))}
 function jkPlaySong(s){if(JK.state&&JK.state.index>=0)jkPlay(JK.state.index,+s)}
 async function jkStop(){
   if(JK.stopPending)return;
-  JK.stopPending=true;
+  JK.stopPending=true;AUDIO_JUKE_STOP_MUTED=true;
+  // Stop all browser-scheduled audio immediately and drop incoming chunks until
+  // the backend reset completes. This prevents the live WebSocket from simply
+  // refilling the Web Audio queue while Stop is in flight.
+  flushBrowserAudio();
   // Make the controls respond immediately while the low-latency reset packet
   // is sent. Suppress the periodic refresh until the authoritative response
   // arrives so an older playing snapshot cannot flash back into the UI.
   if(JK.state){JK.state={...JK.state,playing:false};jkRender(JK.state)}
   try{jkRender(await put("/api/juke/stop",{timeoutMs:6000}))}
   catch(e){toast(e.message,"err")}
-  finally{JK.stopPending=false}
+  finally{flushBrowserAudio();AUDIO_JUKE_STOP_MUTED=false;JK.stopPending=false}
 }
 async function jk(a){try{jkRender(await put("/api/juke/"+a))}catch(e){toast(e.message,"err")}}
 async function jkShuffleSet(){try{

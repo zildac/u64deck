@@ -39,7 +39,7 @@ def main() -> int:
     parser.add_argument("--subnet", required=True, help="A /24 such as 192.168.249.0/24")
     parser.add_argument(
         "--cached", action="append", default=[], metavar="IP",
-        help="Previously known address to verify first; may be repeated.",
+        help="Previously known address to prioritise in the shared pass; may be repeated.",
     )
     parser.add_argument("--port", type=int, default=80)
     args = parser.parse_args()
@@ -61,21 +61,15 @@ def main() -> int:
             cached.append(str(address))
 
     started = time.perf_counter()
-    print("STAGE 1 — cached-first production transport")
-    cached_results = discovery_transport.scan_direct(
-        cached, 4, CONNECT_TIMEOUT, RESPONSE_TIMEOUT,
-        started, "cached-first", args.port)
-    _print_hits(cached_results)
-
     cached_set = set(cached)
     remaining = [str(address) for address in network.hosts() if str(address) not in cached_set]
-    print("STAGE 2 — direct /24 production transport")
-    subnet_results = discovery_transport.scan_direct(
-        remaining, 64, CONNECT_TIMEOUT, RESPONSE_TIMEOUT,
-        started, "direct-subnet", args.port)
-    _print_hits(subnet_results)
+    candidates = [*cached, *remaining]
+    print("ONE PASS — persisted candidates first, then the remaining /24")
+    all_results = discovery_transport.scan_direct(
+        candidates, 64, CONNECT_TIMEOUT, RESPONSE_TIMEOUT,
+        started, "direct-all", args.port)
+    _print_hits(all_results)
 
-    all_results = [*cached_results, *subnet_results]
     counts = discovery_transport.outcome_counts(all_results)
     total_ms = round((time.perf_counter() - started) * 1000.0, 1)
     print(f"Total runtime: {total_ms / 1000.0:.3f} seconds")
