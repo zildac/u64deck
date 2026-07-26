@@ -18,6 +18,16 @@ never selected automatically.
 This is an application-side routing workaround, not a firmware fix. Disable
 Ultimate Wi-Fi and power-cycle the device to restore normal wired REST latency
 when testing the Ethernet REST endpoint itself.
+
+> **⚠️ Recommendation: run your Ultimate with a single active interface.**
+> With both Ethernet and Wi-Fi enabled, the firmware behaviour above makes
+> control intermittently unreliable in practice — the same operation can
+> succeed one minute and time out the next, even with u64deck's split
+> routing working around the worst of it. **Ethernet-only** (disable Wi-Fi
+> in the Ultimate's network settings, then power-cycle) is the
+> configuration everything is happiest in. Dual-interface operation works,
+> but treat it as best-effort until the firmware behaviour changes.
+
 # u64deck
 
 **v1.9.0 — Release Candidate 16**
@@ -869,6 +879,10 @@ The **browser → u64deck** hop, however, is ours to secure:
   responses so the templates in `config.json` can be adapted if the service
   changes shape.
 - One image at a time is cached in RAM per browse (last 8 kept).
+- **Dual-interface (Ethernet + Wi-Fi both enabled) is best-effort.** The
+  firmware's ~2.5 s wired REST delay makes mixed-interface control
+  intermittently flaky; split routing reduces but does not eliminate it.
+  Single-interface — ideally Ethernet-only — is the reliable setup.
 
 ## Files
 
