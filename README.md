@@ -30,7 +30,7 @@ when testing the Ethernet REST endpoint itself.
 
 # u64deck
 
-**v1.9.0 — Release Candidate 16**
+**v1.9.0 — Release Candidate 17**
 
 
 A lightweight, self-hosted control deck for the **Ultimate 64** (and, minus the
@@ -182,7 +182,9 @@ The executable is fully self-contained and needs no Python installation. It crea
 **Windows:** double-click `start.bat` (installs dependencies on first run,
 then starts the server), open http://localhost:8064 and hit **Select Ultimate…**
 in the header — it sweeps your local subnet(s) and lists every Ultimate it
-finds; click **Use** to connect. No IP required.
+finds; click **Use** to connect. No IP required. Use **Exit u64deck** in
+the top bar to stop the Python server cleanly; closing only the browser window
+does not stop the server. The connected Ultimate continues running.
 
 ### Tier 3 — Anywhere else (or by hand)
 
@@ -454,7 +456,7 @@ The repo includes a PyInstaller spec and a GitHub Actions workflow
 1. Push this folder to a GitHub repo.
 2. The **build-exe** action runs on every push — grab `u64deck.exe` from the
    workflow's artifacts (Actions tab → latest run → *u64deck-windows*).
-3. Tag a release (`git tag v1.9.0-rc.16 && git push --tags`) and the exe is attached
+3. Tag a release (`git tag v1.9.0-rc.17 && git push --tags`) and the exe is attached
    to the GitHub Release automatically.
 
 Double-click the exe: it starts the server, opens your browser, and you hit

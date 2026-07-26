@@ -1387,7 +1387,7 @@ def test_frontend_is_split_without_a_build_tool():
 def test_release_metadata_is_centralised():
     import release
     assert server.VERSION == release.VERSION == "1.9.0"
-    assert release.RELEASE_LABEL == "Release Candidate 16"
+    assert release.RELEASE_LABEL == "Release Candidate 17"
     assert server.BUILD == release.build_id(server.ASSETS, Path(server.__file__).parent)
 
 
@@ -2350,7 +2350,7 @@ def test_release_help_and_now_playing_star_are_present():
     assert "jkToggleNowFavourite" in js
     assert ".u64deck-index.sqlite3" in help_js
     assert "star beside the playback controls" in help_js
-    assert "v1.9.0 — Release Candidate 16" in readme
+    assert "v1.9.0 — Release Candidate 17" in readme
     assert ".u64deck-index.sqlite3" in readme
     assert "Install every release into a **new, empty folder**" in readme
     assert "Do not copy `*-wal`" in readme
@@ -5725,3 +5725,112 @@ def test_rc15_stream_control_no_longer_releases_matrix_on_stop():
     assert "_matrix_release_all" not in source
     assert "_matrix_release_cleanup" not in source
 
+
+
+# --- v1.9.0 Release Candidate 17: local graceful exit ---
+
+def test_rc17_exit_ui_and_help_are_present():
+    static = Path(server.ASSETS) / "static"
+    html = (static / "index.html").read_text(encoding="utf-8")
+    js = (static / "app.js").read_text(encoding="utf-8")
+    help_js = (static / "help_content.js").read_text(encoding="utf-8")
+    assert 'id="btnAppExit"' in html
+    assert 'onclick="exitU64deck()"' in html
+    assert '"/api/app/exit"' in js
+    assert '"X-U64deck-Local-Exit":"1"' in js
+    assert "The connected Ultimate is still running." in js
+    assert "Exit u64deck" in help_js
+    assert "The Ultimate itself keeps running" in help_js
+
+
+def test_rc17_exit_is_loopback_only_and_requires_confirmation_header(monkeypatch):
+    from types import SimpleNamespace
+
+    scheduled = []
+    events = []
+    monkeypatch.setattr(server, "_schedule_app_exit", lambda delay=0.20: scheduled.append(delay))
+    monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: events.append((args, kwargs)))
+    server._APP_EXIT_REQUESTED.clear()
+    try:
+        remote = SimpleNamespace(
+            client=SimpleNamespace(host="192.168.1.25"),
+            headers={server._LOCAL_EXIT_HEADER: "1"},
+        )
+        with pytest.raises(HTTPException) as exc:
+            server.app_exit(remote)
+        assert exc.value.status_code == 403
+        assert scheduled == []
+
+        missing_header = SimpleNamespace(
+            client=SimpleNamespace(host="127.0.0.1"), headers={}
+        )
+        with pytest.raises(HTTPException) as exc:
+            server.app_exit(missing_header)
+        assert exc.value.status_code == 403
+        assert scheduled == []
+
+        local = SimpleNamespace(
+            client=SimpleNamespace(host="::1"),
+            headers={server._LOCAL_EXIT_HEADER: "1"},
+        )
+        result = server.app_exit(local)
+        assert result["stopping"] is True
+        assert scheduled == [0.20]
+        assert events and "Exit requested" in events[0][0][1]
+
+        # A double click is idempotent and does not schedule another shutdown.
+        assert server.app_exit(local)["stopping"] is True
+        assert scheduled == [0.20]
+    finally:
+        server._APP_EXIT_REQUESTED.clear()
+
+
+def test_rc17_managed_server_exit_and_dedicated_edge_cleanup(monkeypatch):
+    class DummyServer:
+        should_exit = False
+
+    class DummyProcess:
+        def __init__(self): self.terminated = False
+        def poll(self): return None
+        def terminate(self): self.terminated = True
+
+    dummy_server = DummyServer()
+    dummy_process = DummyProcess()
+    previous_server = server._UVICORN_SERVER
+    previous_process = server._BROWSER_PROCESS
+    server._UVICORN_SERVER = dummy_server
+    server._BROWSER_PROCESS = dummy_process
+    monkeypatch.setattr(server.time, "sleep", lambda _delay: None)
+    try:
+        thread = server._schedule_app_exit()
+        thread.join(timeout=1.0)
+        assert dummy_server.should_exit is True
+        server._close_launched_edge_app()
+        assert dummy_process.terminated is True
+        assert server._BROWSER_PROCESS is None
+    finally:
+        server._UVICORN_SERVER = previous_server
+        server._BROWSER_PROCESS = previous_process
+
+
+def test_rc17_readme_carries_canonical_dual_interface_warnings_verbatim():
+    readme = (Path(server.ROOT) / "README.md").read_text(encoding="utf-8")
+    block1 = """> **⚠️ Recommendation: run your Ultimate with a single active interface.**
+> With both Ethernet and Wi-Fi enabled, the firmware behaviour above makes
+> control intermittently unreliable in practice — the same operation can
+> succeed one minute and time out the next, even with u64deck's split
+> routing working around the worst of it. **Ethernet-only** (disable Wi-Fi
+> in the Ultimate's network settings, then power-cycle) is the
+> configuration everything is happiest in. Dual-interface operation works,
+> but treat it as best-effort until the firmware behaviour changes."""
+    block2 = """- **Dual-interface (Ethernet + Wi-Fi both enabled) is best-effort.** The
+  firmware's ~2.5 s wired REST delay makes mixed-interface control
+  intermittently flaky; split routing reduces but does not eliminate it.
+  Single-interface — ideally Ethernet-only — is the reliable setup."""
+    assert block1 in readme
+    assert block2 in readme
+    assert readme.index(block1) < readme.index("# u64deck")
+    limitations = readme.index("## Known limitations (honest ones)")
+    cache_bullet = readme.index("- One image at a time is cached in RAM per browse (last 8 kept).", limitations)
+    assert readme.index(block2, limitations) > cache_bullet
+    assert readme.index(block2, limitations) < readme.index("## Files", limitations)

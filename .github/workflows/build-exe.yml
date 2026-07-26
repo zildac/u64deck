@@ -60,7 +60,19 @@ jobs:
             } while (-not $ready -and (Get-Date) -lt $deadline)
 
             if (-not $ready) { throw "UI did not serve within 30 seconds" }
-            Write-Host "exe smoke test OK"
+
+            $exit = Invoke-WebRequest -Uri "http://127.0.0.1:8064/api/app/exit" `
+              -Method Post -Headers @{"X-U64deck-Local-Exit"="1"} `
+              -UseBasicParsing -TimeoutSec 5
+            if ($exit.StatusCode -ne 200) { throw "Exit endpoint returned $($exit.StatusCode)" }
+
+            $exitDeadline = (Get-Date).AddSeconds(15)
+            do {
+              Start-Sleep -Milliseconds 250
+              $p.Refresh()
+            } while (-not $p.HasExited -and (Get-Date) -lt $exitDeadline)
+            if (-not $p.HasExited) { throw "u64deck.exe did not stop after local Exit request" }
+            Write-Host "exe startup and graceful-exit smoke test OK"
           } finally {
             $p.Refresh()
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }

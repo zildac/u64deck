@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import copy
 import io
+import ipaddress
 import json
 import os
 import platform
@@ -26,7 +27,7 @@ from urllib.parse import quote
 
 import httpx
 import uvicorn
-from fastapi import Body, FastAPI, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
@@ -344,7 +345,8 @@ def _launch_local_browser(url: str, mode: str | None = None) -> dict:
             profile = _edge_profile_dir()
             try:
                 profile.mkdir(parents=True, exist_ok=True)
-                subprocess.Popen([
+                global _BROWSER_PROCESS
+                _BROWSER_PROCESS = subprocess.Popen([
                     str(edge), f"--app={url}", f"--user-data-dir={profile}",
                     "--no-first-run", "--no-default-browser-check",
                 ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -369,6 +371,56 @@ def _schedule_browser_launch(url: str, mode: str | None = None) -> threading.Thr
     return thread
 
 CFG["browser_startup"] = _normalise_browser_startup(CFG.get("browser_startup"))
+
+# The running uvicorn.Server is retained so the local UI can request a normal
+# lifespan shutdown.  Only the dedicated Edge app process launched by u64deck
+# is retained; system/default browser windows are never terminated.
+_UVICORN_SERVER: uvicorn.Server | None = None
+_BROWSER_PROCESS: subprocess.Popen | None = None
+_APP_EXIT_REQUESTED = threading.Event()
+_LOCAL_EXIT_HEADER = "X-U64deck-Local-Exit"
+
+
+def _client_is_loopback(host: str | None) -> bool:
+    value = str(host or "").strip().split("%", 1)[0]
+    if not value:
+        return False
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return value.lower() == "localhost"
+
+
+def _schedule_app_exit(delay: float = 0.20) -> threading.Thread:
+    """Ask uvicorn to stop after the HTTP response has been returned."""
+    def worker():
+        time.sleep(max(0.0, delay))
+        running = _UVICORN_SERVER
+        if running is None:
+            _warn_event("app-exit", "exit requested but the managed server is not running")
+            return
+        running.should_exit = True
+
+    thread = threading.Thread(target=worker, daemon=True, name="app-exit")
+    thread.start()
+    return thread
+
+
+def _close_launched_edge_app() -> None:
+    """Close only the dedicated Edge app process started by this u64deck run."""
+    global _BROWSER_PROCESS
+    process, _BROWSER_PROCESS = _BROWSER_PROCESS, None
+    if process is None:
+        return
+    try:
+        poll = getattr(process, "poll", None)
+        if callable(poll) and poll() is not None:
+            return
+        terminate = getattr(process, "terminate", None)
+        if callable(terminate):
+            terminate()
+    except Exception as exc:
+        _warn_event("edge-close", f"could not close the dedicated Edge app window: {exc}")
 
 def _diag_event(level: str, message: str, **extra):
     item = {"time": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -1309,15 +1361,38 @@ def _clean_shutdown():
                 receiver.join(timeout=1.5)
         except Exception:
             pass
+    if _APP_EXIT_REQUESTED.is_set():
+        _close_launched_edge_app()
 
 
 @app.get("/api/app_config")
-def app_config():
+def app_config(request: Request):
     safe = {k: v for k, v in CFG.items() if "password" not in k}
     safe["version"] = VERSION
     safe["release_label"] = RELEASE_LABEL
     safe["build"] = BUILD
+    safe["local_exit_available"] = _client_is_loopback(
+        request.client.host if request.client else "")
     return safe
+
+
+@app.post("/api/app/exit")
+def app_exit(request: Request):
+    client_host = request.client.host if request.client else ""
+    if not _client_is_loopback(client_host):
+        raise HTTPException(403, "Exit u64deck is available only from this PC")
+    if request.headers.get(_LOCAL_EXIT_HEADER) != "1":
+        raise HTTPException(403, "Local exit confirmation header is required")
+
+    first_request = not _APP_EXIT_REQUESTED.is_set()
+    _APP_EXIT_REQUESTED.set()
+    if first_request:
+        _diag_event("info", "Exit requested from the local u64deck UI")
+        _schedule_app_exit()
+    return {
+        "stopping": True,
+        "close_window": _normalise_browser_startup(CFG.get("browser_startup")) == "edge_app",
+    }
 
 
 @app.get("/api/local_settings")
@@ -6847,8 +6922,15 @@ def main():
         ssl_kwargs = {"ssl_certfile": CFG["tls_certfile"],
                       "ssl_keyfile": CFG["tls_keyfile"]}
         print("  TLS enabled for the web UI\n")
-    uvicorn.run(app, host=CFG.get("http_host", "0.0.0.0"),
-                port=CFG["http_port"], log_level="warning", **ssl_kwargs)
+    global _UVICORN_SERVER
+    config = uvicorn.Config(
+        app, host=CFG.get("http_host", "0.0.0.0"),
+        port=CFG["http_port"], log_level="warning", **ssl_kwargs)
+    _UVICORN_SERVER = uvicorn.Server(config)
+    try:
+        _UVICORN_SERVER.run()
+    finally:
+        _UVICORN_SERVER = None
 
 
 if __name__ == "__main__":

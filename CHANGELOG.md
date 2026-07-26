@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.9.0 — Release Candidate 17
+
+- Added a confirmed **Exit u64deck** action in the main header. It stops the
+  managed Uvicorn server, runs the existing graceful cleanup path and leaves
+  the connected Ultimate running.
+- Restricted the exit endpoint to loopback clients and a same-origin custom
+  request header, so another device on the LAN or a simple cross-site form
+  cannot stop u64deck. The action is hidden when the UI is opened remotely.
+- Retained the Edge app process launched by u64deck and closes that dedicated
+  window after the server response and cleanup. System/default browser windows
+  are never terminated; they show a final stopped page instead.
+- Carried the canonical dual-interface best-effort README warnings verbatim
+  from the published documentation update, without changing routing behaviour,
+  screenshots or gallery ordering.
+- No discovery, connection, Mount & Run, SID, streaming, storage, settings or
+  device-control behaviour changed from RC16.
+
 ## 1.9.0 — Release Candidate 16
 
 - Removed the separate blocking remembered-address phase from Finder. Configured

@@ -32,6 +32,26 @@ async function api(path,opts={}){
 }
 const put=(p,opts={})=>api(p,{...opts,method:"PUT"});
 
+function showAppStopped(){
+  document.body.innerHTML=`<main class="app-exit-screen"><div class="panel">
+    <h1>u64deck has stopped.</h1>
+    <p>The connected Ultimate is still running.</p>
+    <p class="hint">You may close this window.</p>
+  </div></main>`;
+}
+async function exitU64deck(){
+  if(!confirm("Exit u64deck?\n\nThis stops the local u64deck server and closes its dedicated application window. The connected Ultimate will continue running."))return;
+  const btn=$("#btnAppExit");if(btn){btn.disabled=true;btn.textContent="Exiting…"}
+  try{
+    const result=await api("/api/app/exit",{method:"POST",headers:{"X-U64deck-Local-Exit":"1"},timeoutMs:5000});
+    showAppStopped();
+    if(result?.close_window)setTimeout(()=>{try{window.close()}catch(e){}},250);
+  }catch(e){
+    if(btn){btn.disabled=false;btn.textContent="Exit u64deck"}
+    toast(e.message,"err");
+  }
+}
+
 /* ---------- global viewport-aware tooltips ---------- */
 let TIP_TARGET=null;
 function tooltipHide(){
@@ -523,6 +543,7 @@ async function loadInfo(){
     if(!VER_SHOWN){try{const c=await api("/api/app_config");
       if(c.version){$("#ver").textContent="v"+c.version+(c.release_label?" · "+c.release_label:"")+(c.build?" · "+c.build:"");
         $("#ver").title="version "+c.version+(c.release_label?" ("+c.release_label+")":"")+", build "+(c.build||"?")+" — quote this in bug reports";
+        const exitBtn=$("#btnAppExit");if(exitBtn)exitBtn.style.display=c.local_exit_available===false?"none":"";
         VER_SHOWN=true}}catch(e){}}
     const previousFailures=INFO_FAILURES,i=await api("/api/info");
     if(i?.u64deck_discovery_busy||i?.u64deck_operation_busy){

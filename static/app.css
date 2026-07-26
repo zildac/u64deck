@@ -314,3 +314,7 @@ pre.raw{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
 .disc-choice.selected{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 32%,transparent);background:color-mix(in srgb,var(--accent) 14%,var(--panel))}
 .stream-hint{border:1px solid rgba(255,184,92,.45);background:rgba(255,184,92,.08);
   color:#ffd993;border-radius:7px;padding:7px 9px;margin-bottom:8px;font-size:12px}
+
+.app-exit-screen{min-height:100vh;display:grid;place-items:center;padding:24px;text-align:center}
+.app-exit-screen .panel{width:min(520px,92vw);padding:28px}
+.app-exit-screen h1{margin:0 0 10px;color:var(--acc2);font-size:22px}
