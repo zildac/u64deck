@@ -81,6 +81,9 @@ h2{font-size:13px;letter-spacing:.12em;color:var(--dim);font-weight:600;margin:0
 #jkListContext{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .sid-queue-tools{gap:6px;margin:4px 0 8px;align-items:center;flex:0 0 auto}
 .sid-queue-list{flex:1 1 auto;min-height:0;overflow:auto;border-top:1px solid rgba(39,44,76,.55)}
+.sid-queue-empty{display:flex;min-height:180px;height:100%;padding:28px;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:5px;color:var(--dim)}
+.sid-queue-empty strong{color:var(--txt);font-size:14px}
+.sid-queue-empty span{max-width:52ch;font-size:12px}
 .jkq-grid{min-width:760px}
 .jkq-row{display:grid;grid-template-columns:44px minmax(240px,1fr) minmax(145px,.52fr) 92px minmax(150px,.48fr) 62px 126px;
   align-items:center;border-bottom:1px solid rgba(39,44,76,.5);min-height:31px}
@@ -318,3 +321,51 @@ pre.raw{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
 .app-exit-screen{min-height:100vh;display:grid;place-items:center;padding:24px;text-align:center}
 .app-exit-screen .panel{width:min(520px,92vw);padding:28px}
 .app-exit-screen h1{margin:0 0 10px;color:var(--acc2);font-size:22px}
+
+/* system health — local counters only; no additional Ultimate polling */
+#tab-health.active{display:block}
+.health-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:12px}
+.health-head h2{margin-bottom:4px}
+.health-summary{display:flex;align-items:center;gap:14px;border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:14px;background:var(--panel)}
+.health-summary-badge{display:inline-flex;align-items:center;justify-content:center;min-width:92px;border:1px solid var(--line);border-radius:999px;padding:4px 10px;font-size:11px;font-weight:800;letter-spacing:.08em}
+.health-summary>div{display:flex;flex-direction:column;min-width:0}.health-summary b{font-size:14px}.health-summary span:last-child{color:var(--dim);font-size:12px;overflow-wrap:anywhere}
+.health-summary.state-healthy{border-color:rgba(121,217,155,.45);background:linear-gradient(90deg,rgba(121,217,155,.08),var(--panel) 42%)}
+.health-summary.state-healthy .health-summary-badge{color:var(--ok);border-color:var(--ok);background:rgba(121,217,155,.08)}
+.health-summary.state-degraded{border-color:rgba(255,184,92,.48);background:linear-gradient(90deg,rgba(255,184,92,.09),var(--panel) 42%)}
+.health-summary.state-degraded .health-summary-badge{color:var(--warn);border-color:var(--warn);background:rgba(255,184,92,.08)}
+.health-summary.state-attention{border-color:rgba(255,128,128,.5);background:linear-gradient(90deg,rgba(255,128,128,.09),var(--panel) 42%)}
+.health-summary.state-attention .health-summary-badge{color:var(--err);border-color:var(--err);background:rgba(255,128,128,.08)}
+.health-grid{display:grid;grid-template-columns:repeat(2,minmax(380px,1fr));gap:14px}
+.health-card{min-width:0;margin-bottom:0}
+.health-card-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+.health-card-title h2{margin:0}
+.health-primary{font-size:16px;font-weight:700;color:var(--txt);margin-bottom:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.health-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;margin-top:12px;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--line)}
+.health-metrics>div{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0;padding:8px 9px;background:var(--raised)}
+.health-metrics span{color:var(--dim);font-size:11px;white-space:nowrap}
+.health-metrics b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right;font-size:12px;font-variant-numeric:tabular-nums}
+.health-metrics.compact{margin-top:6px}.health-metrics.compact>div{padding:6px 8px}
+.health-stream-row+.health-stream-row{margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
+.health-stream-row>div:first-child{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.health-note{margin-top:10px;padding:7px 9px;border:1px solid rgba(255,128,128,.35);border-radius:7px;color:var(--err);font-size:12px;overflow-wrap:anywhere}
+.health-limit{margin-top:14px;color:var(--dim);font-size:12px}.health-limit b{color:var(--warn)}
+.health-details{padding:0;margin-top:14px;overflow:hidden}.health-details summary{cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 14px;color:var(--acc2);font-weight:700;list-style:none}.health-details summary::-webkit-details-marker{display:none}.health-details summary::before{content:"▸";color:var(--dim);margin-right:6px}.health-details[open] summary::before{content:"▾"}.health-details[open] summary{border-bottom:1px solid var(--line)}
+.health-history{padding:4px 14px 10px;max-height:320px;overflow:auto}.health-history-row{display:grid;grid-template-columns:80px 78px minmax(160px,.7fr) minmax(220px,1.3fr);gap:10px;align-items:center;padding:7px 0;border-bottom:1px solid rgba(39,44,76,.58);font-size:11px}.health-history-row:last-child{border-bottom:0}.health-history-row b,.health-history-row span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.health-history-row>span:last-child{color:var(--dim)}.health-history-time{color:var(--dim);font-variant-numeric:tabular-nums}
+@media(max-width:980px){.health-grid{grid-template-columns:1fr}.health-head{flex-direction:column}.health-history-row{grid-template-columns:70px 70px minmax(120px,.6fr) minmax(180px,1.4fr)}}
+@media(max-width:620px){.health-metrics{grid-template-columns:1fr}.health-summary{align-items:flex-start;flex-direction:column}.health-history-row{grid-template-columns:64px 64px 1fr}.health-history-row>span:last-child{grid-column:1/-1;white-space:normal}.health-history{padding-left:10px;padding-right:10px}}
+/* RC21 health presentation: compact, centred states without repeated pills. */
+#tab-health .badge{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:max-content;max-width:100%;min-height:20px;box-sizing:border-box;
+  flex:0 0 auto;line-height:1.2;white-space:nowrap;text-align:center;
+  padding:2px 8px;
+}
+.health-history-row .badge{justify-self:start;min-width:0}
+.health-outcome{display:inline-grid;place-items:center;justify-self:start;width:20px;height:20px;
+  border:1px solid var(--line);border-radius:50%;font-size:11px;font-weight:800;line-height:1}
+.health-outcome.ok{color:var(--ok);border-color:var(--ok);background:rgba(121,217,155,.08)}
+.health-outcome.warn{color:var(--warn);border-color:var(--warn);background:rgba(255,184,92,.08)}
+.health-outcome.bad{color:var(--err);border-color:var(--err);background:rgba(255,128,128,.08)}
+.health-history-row .health-event-state{font-size:10px;color:var(--dim);white-space:nowrap}
+.health-history-row .health-event-state.active{color:var(--warn)}
+.health-history-row .health-event-state.recovered{color:var(--ok)}

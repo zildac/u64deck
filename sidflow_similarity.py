@@ -1,16 +1,16 @@
 """SIDFlow portable similarity export support for the SID Jukebox.
 
 The published full export is slimmed into a private u64deck SQLite database.
-Only track identity, diagnostic classifier values and normalised perceptual
-feature vectors are retained; the heavyweight source feature JSON is deleted
-once the compact database has been promoted successfully.
+Track identity, diagnostic classifier values, the published weighted neighbour
+graph and a compact local fallback vector are retained; the heavyweight source
+feature JSON is deleted once the compact database has been promoted successfully.
 """
 
 from __future__ import annotations
 
 import gc
+import gzip
 import hashlib
-import heapq
 import json
 import math
 import operator
@@ -29,12 +29,29 @@ from typing import Callable, Iterable, Mapping
 SCHEMA_VERSION = "sidcorr-1"
 VECTOR_SCHEMA_VERSION = "u64deck-featvec-1"
 FULL_SQLITE = "sidcorr-hvsc-full-sidcorr-1.sqlite"
+FULL_SQLITE_GZ = "sidcorr-hvsc-full-sidcorr-1.sqlite.gz"
 FULL_MANIFEST = "sidcorr-hvsc-full-sidcorr-1.manifest.json"
 MOBILE_SQLITE = "sidcorr-hvsc-mobile-sidcorr-1.sqlite"
 MOBILE_MANIFEST = "sidcorr-hvsc-mobile-sidcorr-1.manifest.json"
 CHECKSUMS = "SHA256SUMS"
-LATEST_RELEASE_API = "https://api.github.com/repos/chrisgleissner/sidflow-data/releases/latest"
-LATEST_DOWNLOAD_BASE = "https://github.com/chrisgleissner/sidflow-data/releases/latest/download"
+PINNED_RELEASE_TAG = "0.8.0"
+PINNED_RELEASE_API = (
+    "https://api.github.com/repos/chrisgleissner/sidflow-data/releases/tags/"
+    + PINNED_RELEASE_TAG
+)
+PINNED_DOWNLOAD_BASE = (
+    "https://github.com/chrisgleissner/sidflow-data/releases/download/"
+    + PINNED_RELEASE_TAG
+)
+# Backwards-compatible aliases used by older tests/imports. These are pinned,
+# not mutable latest-release URLs.
+LATEST_RELEASE_API = PINNED_RELEASE_API
+LATEST_DOWNLOAD_BASE = PINNED_DOWNLOAD_BASE
+PINNED_GZIP_BYTES = 194_351_886
+PINNED_SQLITE_BYTES = 982_155_264
+PINNED_COMPACT_ESTIMATE_BYTES = 300_000_000
+PINNED_GZIP_SHA256 = "7eeddad82666fbf75ce93d0d412a7b31797475bee1b77c960542c7edb7b2fcf0"
+PINNED_SQLITE_SHA256 = "d3d825ae0ed38139802b57cb7e8c2f01fc40bdbb824bf6669e9d2ef51bb176da"
 
 FEATURE_DIMENSIONS = (
     "bpm", "dynamicRange", "energy", "inharmonicity", "lowFrequencyEnergyRatio",
@@ -75,6 +92,62 @@ def validate_manifest(manifest: Mapping) -> dict:
     out["vector_dimensions"] = int(manifest.get("vector_dimensions") or 0)
     out["neighbor_row_count"] = int(manifest.get("neighbor_row_count") or 0)
     return out
+
+
+
+
+def validate_pinned_manifest(manifest: Mapping) -> dict:
+    """Validate the SIDFlow 0.8.0 contract used by u64deck."""
+    out = validate_manifest(manifest)
+    if int(out.get("vector_dimensions") or 0) != 58:
+        raise ValueError("SIDFlow 0.8.0 full export must contain 58-dimensional vectors")
+    if str(out.get("similarity_metric") or "") != "weighted-cosine":
+        raise ValueError("SIDFlow 0.8.0 full export must use weighted-cosine similarity")
+    weights = out.get("vector_weights")
+    if not isinstance(weights, list) or len(weights) != 58:
+        raise ValueError("SIDFlow 0.8.0 manifest must publish 58 vector weights")
+    if any(not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) <= 0
+           for value in weights):
+        raise ValueError("SIDFlow vector weights contain an invalid value")
+    if int(out.get("neighbor_row_count") or 0) < int(out["track_count"]):
+        raise ValueError("SIDFlow 0.8.0 full export does not contain the expected neighbour graph")
+    hvsc = str(out.get("hvsc_version") or "")
+    if "85" not in hvsc:
+        raise ValueError(f"SIDFlow 0.8.0 export targets an unexpected HVSC release: {hvsc or 'unknown'}")
+    return out
+
+
+def gunzip_file(source: Path, destination: Path, *, expected_bytes: int = 0,
+                 progress: Progress | None = None) -> int:
+    """Stream-decompress a gzip asset without holding it in memory."""
+    source = Path(source)
+    destination = Path(destination)
+    if destination.exists():
+        raise FileExistsError(f"SIDFlow decompression target already exists: {destination.name}")
+    written = 0
+    try:
+        with gzip.open(source, "rb") as src, destination.open("xb") as dst:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                written += len(chunk)
+                if progress:
+                    progress("decompressing", written, int(expected_bytes or 0))
+            dst.flush()
+            os.fsync(dst.fileno())
+        if expected_bytes and written != int(expected_bytes):
+            raise ValueError(
+                f"SIDFlow decompressed size {written:,} does not match expected {int(expected_bytes):,}"
+            )
+        return written
+    except Exception:
+        try:
+            destination.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def parse_sha256sums(text: str) -> dict[str, str]:
@@ -470,6 +543,21 @@ class SimilarityStore:
                 "export_profile": meta.get("export_profile", ""),
                 "release_tag": str(manifest.get("u64deck_release_tag") or ""),
                 "source_asset": str(manifest.get("u64deck_source_asset") or ""),
+                "hvsc_version": str(manifest.get("hvsc_version") or ""),
+                "feature_schema_version": str(manifest.get("feature_schema_version") or ""),
+                "similarity_metric": str(manifest.get("similarity_metric") or ""),
+                "vector_dimensions": int(manifest.get("vector_dimensions") or 0),
+                "neighbor_count_per_track": int(manifest.get("neighbor_count_per_track") or 0),
+                "recommendation_engine": "SIDFlow weighted neighbour graph" if neighbors else "u64deck fallback scan",
+                "fallback_engine": "u64deck 48-dimensional feature scan",
+                "supported_release": PINNED_RELEASE_TAG,
+                "needs_update": not (
+                    str(manifest.get("u64deck_release_tag") or "") == PINNED_RELEASE_TAG
+                    and int(manifest.get("vector_dimensions") or 0) == 58
+                    and str(manifest.get("similarity_metric") or "") == "weighted-cosine"
+                    and int(manifest.get("neighbor_row_count") or 0) > 0
+                    and "85" in str(manifest.get("hvsc_version") or "")
+                ),
                 "duplicate_vector_ratio": float(meta.get("duplicate_vector_ratio") or 0.0),
                 "quality_warning": warning,
                 "error": error,
@@ -523,26 +611,42 @@ class SimilarityStore:
         return self._row_dict(row, 1.0) if row else None
 
     @staticmethod
-    def _row_dict(row, similarity: float) -> dict:
+    def _row_dict(row, similarity: float, source: str = "lookup") -> dict:
         return {
             "track_id": row[0], "sid_path": row[2], "song_index": row[4],
             "e": row[5], "m": row[6], "c": row[7], "p": row[8],
-            "similarity": float(similarity),
+            "similarity": float(similarity), "recommendation_source": source,
         }
 
     def rank(self, seed_track_id: str, *, limit: int = 20,
              present_paths: set[str] | None = None,
-             exclude_track_ids: Iterable[str] = ()) -> list[dict]:
+             exclude_track_ids: Iterable[str] = (),
+             exclude_sid_paths: Iterable[str] = (),
+             same_file_policy: str = "prefer_other") -> list[dict]:
+        """Rank candidates, preferring SIDFlow's authoritative 0.8.0 graph.
+
+        same_file_policy is one of: include, prefer_other, exclude. The default
+        keeps sibling subtunes available as a last resort without letting them
+        dominate recommendations.
+        """
         self._ensure_vectors()
         if self._quality_warning:
             raise ValueError(self._quality_warning)
         seed = self._by_track.get(str(seed_track_id).casefold())
         if not seed:
             raise KeyError(seed_track_id)
+        if same_file_policy not in {"include", "prefer_other", "exclude"}:
+            raise ValueError("invalid SIDFlow same-file policy")
+        wanted = max(1, int(limit))
         excluded = {str(value).casefold() for value in exclude_track_ids}
         excluded.add(str(seed_track_id).casefold())
         present = {str(value).casefold() for value in present_paths} if present_paths is not None else None
+        excluded_paths = {str(value).casefold() for value in exclude_sid_paths}
+        seed_path_key = seed[3]
 
+        graph_other: list[dict] = []
+        graph_same: list[dict] = []
+        graph_seen: set[str] = set()
         with self.file_lock:
             with closing(self._connect()) as conn:
                 has_neighbors = int(conn.execute("SELECT COUNT(*) FROM neighbors").fetchone()[0]) > 0
@@ -551,42 +655,57 @@ class SimilarityStore:
                         "SELECT t.track_id,t.sid_path,t.song_index,t.e,t.m,t.c,t.p,n.similarity "
                         "FROM neighbors n JOIN tracks t ON t.track_id=n.neighbor_track_id "
                         "WHERE n.seed_track_id=? ORDER BY n.profile,n.rank LIMIT ?",
-                        (seed[0], max(200, int(limit) * 20)),
+                        (seed[0], max(250, wanted * 25)),
                     ).fetchall()
-                    out = []
-                    seen = set()
                     for row in rows:
                         key = str(row["track_id"]).casefold()
-                        if key in seen or key in excluded:
+                        sid_path = str(row["sid_path"]); path_key = sid_path.casefold()
+                        if key in graph_seen or key in excluded:
                             continue
-                        if present is not None and str(row["sid_path"]).casefold() not in present:
+                        if present is not None and path_key not in present:
                             continue
-                        seen.add(key)
-                        track_id = str(row["track_id"]); sid_path = str(row["sid_path"])
+                        if path_key in excluded_paths:
+                            continue
+                        same_file = path_key == seed_path_key
+                        if same_file and same_file_policy == "exclude":
+                            continue
+                        graph_seen.add(key)
                         compact = (
-                            track_id, track_id.casefold(), sid_path, sid_path.casefold(),
+                            str(row["track_id"]), key, sid_path, path_key,
                             row["song_index"], row["e"], row["m"], row["c"], row["p"], array("f"),
                         )
-                        out.append(self._row_dict(compact, row["similarity"]))
-                        if len(out) >= limit:
-                            return out
+                        item = self._row_dict(compact, row["similarity"], "sidflow-neighbors")
+                        (graph_same if same_file else graph_other).append(item)
 
-        wanted = max(1, int(limit))
-        best: list[tuple[float, int, tuple]] = []
+        graph = graph_other + (graph_same if same_file_policy != "exclude" else [])
+        if len(graph) >= wanted:
+            return graph[:wanted]
+
+        # The fixed-depth graph can be exhausted by local-HVSC filtering or a
+        # long Radio session. Fill the remainder with the clearly labelled
+        # legacy u64deck feature scan, never silently presenting it as SIDFlow.
+        excluded.update(graph_seen)
+        fallback_other: list[tuple[float, int, tuple]] = []
+        fallback_same: list[tuple[float, int, tuple]] = []
         seed_vector = seed[9]
         for sequence, row in enumerate(self._vectors):
             if row[1] in excluded:
                 continue
             if present is not None and row[3] not in present:
                 continue
+            if row[3] in excluded_paths:
+                continue
+            same_file = row[3] == seed_path_key
+            if same_file and same_file_policy == "exclude":
+                continue
             score = float(sum(map(operator.mul, seed_vector, row[9])))
-            entry = (score, -sequence, row)
-            if len(best) < wanted:
-                heapq.heappush(best, entry)
-            elif entry[:2] > best[0][:2]:
-                heapq.heapreplace(best, entry)
-        best.sort(key=lambda item: (-item[0], -item[1]))
-        return [self._row_dict(row, score) for score, _sequence, row in best]
+            (fallback_same if same_file else fallback_other).append((score, sequence, row))
+        fallback_other.sort(key=lambda item: (-item[0], item[1]))
+        fallback_same.sort(key=lambda item: (-item[0], item[1]))
+        fallback = fallback_other + (fallback_same if same_file_policy != "exclude" else [])
+        for score, _sequence, row in fallback[:max(0, wanted - len(graph))]:
+            graph.append(self._row_dict(row, score, "u64deck-fallback"))
+        return graph[:wanted]
 
 
 def _replace_with_retries(source: Path, destination: Path, attempts: int) -> None:

@@ -6,6 +6,7 @@ import json
 import re
 import time
 import threading
+import zipfile
 from pathlib import Path
 from contextlib import closing, contextmanager
 
@@ -1279,6 +1280,7 @@ def test_drive_status_retries_current_backend_after_closed_client_handover(monke
             raise RuntimeError("Ultimate REST client is closed")
 
     monkeypatch.setattr(server, "DEVICE_OP", FakeCoordinator())
+    monkeypatch.setattr(server, "_DRIVE_STATUS_READY_AT", server.time.time())
     monkeypatch.setattr(server, "rest", OldRest())
     monkeypatch.setattr(server, "_reconcile_swap_from_drives", lambda out: {})
     payload = server.drives()
@@ -1307,6 +1309,7 @@ def test_drive_status_returns_controlled_snapshot_when_client_is_closed(monkeypa
         server.MOUNT_STATE["a"] = {"name": "Known.d64", "mode": "unlinked"}
         server.MOUNT_STATE["b"] = {}
         monkeypatch.setattr(server, "DEVICE_OP", FakeCoordinator())
+        monkeypatch.setattr(server, "_DRIVE_STATUS_READY_AT", server.time.time())
         monkeypatch.setattr(server, "rest", ClosedRest())
         payload = server.drives()
 
@@ -1373,6 +1376,488 @@ def test_experimental_telnet_remote_is_removed_and_matrix_keyboard_is_present():
     assert not hasattr(ultimate, "VT100Screen")
 
 
+# --- v1.9.0 Release Candidate 20: expanded readable health telemetry ---
+
+def test_rc20_health_dashboard_groups_extended_metrics_and_status_colours():
+    static = Path(server.ASSETS) / "static"
+    html = (static / "index.html").read_text(encoding="utf-8")
+    js = (static / "app.js").read_text(encoding="utf-8")
+    css = (static / "app.css").read_text(encoding="utf-8")
+    for marker in (
+        'id="healthSummaryBadge"', 'id="healthRestSuccess"',
+        'id="healthVideoLongestGap"', 'id="healthAudioQueue"',
+        'id="healthQueueWaitStats"', 'id="healthIndexRates"',
+        'id="healthImageCacheHits"', 'id="healthOperationHistory"',
+        'id="healthStreamHistory"', 'id="healthLifecycleHistory"',
+    ):
+        assert marker in html
+    assert 'api("/api/health/browser"' in js
+    assert 'audioUnderruns' in js
+    assert 'video_render_fps' in js
+    assert '.health-summary.state-healthy' in css
+    assert '.health-summary.state-degraded' in css
+    assert '.health-summary.state-attention' in css
+    assert '.health-details' in css
+
+
+def test_rc20_rest_reliability_tracks_failures_streak_and_p95():
+    previous = (
+        list(server._HEALTH_REST_LATENCIES), server._HEALTH_REST_SUCCESSES,
+        server._HEALTH_REST_FAILURES, server._HEALTH_REST_CONSECUTIVE_FAILURES,
+        dict(server._HEALTH_LAST_DEVICE), server._HEALTH_LAST_DEVICE_AT,
+        server._HEALTH_LAST_INFO_ERROR, server._HEALTH_LAST_INFO_ERROR_AT,
+    )
+    try:
+        server._HEALTH_REST_LATENCIES.clear()
+        server._HEALTH_REST_SUCCESSES = 0
+        server._HEALTH_REST_FAILURES = 0
+        server._HEALTH_REST_CONSECUTIVE_FAILURES = 0
+        for value in (10, 20, 30, 40, 200):
+            server._health_record_info({"product": "Ultimate 64"}, value)
+        server._health_record_info_error(RuntimeError("timeout"), 2500)
+        server._health_record_info_error(RuntimeError("timeout"), 2500)
+        snap = server._health_latency_snapshot()
+        assert snap["p95_ms"] == 200.0
+        assert snap["successes"] == 5
+        assert snap["failures"] == 2
+        assert snap["consecutive_failures"] == 2
+        assert snap["success_rate_percent"] == round(5 / 7 * 100, 2)
+    finally:
+        samples, successes, failures, consecutive, device, device_at, error, error_at = previous
+        server._HEALTH_REST_LATENCIES.clear(); server._HEALTH_REST_LATENCIES.extend(samples)
+        server._HEALTH_REST_SUCCESSES = successes
+        server._HEALTH_REST_FAILURES = failures
+        server._HEALTH_REST_CONSECUTIVE_FAILURES = consecutive
+        server._HEALTH_LAST_DEVICE.clear(); server._HEALTH_LAST_DEVICE.update(device)
+        server._HEALTH_LAST_DEVICE_AT = device_at
+        server._HEALTH_LAST_INFO_ERROR = error
+        server._HEALTH_LAST_INFO_ERROR_AT = error_at
+
+
+def test_rc20_coordinator_exposes_wait_distribution_and_recent_history():
+    from device_coordinator import DeviceOperationCoordinator
+    coordinator = DeviceOperationCoordinator()
+    with coordinator.operation("interactive", "first"):
+        pass
+    with coordinator.operation("status", "second"):
+        pass
+    snap = coordinator.snapshot()
+    assert snap.completed == 2
+    assert snap.completed_interactive == 1
+    assert snap.completed_status == 1
+    assert snap.p95_wait_seconds >= 0
+    history = coordinator.recent_operations(10)
+    assert [row["reason"] for row in history] == ["first", "second"]
+    assert all(row["outcome"] == "ok" for row in history)
+
+
+def test_rc20_browser_telemetry_report_is_local_only_and_in_health_snapshot():
+    previous = dict(server._HEALTH_BROWSER_TELEMETRY)
+    previous_at = server._HEALTH_BROWSER_TELEMETRY_AT
+    try:
+        request = type("Request", (), {"client": type("Client", (), {"host": "127.0.0.1"})()})()
+        result = server.health_browser_report(request, {
+            "video_render_fps": 49.9, "audio_queue_ms": 82,
+            "audio_underruns": 1, "ignored": "nope",
+        })
+        assert result == {"ok": True}
+        assert server._HEALTH_BROWSER_TELEMETRY["video_render_fps"] == 49.9
+        assert server._HEALTH_BROWSER_TELEMETRY["audio_queue_ms"] == 82
+        assert "ignored" not in server._HEALTH_BROWSER_TELEMETRY
+        assert server._health_stream_snapshot()["browser"]["audio_underruns"] == 1
+    finally:
+        server._HEALTH_BROWSER_TELEMETRY.clear(); server._HEALTH_BROWSER_TELEMETRY.update(previous)
+        server._HEALTH_BROWSER_TELEMETRY_AT = previous_at
+
+
+def test_rc20_cache_snapshot_tracks_image_and_sid_cache_contract():
+    previous = dict(server._HEALTH_CACHE_STATS)
+    previous_cache = server.IMAGE_CACHE.copy()
+    try:
+        server._HEALTH_CACHE_STATS.update({
+            "image_hits": 3, "image_misses": 1, "image_evictions": 2,
+            "sid_materialise_hits": 4, "sid_materialise_misses": 1,
+        })
+        server.IMAGE_CACHE.clear()
+        server.IMAGE_CACHE["abc"] = {"name": "demo.d64", "data": b"1234", "ts": server.time.time()}
+        snap = server._health_cache_snapshot()
+        assert snap["image_entries"] == 1
+        assert snap["image_bytes"] == 4
+        assert snap["image_hit_rate_percent"] == 75.0
+        assert snap["sid_hit_rate_percent"] == 80.0
+    finally:
+        server._HEALTH_CACHE_STATS.clear(); server._HEALTH_CACHE_STATS.update(previous)
+        server.IMAGE_CACHE.clear(); server.IMAGE_CACHE.update(previous_cache)
+
+
+# --- v1.9.0 Release Candidate 21: robust readable health status ---
+
+def test_rc21_health_ignores_recovered_diagnostic_history_but_flags_unresolved_errors():
+    previous_events = list(server.DIAG_EVENTS)
+    previous_success_at = server._HEALTH_LAST_DEVICE_AT
+    now = server.time.time()
+    try:
+        server.DIAG_EVENTS.clear()
+        server.DIAG_EVENTS.append({
+            "time": server.datetime.fromtimestamp(now - 60).isoformat(timespec="seconds"),
+            "level": "error", "message": "transient startup failure",
+        })
+        server._HEALTH_LAST_DEVICE_AT = now - 10
+        recovered = server._health_event_snapshot()
+        assert recovered["errors"] == 1
+        assert recovered["active_errors"] == 0
+        assert recovered["events"][0]["recovered"] is True
+        summary = server._health_summary(
+            {"configured": True, "last_success_age_seconds": 1, "consecutive_failures": 0},
+            {"video": {}, "audio": {}}, {"active_seconds": 0}, recovered,
+            {"config": {"last": {"success": True}}},
+        )
+        assert summary["state"] == "healthy"
+
+        server._HEALTH_LAST_DEVICE_AT = now - 120
+        unresolved = server._health_event_snapshot()
+        assert unresolved["active_errors"] == 1
+        assert unresolved["events"][0]["recovered"] is False
+        summary = server._health_summary(
+            {"configured": True, "last_success_age_seconds": 1, "consecutive_failures": 0},
+            {"video": {}, "audio": {}}, {"active_seconds": 0}, unresolved,
+            {"config": {"last": {"success": True}}},
+        )
+        assert summary["state"] == "degraded"
+        assert "recent unresolved diagnostic error" in " ".join(summary["reasons"])
+    finally:
+        server.DIAG_EVENTS.clear(); server.DIAG_EVENTS.extend(previous_events)
+        server._HEALTH_LAST_DEVICE_AT = previous_success_at
+
+
+def test_rc21_old_stream_gaps_are_history_not_current_degradation():
+    base = {"configured": True, "last_success_age_seconds": 1, "consecutive_failures": 0}
+    diagnostics = {"active_errors": 0, "active_warnings": 0}
+    persistence = {"config": {"last": {"success": True}}}
+    old = server._health_summary(
+        base,
+        {"video": {"gap_events": 5, "dropped": 2, "recent_gap_age_seconds": 61}, "audio": {}},
+        {"active_seconds": 0}, diagnostics, persistence,
+    )
+    assert old["state"] == "healthy"
+    recent = server._health_summary(
+        base,
+        {"video": {"gap_events": 5, "dropped": 2, "recent_gap_age_seconds": 10}, "audio": {}},
+        {"active_seconds": 0}, diagnostics, persistence,
+    )
+    assert recent["state"] == "degraded"
+    assert "Recent video packet gap" in recent["reasons"]
+
+
+def test_rc21_health_ui_auto_refreshes_without_manual_button_and_avoids_duplicate_badges():
+    static = Path(server.ASSETS) / "static"
+    html = (static / "index.html").read_text(encoding="utf-8")
+    js = (static / "app.js").read_text(encoding="utf-8")
+    css = (static / "app.css").read_text(encoding="utf-8")
+    assert 'onclick="healthLoad(true)"' not in html
+    assert 'id="healthStreamsState"' in html
+    assert 'id="healthVideoState"' not in html
+    assert 'id="healthAudioState"' not in html
+    assert 'id="healthActivityState"' not in html
+    assert 'id="healthIndexState"' not in html
+    assert 'id="healthDiagnosticHistory"' in html
+    assert 'auto-updated ' in js and 'every 2 s' in js
+    assert '.health-outcome' in css
+    assert 'width:max-content' in css
+    assert 'justify-content:center' in css
+
+
+def test_rc21_latest_config_result_not_historical_failure_count_drives_badge():
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'lastConfig.success===false' in js
+    assert 'config.failures?"save errors"' not in js
+
+
+
+# --- v1.9.0 Release Candidate 22: ordered drive-status startup ---
+
+def test_rc22_drive_status_waits_for_device_readiness_without_rest_or_diagnostic_error(monkeypatch):
+    calls = []
+
+    class FakeCoordinator:
+        def snapshot(self):
+            class Snapshot:
+                active_priority = None
+                active_reason = ""
+                waiting_interactive = 0
+            return Snapshot()
+        @contextmanager
+        def operation(self, *args, **kwargs):
+            yield
+
+    class FakeRest:
+        host = "192.0.2.64"
+        def get_json(self, path):
+            calls.append(path)
+            pytest.fail("cold-start drive status must wait for successful device info")
+
+    previous_ready = server._DRIVE_STATUS_READY_AT
+    previous_failures = server._DRIVE_STATUS_TRANSIENT_FAILURES
+    previous_failure_at = server._DRIVE_STATUS_LAST_FAILURE_AT
+    previous_events = list(server.DIAG_EVENTS)
+    try:
+        server._drive_status_mark_not_ready()
+        server.DIAG_EVENTS.clear()
+        monkeypatch.setattr(server, "DEVICE_OP", FakeCoordinator())
+        monkeypatch.setattr(server, "rest", FakeRest())
+        payload = server.drives()
+        assert payload["u64deck_drives_waiting"] is True
+        assert payload["u64deck_drives_error"] is False
+        assert payload["u64deck_retry_ms"] == 750
+        assert "Waiting for the Ultimate connection" in payload["u64deck_drives_message"]
+        assert calls == []
+        assert list(server.DIAG_EVENTS) == []
+    finally:
+        server._DRIVE_STATUS_READY_AT = previous_ready
+        server._DRIVE_STATUS_TRANSIENT_FAILURES = previous_failures
+        server._DRIVE_STATUS_LAST_FAILURE_AT = previous_failure_at
+        server.DIAG_EVENTS.clear(); server.DIAG_EVENTS.extend(previous_events)
+
+
+def test_rc22_transient_drive_refusal_is_bounded_before_becoming_diagnostic_error(monkeypatch):
+    class FakeCoordinator:
+        def snapshot(self):
+            class Snapshot:
+                active_priority = None
+                active_reason = ""
+                waiting_interactive = 0
+            return Snapshot()
+        @contextmanager
+        def operation(self, *args, **kwargs):
+            yield
+
+    class RefusedRest:
+        host = "192.0.2.64"
+        def get_json(self, path):
+            raise RuntimeError("[WinError 10061] connection actively refused")
+
+    previous_ready = server._DRIVE_STATUS_READY_AT
+    previous_failures = server._DRIVE_STATUS_TRANSIENT_FAILURES
+    previous_failure_at = server._DRIVE_STATUS_LAST_FAILURE_AT
+    previous_events = list(server.DIAG_EVENTS)
+    try:
+        server._drive_status_mark_ready()
+        server.DIAG_EVENTS.clear()
+        monkeypatch.setattr(server, "DEVICE_OP", FakeCoordinator())
+        monkeypatch.setattr(server, "rest", RefusedRest())
+        for attempt in range(1, server.DRIVE_STATUS_MAX_TRANSIENT_RETRIES + 1):
+            payload = server.drives()
+            assert payload["u64deck_drives_waiting"] is True
+            assert payload["u64deck_drives_error"] is False
+            assert payload["u64deck_drive_attempt"] == attempt
+            assert not [e for e in server.DIAG_EVENTS if e.get("level") == "error"]
+        terminal = server.drives()
+        assert terminal["u64deck_drives_waiting"] is False
+        assert terminal["u64deck_drives_error"] is True
+        assert terminal["u64deck_retry_ms"] == 0
+        errors = [e for e in server.DIAG_EVENTS if e.get("level") == "error"]
+        assert len(errors) == 1
+        assert "after automatic retries" in errors[0]["message"]
+    finally:
+        server._DRIVE_STATUS_READY_AT = previous_ready
+        server._DRIVE_STATUS_TRANSIENT_FAILURES = previous_failures
+        server._DRIVE_STATUS_LAST_FAILURE_AT = previous_failure_at
+        server.DIAG_EVENTS.clear(); server.DIAG_EVENTS.extend(previous_events)
+
+
+def test_rc22_successful_drive_status_resets_transient_failure_streak(monkeypatch):
+    class FakeCoordinator:
+        def snapshot(self):
+            class Snapshot:
+                active_priority = None
+                active_reason = ""
+                waiting_interactive = 0
+            return Snapshot()
+        @contextmanager
+        def operation(self, *args, **kwargs):
+            yield
+
+    class HealthyRest:
+        host = "192.0.2.64"
+        def get_json(self, path):
+            return {"drives": []}
+
+    previous_ready = server._DRIVE_STATUS_READY_AT
+    previous_failures = server._DRIVE_STATUS_TRANSIENT_FAILURES
+    previous_failure_at = server._DRIVE_STATUS_LAST_FAILURE_AT
+    try:
+        server._drive_status_mark_ready()
+        server._DRIVE_STATUS_TRANSIENT_FAILURES = 2
+        server._DRIVE_STATUS_LAST_FAILURE_AT = server.time.time()
+        monkeypatch.setattr(server, "DEVICE_OP", FakeCoordinator())
+        monkeypatch.setattr(server, "rest", HealthyRest())
+        monkeypatch.setattr(server, "_reconcile_swap_from_drives", lambda out: {})
+        assert server.drives()["drives"] == []
+        assert server._DRIVE_STATUS_TRANSIENT_FAILURES == 0
+        assert server._DRIVE_STATUS_LAST_FAILURE_AT == 0.0
+    finally:
+        server._DRIVE_STATUS_READY_AT = previous_ready
+        server._DRIVE_STATUS_TRANSIENT_FAILURES = previous_failures
+        server._DRIVE_STATUS_LAST_FAILURE_AT = previous_failure_at
+
+
+def test_rc22_frontend_sequences_info_before_first_drive_request_and_retries_neutrally():
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    boot = js[js.index("/* ---------- boot ---------- */"): ]
+    assert "qlRefresh();refreshDrives();idxPollStart()" not in boot
+    assert 'renderDrivePanel("Waiting for the Ultimate connection before reading drive status…")' in boot
+    assert "const firstDriveReady=!DRIVE_STATUS_READY" in js
+    assert "if(firstDriveReady)setTimeout(refreshDrives,0)" in js
+    assert "if(!DRIVE_STATUS_READY)" in js
+    assert "if(!r.u64deck_drives_error&&retry>0)" in js
+
+
+
+# --- v1.9.0 Release Candidate 24: SID grace default and empty-queue playlist UI ---
+
+def test_rc24_songlength_auto_advance_uses_configurable_half_second_grace(monkeypatch):
+    previous_lengths = dict(server.SONGLENGTHS_BY_PATH)
+    previous_grace = server.CFG.get("sid_jukebox_end_grace_secs")
+    try:
+        server.SONGLENGTHS_BY_PATH.clear()
+        server.SONGLENGTHS_BY_PATH["musicians/a/a.sid"] = [120.0]
+        monkeypatch.setattr(server, "_configured_hvsc_root", lambda: "/USB0/HVSC")
+        server.CFG["sid_jukebox_end_grace_secs"] = 0.5
+        item = server._juke_lazy_item("/USB0/HVSC/MUSICIANS/A/A.sid", "A.sid")
+        length, grace, delay, source = server._juke_auto_advance_plan(item, 1)
+        assert (length, grace, delay, source) == (120.0, 0.5, 120.5, "songlengths")
+    finally:
+        server.SONGLENGTHS_BY_PATH.clear()
+        server.SONGLENGTHS_BY_PATH.update(previous_lengths)
+        if previous_grace is None:
+            server.CFG.pop("sid_jukebox_end_grace_secs", None)
+        else:
+            server.CFG["sid_jukebox_end_grace_secs"] = previous_grace
+
+
+def test_rc24_juke_play_arms_the_planned_deadline_and_reports_it(monkeypatch):
+    previous_juke = dict(server.JUKE)
+    previous_cfg = dict(server.CFG)
+    captured = {}
+    item = {
+        "label": "Grace.sid",
+        "path": "/HVSC/Grace.sid",
+        "data": b"sid-data",
+        "meta": {"name": "Grace", "start_song": 1, "songs": 1},
+    }
+
+    class FakeTimer:
+        def __init__(self, interval, callback, args=()):
+            captured.update(interval=interval, callback=callback, args=args, started=False)
+        def start(self):
+            captured["started"] = True
+        def cancel(self):
+            captured["cancelled"] = True
+
+    try:
+        server.JUKE.clear(); server.JUKE.update({
+            "items": [item], "index": -1, "playing": False,
+            "shuffle": False, "radio": False, "song": 0, "timer": None,
+            "folder": "", "loading": False, "source": "test",
+            "generation": 0, "stop_after_current": False,
+        })
+        monkeypatch.setattr(server, "_cart_configured", lambda: "")
+        monkeypatch.setattr(server, "_post_sid_upload", lambda *args, **kwargs: {})
+        monkeypatch.setattr(server, "_juke_auto_advance_plan",
+                            lambda item, song: (120.0, 0.5, 120.5, "songlengths"))
+        monkeypatch.setattr(server._threading, "Timer", FakeTimer)
+        monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+
+        out = server._juke_play(0)
+
+        assert captured["interval"] == 120.5
+        assert captured["callback"] is server._juke_auto_next
+        assert captured["args"] == (server.JUKE["generation"],)
+        assert captured["started"] is True
+        assert out["play_timing"]["duration_source"] == "songlengths"
+        assert out["play_timing"]["song_length_secs"] == 120.0
+        assert out["play_timing"]["end_grace_secs"] == 0.5
+        assert out["play_timing"]["auto_advance_secs"] == 120.5
+    finally:
+        timer = server.JUKE.get("timer")
+        if timer is not None and hasattr(timer, "cancel"):
+            timer.cancel()
+        server.JUKE.clear(); server.JUKE.update(previous_juke)
+        server.CFG.clear(); server.CFG.update(previous_cfg)
+
+
+def test_rc24_jukebox_end_grace_is_bounded_and_invalid_values_fall_back():
+    previous = server.CFG.get("sid_jukebox_end_grace_secs")
+    try:
+        server.CFG["sid_jukebox_end_grace_secs"] = -9
+        assert server._juke_end_grace_seconds() == 0.0
+        server.CFG["sid_jukebox_end_grace_secs"] = 99
+        assert server._juke_end_grace_seconds() == 30.0
+        server.CFG["sid_jukebox_end_grace_secs"] = "not-a-number"
+        assert server._juke_end_grace_seconds() == 0.5
+    finally:
+        if previous is None:
+            server.CFG.pop("sid_jukebox_end_grace_secs", None)
+        else:
+            server.CFG["sid_jukebox_end_grace_secs"] = previous
+
+
+def test_rc24_unknown_length_retains_existing_fallback_allowance(monkeypatch):
+    previous_default = server.CFG.get("sid_default_secs")
+    try:
+        monkeypatch.setattr(server, "_juke_length", lambda item, song: None)
+        server.CFG["sid_default_secs"] = 180
+        assert server._juke_auto_advance_plan({}, 1) == (180.0, 1.0, 181.0, "fallback")
+        server.CFG["sid_default_secs"] = 0
+        assert server._juke_auto_advance_plan({}, 1) == (0.0, 0.0, 0.0, "fallback")
+    finally:
+        if previous_default is None:
+            server.CFG.pop("sid_default_secs", None)
+        else:
+            server.CFG["sid_default_secs"] = previous_default
+
+
+def test_rc24_documentation_describes_end_grace_without_changing_native_duration():
+    root = Path(server.__file__).parent
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    help_js = (Path(server.ASSETS) / "static" / "help_content.js").read_text(encoding="utf-8")
+    example = json.loads((root / "config.example.json").read_text(encoding="utf-8"))
+    assert example["sid_jukebox_end_grace_secs"] == 0.5
+    assert "sid_jukebox_end_grace_secs" in readme
+    assert "original documented duration is still sent to the Ultimate" in readme
+    assert "sid_jukebox_end_grace_secs" in help_js
+
+
+def test_rc24_empty_queue_keeps_saved_playlist_controls_visible():
+    static = Path(server.ASSETS) / "static"
+    html = (static / "index.html").read_text(encoding="utf-8")
+    js = (static / "app.js").read_text(encoding="utf-8")
+    css = (static / "app.css").read_text(encoding="utf-8")
+    assert 'id="jkListPanel" style="display:flex"' in html
+    assert 'id="plSel"' in html and 'id="plLoadBtn"' in html
+    assert 'No tunes queued' in html
+    assert 'lp.style.display="flex"' in js
+    assert 'if(!items.length)' in js
+    assert 'PLAY QUEUE — 0 TUNES' in js
+    assert '.sid-queue-empty{' in css
+    assert 'lp.style.display="none"' not in js
+
+
+def test_rc24_empty_queue_controls_are_context_sensitive():
+    static = Path(server.ASSETS) / "static"
+    html = (static / "index.html").read_text(encoding="utf-8")
+    js = (static / "app.js").read_text(encoding="utf-8")
+    assert 'id="plSaveBtn"' in html and 'disabled>💾 Save</button>' in html
+    assert 'id="jkClearQueueBtn"' in html and 'disabled>Clear Queue</button>' in html
+    assert 'id="plDeleteBtn"' in html and 'disabled>🗑</button>' in html
+    assert 'onchange="plControlsSync()"' in html
+    assert 'save.disabled=!hasItems' in js
+    assert 'clear.disabled=!hasItems' in js
+    assert 'del.disabled=!selected' in js
+    assert 'plControlsSync(s);' in js
+    assert 'plControlsSync();' in js
+
+
 def test_frontend_is_split_without_a_build_tool():
     static = Path(server.ASSETS) / "static"
     html = (static / "index.html").read_text(encoding="utf-8")
@@ -1387,7 +1872,7 @@ def test_frontend_is_split_without_a_build_tool():
 def test_release_metadata_is_centralised():
     import release
     assert server.VERSION == release.VERSION == "1.9.0"
-    assert release.RELEASE_LABEL == "Release Candidate 18"
+    assert release.RELEASE_LABEL == "Release Candidate 25"
     assert server.BUILD == release.build_id(server.ASSETS, Path(server.__file__).parent)
 
 
@@ -2350,7 +2835,7 @@ def test_release_help_and_now_playing_star_are_present():
     assert "jkToggleNowFavourite" in js
     assert ".u64deck-index.sqlite3" in help_js
     assert "star beside the playback controls" in help_js
-    assert "v1.9.0 — Release Candidate 18" in readme
+    assert "v1.9.0 — Release Candidate 25" in readme
     assert ".u64deck-index.sqlite3" in readme
     assert "Install every release into a **new, empty folder**" in readme
     assert "Do not copy `*-wal`" in readme
@@ -2640,11 +3125,60 @@ def _sidflow_manifest(count: int, **extra) -> dict:
     return value
 
 
+def _sidflow_080_manifest(count: int, **extra) -> dict:
+    value = _sidflow_manifest(
+        count,
+        vector_dimensions=58,
+        neighbor_row_count=max(count, 1),
+        feature_schema_version="1.5.0",
+        hvsc_version="HVSC 85 + Update 85",
+        similarity_metric="weighted-cosine",
+        vector_weights=[1.0] * 58,
+        file_checksums={
+            "sqlite_sha256": "d3d825ae0ed38139802b57cb7e8c2f01fc40bdbb824bf6669e9d2ef51bb176da"
+        },
+    )
+    value.update(extra)
+    return value
+
+
 def test_sidflow_manifest_schema_gate():
     import sidflow_similarity as sf
     assert sf.validate_manifest(_sidflow_manifest(1))["schema_version"] == "sidcorr-1"
     with pytest.raises(ValueError, match="sidcorr-2.*not supported"):
         sf.validate_manifest(_sidflow_manifest(1, schema_version="sidcorr-2"))
+
+
+def test_sidflow_080_manifest_contract_is_strict():
+    import sidflow_similarity as sf
+    manifest = sf.validate_pinned_manifest(_sidflow_080_manifest(10, neighbor_row_count=250))
+    assert manifest["vector_dimensions"] == 58
+    assert manifest["similarity_metric"] == "weighted-cosine"
+    with pytest.raises(ValueError, match="58 vector weights"):
+        sf.validate_pinned_manifest(_sidflow_080_manifest(10, vector_weights=[1.0] * 57))
+    with pytest.raises(ValueError, match="unexpected HVSC"):
+        sf.validate_pinned_manifest(_sidflow_080_manifest(10, hvsc_version="HVSC 84"))
+
+
+def test_sidflow_gzip_streaming_and_size_validation(tmp_path: Path):
+    import gzip
+    import sidflow_similarity as sf
+    raw = (b"sidflow-0.8.0" * 8192) + b"end"
+    compressed = tmp_path / "source.sqlite.gz"
+    output = tmp_path / "source.sqlite"
+    with gzip.open(compressed, "wb") as fh:
+        fh.write(raw)
+    progress = []
+    assert sf.gunzip_file(
+        compressed, output, expected_bytes=len(raw),
+        progress=lambda stage, current, total: progress.append((stage, current, total)),
+    ) == len(raw)
+    assert output.read_bytes() == raw
+    assert progress and progress[-1] == ("decompressing", len(raw), len(raw))
+    bad = tmp_path / "bad.sqlite"
+    with pytest.raises(ValueError, match="decompressed size"):
+        sf.gunzip_file(compressed, bad, expected_bytes=len(raw) + 1)
+    assert not bad.exists()
 
 
 def test_sidflow_slimming_preserves_rows_bounds_size_and_deletes_source(tmp_path: Path):
@@ -2703,11 +3237,12 @@ def test_sidflow_more_like_filters_to_device_and_radio_does_not_repeat(monkeypat
         def status(self): return {"available": True, "tracks": 3}
         def lookup(self, rel, song):
             return {"track_id": f"{rel}#{song}", "sid_path": rel, "song_index": song}
-        def rank(self, seed, *, limit, present_paths, exclude_track_ids):
+        def rank(self, seed, *, limit, present_paths, exclude_track_ids,
+                 exclude_sid_paths=(), same_file_policy="prefer_other"):
             excluded = {str(x).casefold() for x in exclude_track_ids}
             candidates = [
-                {"track_id": "MUSICIANS/B/B.sid#1", "sid_path": "MUSICIANS/B/B.sid", "song_index": 1, "similarity": .99},
-                {"track_id": "MUSICIANS/C/C.sid#2", "sid_path": "MUSICIANS/C/C.sid", "song_index": 2, "similarity": .95},
+                {"track_id": "MUSICIANS/B/B.sid#1", "sid_path": "MUSICIANS/B/B.sid", "song_index": 1, "similarity": .99, "recommendation_source": "sidflow-neighbors"},
+                {"track_id": "MUSICIANS/C/C.sid#2", "sid_path": "MUSICIANS/C/C.sid", "song_index": 2, "similarity": .95, "recommendation_source": "sidflow-neighbors"},
             ]
             return [row for row in candidates if row["track_id"].casefold() not in excluded]
     class FakeIndex:
@@ -2771,29 +3306,42 @@ def test_sidflow_ui_attribution_docs_and_archive_hygiene_are_present():
     assert not list(root.glob(".sidflow-*"))
 
 
-def test_sidflow_asset_plan_requires_full_feature_export(monkeypatch):
+def test_sidflow_asset_plan_pins_080_compressed_full_export():
     class Response:
         def raise_for_status(self): pass
         def json(self):
             return {
-                "tag_name": "sidcorr-hvsc-full-20260407T115218Z",
-                "published_at": "2026-04-07T11:52:18Z",
+                "tag_name": "0.8.0",
+                "published_at": "2026-07-27T20:52:00Z",
                 "assets": [
-                    {"name": "sidcorr-hvsc-full-sidcorr-1.sqlite", "browser_download_url": "https://example/full.sqlite"},
-                    {"name": "sidcorr-hvsc-full-sidcorr-1.manifest.json", "browser_download_url": "https://example/full.json"},
-                    {"name": "sidcorr-hvsc-mobile-sidcorr-1.sqlite", "browser_download_url": "https://example/mobile.sqlite"},
-                    {"name": "sidcorr-hvsc-mobile-sidcorr-1.manifest.json", "browser_download_url": "https://example/mobile.json"},
-                    {"name": "SHA256SUMS", "browser_download_url": "https://example/SHA256SUMS"},
+                    {"name": "sidcorr-hvsc-full-sidcorr-1.sqlite.gz", "browser_download_url": "https://example/full.sqlite.gz", "size": 194351886},
+                    {"name": "sidcorr-hvsc-full-sidcorr-1.manifest.json", "browser_download_url": "https://example/full.json", "size": 1234},
+                    {"name": "SHA256SUMS", "browser_download_url": "https://example/SHA256SUMS", "size": 999},
                 ],
             }
     class Client:
         def get(self, url): return Response()
 
     plan = server._sidflow_asset_plan(Client())
+    assert plan["tag"] == "0.8.0"
     assert plan["profile"] == "full"
-    assert plan["sqlite_url"] == "https://example/full.sqlite"
+    assert plan["gzip_name"] == "sidcorr-hvsc-full-sidcorr-1.sqlite.gz"
+    assert plan["gzip_url"] == "https://example/full.sqlite.gz"
     assert plan["manifest_url"] == "https://example/full.json"
     assert plan["checksums_url"] == "https://example/SHA256SUMS"
+    assert plan["gzip_sha256"] == "7eeddad82666fbf75ce93d0d412a7b31797475bee1b77c960542c7edb7b2fcf0"
+    assert plan["sqlite_sha256"] == "d3d825ae0ed38139802b57cb7e8c2f01fc40bdbb824bf6669e9d2ef51bb176da"
+
+
+def test_sidflow_disk_preflight_blocks_before_download(monkeypatch):
+    plan = {"gzip_bytes": 200, "sqlite_bytes": 1000}
+    class Usage:
+        free = 100
+    monkeypatch.setattr(server.shutil, "disk_usage", lambda path: Usage())
+    with pytest.raises(ValueError, match="Not enough free disk space"):
+        server._sidflow_check_disk_space(plan)
+
+
 
 
 def test_sidflow_slimming_retains_and_prefers_future_neighbors(tmp_path: Path):
@@ -2822,6 +3370,96 @@ def test_sidflow_slimming_retains_and_prefers_future_neighbors(tmp_path: Path):
     ranked = store.rank("A.sid#1", limit=1)
     assert ranked[0]["track_id"] == "C.sid#1"
     assert ranked[0]["similarity"] == pytest.approx(0.777)
+    assert ranked[0]["recommendation_source"] == "sidflow-neighbors"
+
+
+def test_sidflow_neighbor_graph_prefers_other_files_and_radio_excludes_siblings(tmp_path: Path):
+    import sqlite3
+    import sidflow_similarity as sf
+    source = tmp_path / "source.sqlite"
+    live = tmp_path / "live.sqlite"
+    rows = [
+        ("A.sid#1", "A.sid", 1, 1.0, 0.0, 0.0, None),
+        ("A.sid#2", "A.sid", 2, 0.99, 0.0, 0.0, None),
+        ("B.sid#1", "B.sid", 1, 0.9, 0.1, 0.0, None),
+        ("C.sid#1", "C.sid", 1, 0.8, 0.2, 0.0, None),
+    ]
+    _sidflow_source_db(source, rows)
+    edges = [
+        ("default", "A.sid#1", "A.sid#2", 1, .99),
+        ("default", "A.sid#1", "B.sid#1", 2, .95),
+        ("default", "A.sid#1", "C.sid#1", 3, .90),
+    ]
+    with closing(sqlite3.connect(source)) as conn, conn:
+        conn.executemany(
+            "INSERT INTO neighbors(profile,seed_track_id,neighbor_track_id,rank,similarity) VALUES(?,?,?,?,?)",
+            edges,
+        )
+    sf.slim_and_promote(source, live, _sidflow_manifest(len(rows), neighbor_row_count=len(edges)))
+    store = sf.SimilarityStore(live)
+    preferred = store.rank("A.sid#1", limit=3, same_file_policy="prefer_other")
+    assert [row["track_id"] for row in preferred] == ["B.sid#1", "C.sid#1", "A.sid#2"]
+    radio = store.rank("A.sid#1", limit=3, same_file_policy="exclude")
+    assert [row["track_id"] for row in radio] == ["B.sid#1", "C.sid#1"]
+
+
+def test_sidflow_fallback_is_explicitly_labelled(tmp_path: Path):
+    import sidflow_similarity as sf
+    source = tmp_path / "source.sqlite"
+    live = tmp_path / "live.sqlite"
+    rows = [
+        ("A.sid#1", "A.sid", 1, 3, 3, 3, None, {"bpm": 120, "energy": .8}),
+        ("B.sid#1", "B.sid", 1, 3, 3, 3, None, {"bpm": 121, "energy": .79}),
+    ]
+    _sidflow_source_db(source, rows)
+    sf.slim_and_promote(source, live, _sidflow_manifest(len(rows)))
+    ranked = sf.SimilarityStore(live).rank("A.sid#1", limit=1)
+    assert ranked[0]["recommendation_source"] == "u64deck-fallback"
+
+
+def test_sidflow_080_compact_status_reports_supported_contract(tmp_path: Path):
+    import sqlite3
+    import sidflow_similarity as sf
+    source = tmp_path / "source.sqlite"
+    live = tmp_path / "live.sqlite"
+    rows = [
+        ("A.sid#1", "A.sid", 1, 1.0, 0.0, 0.0, None),
+        ("B.sid#1", "B.sid", 1, 0.9, 0.1, 0.0, None),
+    ]
+    _sidflow_source_db(source, rows)
+    with closing(sqlite3.connect(source)) as conn, conn:
+        conn.executemany(
+            "INSERT INTO neighbors(profile,seed_track_id,neighbor_track_id,rank,similarity) VALUES(?,?,?,?,?)",
+            [
+                ("default", "A.sid#1", "B.sid#1", 1, .95),
+                ("default", "B.sid#1", "A.sid#1", 1, .95),
+            ],
+        )
+    manifest = _sidflow_080_manifest(
+        2,
+        neighbor_row_count=2,
+        u64deck_release_tag="0.8.0",
+        u64deck_source_asset=sf.FULL_SQLITE_GZ,
+    )
+    sf.slim_and_promote(source, live, manifest)
+    status = sf.SimilarityStore(live).status()
+    assert status["available"] is True
+    assert status["needs_update"] is False
+    assert status["release_tag"] == "0.8.0"
+    assert status["hvsc_version"] == "HVSC 85 + Update 85"
+    assert status["similarity_metric"] == "weighted-cosine"
+    assert status["vector_dimensions"] == 58
+    assert status["neighbors"] == 2
+    assert status["recommendation_engine"] == "SIDFlow weighted neighbour graph"
+
+
+def test_sidflow_recommendations_reject_older_installed_data(monkeypatch):
+    class OldStore:
+        def status(self):
+            return {"available": True, "needs_update": True}
+    monkeypatch.setattr(server, "SIDFLOW_STORE", OldStore())
+    with pytest.raises(HTTPException, match="0.8.0 data is required"):
+        server._sidflow_recommendations("/USB0/HVSC/A.sid", 1)
 
 
 def test_sidflow_sha256_parser_accepts_common_relative_names():
@@ -3378,7 +4016,7 @@ def test_sidflow_help_explains_radio_queue_and_local_privacy():
         "Selecting an individual search or browser result now creates a one-tune queue",
         "Clear Queue always disarms Radio first",
         "cancel pending SID completion/auto-advance callbacks",
-        "inserts the results immediately after the currently playing tune",
+        "inserts up to 20 results immediately after the current tune",
         "A session-level played set prevents repeats",
         "does not upload listening activity",
         "Powered by SIDFlow (Chris Gleissner)",
@@ -5479,7 +6117,8 @@ def test_rc16_frontend_flushes_scheduled_audio_and_caps_queue_ahead():
     assert "const AUDIO_SOURCES=new Set(),AUDIO_MAX_AHEAD=0.32" in js
     assert "AUDIO_JUKE_STOP_MUTED" in js
     assert "function flushBrowserAudio()" in js
-    assert "if(nextT>now+AUDIO_MAX_AHEAD)return" in js
+    assert "AUDIO_MAX_AHEAD" in js
+    assert "audioDroppedAhead" in js
     stop = js[js.index("async function jkStop()") : js.index("async function jk(a)")]
     assert "flushBrowserAudio();" in stop
     assert "AUDIO_JUKE_STOP_MUTED=true" in stop
@@ -5931,3 +6570,210 @@ def test_rc17_readme_carries_canonical_dual_interface_warnings_verbatim():
     cache_bullet = readme.index("- One image at a time is cached in RAM per browse (last 8 kept).", limitations)
     assert readme.index(block2, limitations) > cache_bullet
     assert readme.index(block2, limitations) < readme.index("## Files", limitations)
+
+
+# --- v1.9.0 Release Candidate 19: local System Health dashboard ---
+
+def test_rc19_health_ui_help_and_local_poll_contract():
+    static = Path(server.ASSETS) / "static"
+    html = (static / "index.html").read_text(encoding="utf-8")
+    js = (static / "app.js").read_text(encoding="utf-8")
+    css = (static / "app.css").read_text(encoding="utf-8")
+    help_js = (static / "help_content.js").read_text(encoding="utf-8")
+    assert 'data-tab="health"' in html
+    assert 'id="tab-health"' in html
+    assert 'id="healthRestLatestP95"' in html
+    assert 'id="healthVideoRate"' in html
+    assert 'id="healthProcessLoad"' in html
+    assert 'id="healthActiveOperation"' in html
+    assert 'id="healthSummaryBadge"' in html
+    assert 'id="healthOperationHistory"' in html
+    assert 'api("/api/health"' in js
+    assert 'setInterval(healthLoad,2000)' in js
+    assert 'document.hidden' in js
+    assert '#tab-health.active' in css
+    assert 'does not call the Ultimate' in help_js
+    assert 'FPGA utilisation or temperature' in help_js
+
+
+def test_rc19_health_latency_summary_uses_existing_info_samples():
+    previous_samples = list(server._HEALTH_REST_LATENCIES)
+    previous_device = dict(server._HEALTH_LAST_DEVICE)
+    previous_device_at = server._HEALTH_LAST_DEVICE_AT
+    previous_error = server._HEALTH_LAST_INFO_ERROR
+    previous_error_at = server._HEALTH_LAST_INFO_ERROR_AT
+    previous_successes = server._HEALTH_REST_SUCCESSES
+    previous_failures = server._HEALTH_REST_FAILURES
+    previous_consecutive = server._HEALTH_REST_CONSECUTIVE_FAILURES
+    try:
+        server._HEALTH_REST_LATENCIES.clear()
+        server._HEALTH_LAST_DEVICE.clear()
+        server._HEALTH_LAST_DEVICE_AT = 0.0
+        server._HEALTH_LAST_INFO_ERROR = ""
+        server._HEALTH_LAST_INFO_ERROR_AT = 0.0
+        server._HEALTH_REST_SUCCESSES = 0
+        server._HEALTH_REST_FAILURES = 0
+        server._HEALTH_REST_CONSECUTIVE_FAILURES = 0
+        server._health_record_info({
+            "product": "Ultimate 64", "firmware_version": "3.15",
+            "fpga_version": "122", "core_version": "1.4B",
+            "hostname": "Ultimate-Test", "unique_id": "101090",
+        }, 20.0)
+        server._health_record_info({"product": "Ultimate 64"}, 40.0)
+        snap = server._health_latency_snapshot()
+        assert snap["samples"] == 2
+        assert snap["latest_ms"] == 40.0
+        assert snap["minimum_ms"] == 20.0
+        assert snap["average_ms"] == 30.0
+        assert snap["maximum_ms"] == 40.0
+        assert snap["p95_ms"] == 40.0
+        assert snap["successes"] == 2
+        assert snap["success_rate_percent"] == 100.0
+        assert snap["device"]["product"] == "Ultimate 64"
+        assert snap["last_success_age_seconds"] is not None
+    finally:
+        server._HEALTH_REST_LATENCIES.clear()
+        server._HEALTH_REST_LATENCIES.extend(previous_samples)
+        server._HEALTH_LAST_DEVICE.clear()
+        server._HEALTH_LAST_DEVICE.update(previous_device)
+        server._HEALTH_LAST_DEVICE_AT = previous_device_at
+        server._HEALTH_LAST_INFO_ERROR = previous_error
+        server._HEALTH_LAST_INFO_ERROR_AT = previous_error_at
+        server._HEALTH_REST_SUCCESSES = previous_successes
+        server._HEALTH_REST_FAILURES = previous_failures
+        server._HEALTH_REST_CONSECUTIVE_FAILURES = previous_consecutive
+
+
+def test_rc19_health_endpoint_never_calls_ultimate(monkeypatch):
+    class NoPollRest:
+        host = "192.0.2.64"
+        def info(self):
+            raise AssertionError("health endpoint must not call the Ultimate")
+
+    previous_cfg = dict(server.CFG)
+    previous_rest = server.rest
+    try:
+        server.CFG["u64_host"] = "192.0.2.64"
+        server.CFG["rest_control_host"] = "192.0.2.64"
+        server.rest = NoPollRest()
+        monkeypatch.setattr(server, "_health_process_snapshot", lambda: {"uptime_seconds": 1.0})
+        monkeypatch.setattr(server, "_health_stream_snapshot", lambda: {"video": {}, "audio": {}})
+        monkeypatch.setattr(server, "_health_index_snapshot", lambda: {"images": 2})
+        monkeypatch.setattr(server, "_health_event_snapshot", lambda: {"retained": 0, "warnings": 0, "errors": 0})
+        payload = server.health_get()
+        assert payload["poll_hint_ms"] == 2000
+        assert payload["ultimate"]["selected_ip"] == "192.0.2.64"
+        assert payload["limitations"]["fpga_utilisation_available"] is False
+    finally:
+        server.CFG.clear()
+        server.CFG.update(previous_cfg)
+        server.rest = previous_rest
+
+
+def test_rc19_stream_health_calculates_local_rates_and_packet_age(monkeypatch):
+    class DummyReceiver:
+        running = True
+        packets = 200
+        dropped = 3
+        frame_no = 50
+        bytes_received = 125000
+        started_at = 1.0
+        last_packet_at = 99.8
+        last_pkt_len = 770
+
+    previous_video, previous_audio = server.video, server.audio
+    previous_samples = dict(server._HEALTH_STREAM_SAMPLE)
+    previous_rates = {k: dict(v) for k, v in server._HEALTH_STREAM_RATES.items()}
+    previous_state = dict(server.STREAM_STATE)
+    try:
+        server.video = DummyReceiver()
+        server.audio = DummyReceiver()
+        server.STREAM_STATE.update(video=True, audio=True)
+        server._HEALTH_STREAM_SAMPLE.clear()
+        server._HEALTH_STREAM_SAMPLE.update({
+            "video": {"time": 99.0, "bytes": 100000, "packets": 150, "frames": 25},
+            "audio": {"time": 99.0, "bytes": 100000, "packets": 150, "frames": 25},
+        })
+        server._HEALTH_STREAM_RATES["video"] = {}
+        server._HEALTH_STREAM_RATES["audio"] = {}
+        monkeypatch.setattr(server.time, "time", lambda: 100.0)
+        snap = server._health_stream_snapshot()
+        assert snap["video"]["bitrate_bps"] == 200000
+        assert snap["video"]["packets_per_second"] == 50.0
+        assert snap["video"]["frames_per_second"] == 25.0
+        assert snap["video"]["packet_age_seconds"] == 0.2
+        assert snap["audio"]["commanded_on"] is True
+    finally:
+        server.video, server.audio = previous_video, previous_audio
+        server._HEALTH_STREAM_SAMPLE.clear()
+        server._HEALTH_STREAM_SAMPLE.update(previous_samples)
+        server._HEALTH_STREAM_RATES.clear()
+        server._HEALTH_STREAM_RATES.update(previous_rates)
+        server.STREAM_STATE.clear()
+        server.STREAM_STATE.update(previous_state)
+
+
+def test_rc19_diagnostics_contains_health_snapshot(monkeypatch):
+    class FakeRest:
+        def info(self): return {"product": "Ultimate"}
+    monkeypatch.setattr(server, "rest", FakeRest())
+    monkeypatch.setattr(server, "stream_stats", lambda: {"video": {"packets": 1}})
+    monkeypatch.setattr(server, "health_snapshot", lambda: {"u64deck": {"process": {"cpu_percent": 1.0}}, "limitations": {"fpga_utilisation_available": False}})
+    monkeypatch.setattr(server, "fs_index_status", lambda: {"running": False})
+    monkeypatch.setattr(server, "cache_stats", lambda: {"database": {"images": 2}})
+    monkeypatch.setattr(server, "cache_parse_errors", lambda limit=200: {"count": 0, "errors": []})
+    response = server.diagnostics_export({"browser": {"userAgent": "pytest"}})
+    with zipfile.ZipFile(io.BytesIO(response.body)) as archive:
+        summary = json.loads(archive.read("summary.json"))
+    assert summary["health"]["u64deck"]["process"]["cpu_percent"] == 1.0
+    assert summary["health"]["limitations"]["fpga_utilisation_available"] is False
+
+
+# --- v1.9.0 Release Candidate 25 public packaging contract ---
+
+def test_rc25_public_documentation_identity_and_sidflow_contract():
+    root = Path(server.ROOT)
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
+    build = server.BUILD
+    assert f"v1.9.0 — Release Candidate 25 · build {build}" in readme
+    assert f"**Public build:** `{build}`" in changelog
+    assert "git tag v1.9.0-rc.25 && git push --tags" in readme
+    assert "v1.9.0-rc.24" not in readme
+    normalized_readme = " ".join(readme.split())
+    for text in (
+        "194,351,886 bytes",
+        "982,155,264-byte",
+        "269,389,824-byte",
+        "about 48 seconds",
+        "roughly 1.8 GiB",
+        "Update required",
+        "With no network available",
+        "ordinary SID browsing, queueing and playback continue",
+        "u64deck-fallback",
+        "2,196,700",
+        "58-dimensional",
+        "48-dimensional",
+    ):
+        assert text in normalized_readme
+    for url in (
+        "https://github.com/chrisgleissner/sidflow",
+        "https://github.com/chrisgleissner/sidflow-data/releases/tag/0.8.0",
+        "https://github.com/chrisgleissner/sidflow/blob/main/doc/migration/0.5-to-0.8-u64deck.md",
+    ):
+        assert url in readme
+    assert "without network, recommendations remain unavailable while normal SID playback continues" in help_js
+    assert "about 48 seconds" in help_js
+
+
+def test_rc25_public_docs_cover_playlist_selection_before_playback_entry_paths():
+    root = Path(server.ROOT)
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
+    assert "Saved play queues can be loaded before any tune is selected" in readme
+    for text in ("fresh start", "direct Jukebox visit", "Clear Queue", "Search", "folder browsing", "local-SID picker", "Storage", "Favourites", "Recent Items"):
+        assert text in readme
+    assert "Saved play queues before playback" in help_js
+    assert "post-Clear Queue state" in changelog

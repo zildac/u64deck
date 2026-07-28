@@ -36,6 +36,7 @@
   <button data-tab="screen" class="active" onclick="tab('screen')">SCREEN</button>
   <button data-tab="home" onclick="tab('home')">FAVOURITES</button>
   <button data-tab="disks" onclick="tab('disks')">STORAGE</button>
+  <button data-tab="health" onclick="tab('health')">HEALTH</button>
   <button data-tab="settings" onclick="tab('settings')">SETTINGS</button>
   <button data-tab="asm64" onclick="tab('asm64')">ASSEMBLY64</button>
   <button data-tab="sid" onclick="tab('sid')">SID JUKEBOX</button>
@@ -357,6 +358,161 @@
   </div>
 </section>
 
+<!-- ============ HEALTH ============ -->
+<section id="tab-health">
+  <div class="health-head">
+    <div>
+      <h2>SYSTEM HEALTH</h2>
+      <div class="hint">Local telemetry and cached Ultimate status. No additional recurring Ultimate requests are made.</div>
+    </div>
+    <div class="row">
+      <span id="healthUpdated" class="hint">auto-update waiting for first sample</span>
+    </div>
+  </div>
+
+  <div id="healthSummary" class="health-summary state-neutral">
+    <span id="healthSummaryBadge" class="health-summary-badge">WAITING</span>
+    <div><b id="healthSummaryTitle">Waiting for first sample</b><span id="healthSummaryReasons">Health telemetry appears here.</span></div>
+  </div>
+
+  <div class="health-grid">
+    <div class="panel health-card">
+      <div class="health-card-title"><h2>ULTIMATE &amp; REST</h2><span id="healthUltimateState" class="badge">unknown</span></div>
+      <div id="healthUltimateName" class="health-primary">Not configured</div>
+      <div id="healthUltimateVersions" class="hint">—</div>
+      <div class="health-metrics">
+        <div><span>Selected / REST</span><b id="healthUltimateRoutes">—</b></div>
+        <div><span>Latest / p95</span><b id="healthRestLatestP95">—</b></div>
+        <div><span>Min / avg / max</span><b id="healthRestRange">—</b></div>
+        <div><span>Success rate</span><b id="healthRestSuccess">—</b></div>
+        <div><span>Failures / streak</span><b id="healthRestFailures">0 / 0</b></div>
+        <div><span>Last success</span><b id="healthLastResponse">—</b></div>
+        <div><span>Client replacements</span><b id="healthRestReconnects">0</b></div>
+        <div><span>Samples</span><b id="healthRestSamples">0</b></div>
+      </div>
+      <div id="healthUltimateError" class="health-note" style="display:none"></div>
+    </div>
+
+    <div class="panel health-card">
+      <div class="health-card-title"><h2>STREAMS</h2><span id="healthStreamsState" class="badge">off</span></div>
+      <div id="healthStreamTransport" class="hint">Transport: —</div>
+      <div class="health-stream-row">
+        <div><b>VIDEO</b></div>
+        <div class="health-metrics compact">
+          <div><span>Received / rendered</span><b id="healthVideoFps">—</b></div>
+          <div><span>Rate</span><b id="healthVideoRate">—</b></div>
+          <div><span>Drops / gap events</span><b id="healthVideoGaps">0 / 0</b></div>
+          <div><span>Longest packet gap</span><b id="healthVideoLongestGap">—</b></div>
+          <div><span>Current / peak age</span><b id="healthVideoAge">—</b></div>
+          <div><span>Starts / restarts</span><b id="healthVideoRestarts">0 / 0</b></div>
+          <div><span>Browser WS</span><b id="healthVideoWs">0 / 0</b></div>
+          <div><span>Total frames</span><b id="healthVideoFrames">0</b></div>
+        </div>
+      </div>
+      <div class="health-stream-row">
+        <div><b>AUDIO</b></div>
+        <div class="health-metrics compact">
+          <div><span>Packets</span><b id="healthAudioPps">—</b></div>
+          <div><span>Rate</span><b id="healthAudioRate">—</b></div>
+          <div><span>Drops / gap events</span><b id="healthAudioGaps">0 / 0</b></div>
+          <div><span>Longest packet gap</span><b id="healthAudioLongestGap">—</b></div>
+          <div><span>Current / peak age</span><b id="healthAudioAge">—</b></div>
+          <div><span>Queue / underruns</span><b id="healthAudioQueue">—</b></div>
+          <div><span>Reconnects / WS closes</span><b id="healthAudioReconnects">0 / 0</b></div>
+          <div><span>Audio context</span><b id="healthAudioContext">—</b></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel health-card">
+      <div class="health-card-title"><h2>CURRENT ACTIVITY</h2></div>
+      <div id="healthActivityName" class="health-primary">Idle</div>
+      <div id="healthActivityDetail" class="hint">No operation in progress.</div>
+      <div class="health-metrics">
+        <div><span>Phase</span><b id="healthActivityPhase">—</b></div>
+        <div><span>Elapsed</span><b id="healthActivityElapsed">—</b></div>
+        <div><span>Queue owner</span><b id="healthActiveOperation">idle</b></div>
+        <div><span>Waiters I / S / B</span><b id="healthWaiters">0 / 0 / 0</b></div>
+        <div><span>Wait avg / p95 / max</span><b id="healthQueueWaitStats">—</b></div>
+        <div><span>Completed I / S / B</span><b id="healthCompletedByPriority">0 / 0 / 0</b></div>
+        <div><span>Cancelled</span><b id="healthCancelled">0</b></div>
+        <div><span>Total queue wait</span><b id="healthQueueWait">0 s</b></div>
+      </div>
+    </div>
+
+    <div class="panel health-card">
+      <div class="health-card-title"><h2>INDEX &amp; CACHE</h2></div>
+      <div id="healthIndexCurrent" class="health-primary">Indexer idle</div>
+      <div id="healthIndexDetail" class="hint">—</div>
+      <div class="health-metrics">
+        <div><span>Images / SID metadata</span><b id="healthIndexCounts">—</b></div>
+        <div><span>Database / failures</span><b id="healthIndexDatabase">—</b></div>
+        <div><span>Files / dirs per sec</span><b id="healthIndexRates">—</b></div>
+        <div><span>Image rate / ETA</span><b id="healthIndexEta">—</b></div>
+        <div><span>New / changed / errors</span><b id="healthIndexChanges">—</b></div>
+        <div><span>Image cache</span><b id="healthImageCache">—</b></div>
+        <div><span>Image cache hit rate</span><b id="healthImageCacheHits">—</b></div>
+        <div><span>SID materialisation</span><b id="healthSidCacheHits">—</b></div>
+        <div><span>SIDFlow model</span><b id="healthSidflowModel">—</b></div>
+        <div><span>SIDFlow tracks / neighbours</span><b id="healthSidflowCounts">—</b></div>
+      </div>
+    </div>
+
+    <div class="panel health-card">
+      <div class="health-card-title"><h2>U64DECK &amp; HOST</h2><span id="healthFrozen" class="badge">source</span></div>
+      <div class="health-metrics">
+        <div><span>Process CPU / RAM</span><b id="healthProcessLoad">—</b></div>
+        <div><span>Threads / handles</span><b id="healthProcessShape">—</b></div>
+        <div><span>Process uptime</span><b id="healthProcessUptime">—</b></div>
+        <div><span>Host CPU / RAM</span><b id="healthHostLoad">—</b></div>
+        <div><span>Free disk</span><b id="healthDiskFree">—</b></div>
+        <div><span>I/O read / write</span><b id="healthProcessIo">—</b></div>
+        <div><span>Build</span><b id="healthBuild">—</b></div>
+        <div><span>Diagnostics W / E</span><b id="healthDiagCounts">0 / 0</b></div>
+        <div><span>Active W / E</span><b id="healthDiagActive">0 / 0</b></div>
+        <div><span>Last error</span><b id="healthLastErrorAge">never</b></div>
+      </div>
+    </div>
+
+    <div class="panel health-card">
+      <div class="health-card-title"><h2>PERSISTENCE &amp; LIFECYCLE</h2><span id="healthPersistenceState" class="badge">ready</span></div>
+      <div class="health-metrics">
+        <div><span>Config saves</span><b id="healthConfigSaves">0 / 0</b></div>
+        <div><span>Last config save</span><b id="healthConfigLast">—</b></div>
+        <div><span>Route changes</span><b id="healthRouteChanges">0</b></div>
+        <div><span>Last route</span><b id="healthLastRoute">—</b></div>
+        <div><span>Shutdown state</span><b id="healthShutdownState">not requested</b></div>
+        <div><span>Last shutdown duration</span><b id="healthShutdownTime">—</b></div>
+        <div><span>Events retained</span><b id="healthDiagRetained">0</b></div>
+        <div><span>Last event</span><b id="healthLastEvent">—</b></div>
+      </div>
+    </div>
+  </div>
+
+
+  <details class="panel health-details" id="healthDiagnosticDetails">
+    <summary>Recent warnings and errors <span class="badge" id="healthDiagnosticHistoryCount">0</span></summary>
+    <div id="healthDiagnosticHistory" class="health-history"><div class="hint">No warnings or errors recorded.</div></div>
+  </details>
+
+  <details class="panel health-details">
+    <summary>Recent device operations <span class="badge" id="healthOpHistoryCount">0</span></summary>
+    <div id="healthOperationHistory" class="health-history"><div class="hint">No completed operations yet.</div></div>
+  </details>
+  <details class="panel health-details">
+    <summary>Stream lifecycle <span class="badge" id="healthStreamHistoryCount">0</span></summary>
+    <div id="healthStreamHistory" class="health-history"><div class="hint">No stream events yet.</div></div>
+  </details>
+  <details class="panel health-details">
+    <summary>Route, config and activity history <span class="badge" id="healthLifecycleHistoryCount">0</span></summary>
+    <div id="healthLifecycleHistory" class="health-history"><div class="hint">No lifecycle events yet.</div></div>
+  </details>
+
+  <div class="panel health-limit">
+    <b>Ultimate hardware telemetry:</b> the current firmware REST API does not expose CPU load, FPGA utilisation or temperature, so u64deck does not invent those values.
+  </div>
+</section>
+
 <!-- ============ SETTINGS ============ -->
 <section id="tab-settings">
   <div class="panel">
@@ -410,7 +566,7 @@
         <button class="mini primary" id="sidflowDownloadBtn" onclick="sidflowDownload()">Download Similarity Data</button>
         <button class="mini danger" id="sidflowRemoveBtn" onclick="sidflowRemove()" style="display:none">Remove Similarity Data</button>
       </div>
-      <div class="hint" style="margin-top:6px">Downloads SIDFlow's full feature export once (about 400 MB), verifies its checksum, retains only compact perceptual vectors locally, then deletes the large source file.</div>
+      <div class="hint" style="margin-top:6px">Downloads the pinned SIDFlow 0.8.0 full export as a 194 MB compressed file, verifies both compressed and decompressed SHA-256 digests, imports its weighted 58-dimensional neighbour graph, then removes the temporary 982 MB source. Allow about 1.8 GiB free during the update; the existing working database is preserved unless promotion succeeds.</div>
     </div>
     <div style="border-top:1px solid var(--line);margin-top:12px;padding-top:10px">
       <h2 style="margin-bottom:6px">BUILD INDEX FROM LOCAL USB</h2>
@@ -577,7 +733,7 @@
       <span id="jkSidflowCredit" class="sidflow-credit">Powered by SIDFlow (Chris Gleissner)</span>
     </div>
   </div>
-  <div class="panel sid-queue-panel" id="jkListPanel" style="display:none">
+  <div class="panel sid-queue-panel" id="jkListPanel" style="display:flex">
     <div class="sid-queue-heading">
       <h2 id="jkListTitle">PLAY QUEUE</h2>
       <span id="jkListContext" class="hint"></span>
@@ -585,13 +741,13 @@
     <div class="row sid-queue-tools">
       <input id="plName" style="width:160px" placeholder="play queue name…"
         onkeydown="if(event.key==='Enter')plSave()">
-      <button class="mini" onclick="plSave()" title="save the current play queue (device tunes only)">💾 Save</button>
-      <select id="plSel" style="min-width:160px"><option value="">— saved play queues —</option></select>
-      <button class="mini primary" onclick="plLoad()" title="replace the current play queue with the saved one">▶ Load</button>
-      <button class="mini" onclick="plDelete()" title="delete the selected saved play queue">🗑</button>
-      <button class="mini" onclick="jkClearQueue()" title="clear queued tunes, turn Radio off and let the current SID finish">Clear Queue</button>
+      <button class="mini" id="plSaveBtn" onclick="plSave()" title="save the current play queue (device tunes only)" disabled>💾 Save</button>
+      <select id="plSel" style="min-width:160px" onchange="plControlsSync()"><option value="">— saved play queues —</option></select>
+      <button class="mini primary" id="plLoadBtn" onclick="plLoad()" title="replace the current play queue with the saved one">▶ Load</button>
+      <button class="mini" id="plDeleteBtn" onclick="plDelete()" title="delete the selected saved play queue" disabled>🗑</button>
+      <button class="mini" id="jkClearQueueBtn" onclick="jkClearQueue()" title="clear queued tunes, turn Radio off and let the current SID finish" disabled>Clear Queue</button>
     </div>
-    <div id="jkList" class="sid-queue-list" role="table" aria-label="SID play queue"></div>
+    <div id="jkList" class="sid-queue-list" role="table" aria-label="SID play queue"><div class="sid-queue-empty" role="status"><strong>No tunes queued</strong><span>Choose a saved play queue above, add a SID, or play a folder.</span></div></div>
   </div>
 </section>
 </main>

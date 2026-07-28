@@ -14,18 +14,21 @@ import json
 import os
 import platform
 import re
+import shutil
 import socket
 import subprocess
 import threading
 import time
 import uuid
 import zipfile
+from datetime import datetime
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
 
 import httpx
+import psutil
 import uvicorn
 from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response
@@ -48,12 +51,19 @@ from local_indexer import (list_local_volumes, normalise_ultimate_root,
                            resolve_source, scan_local_tree, volume_identity)
 from sid_indexer import SID_HEADER_BYTES, scan_local_sid_tree
 from sidflow_similarity import (CHECKSUMS as SIDFLOW_CHECKSUMS, FULL_MANIFEST as SIDFLOW_FULL_MANIFEST,
-                                FULL_SQLITE as SIDFLOW_FULL_SQLITE, LATEST_DOWNLOAD_BASE as SIDFLOW_DOWNLOAD_BASE,
-                                LATEST_RELEASE_API as SIDFLOW_RELEASE_API, MOBILE_MANIFEST as SIDFLOW_MOBILE_MANIFEST,
-                                MOBILE_SQLITE as SIDFLOW_MOBILE_SQLITE, SCHEMA_VERSION as SIDFLOW_SCHEMA,
-                                SimilarityStore, build_track_id as sidflow_track_id,
+                                FULL_SQLITE as SIDFLOW_FULL_SQLITE, FULL_SQLITE_GZ as SIDFLOW_FULL_SQLITE_GZ,
+                                PINNED_COMPACT_ESTIMATE_BYTES as SIDFLOW_COMPACT_ESTIMATE_BYTES,
+                                PINNED_DOWNLOAD_BASE as SIDFLOW_DOWNLOAD_BASE,
+                                PINNED_GZIP_BYTES as SIDFLOW_GZIP_BYTES,
+                                PINNED_GZIP_SHA256 as SIDFLOW_GZIP_SHA256,
+                                PINNED_RELEASE_API as SIDFLOW_RELEASE_API,
+                                PINNED_RELEASE_TAG as SIDFLOW_RELEASE_TAG,
+                                PINNED_SQLITE_BYTES as SIDFLOW_SQLITE_BYTES,
+                                PINNED_SQLITE_SHA256 as SIDFLOW_SQLITE_SHA256,
+                                SCHEMA_VERSION as SIDFLOW_SCHEMA, SimilarityStore,
+                                build_track_id as sidflow_track_id, gunzip_file,
                                 normalise_hvsc_relative, parse_sha256sums, sha256_file,
-                                slim_and_promote, validate_manifest)
+                                slim_and_promote, validate_pinned_manifest)
 from release import VERSION, RELEASE_LABEL, build_id
 from state_io import (read_json as _read_json, warn_throttled as _warn_throttled,
                       write_json_atomic as _write_json_atomic)
@@ -102,6 +112,55 @@ def _attachment_headers(name: str) -> dict[str, str]:
 
 
 BUILD = build_id(ASSETS, Path(__file__).parent)
+
+APP_STARTED_AT = time.time()
+_HEALTH_LOCK = threading.RLock()
+_HEALTH_REST_LATENCIES = deque(maxlen=240)
+_HEALTH_REST_SUCCESSES = 0
+_HEALTH_REST_FAILURES = 0
+_HEALTH_REST_CONSECUTIVE_FAILURES = 0
+_HEALTH_REST_CLIENT_REPLACEMENTS = 0
+_HEALTH_LAST_DEVICE = {}
+_HEALTH_LAST_DEVICE_AT = 0.0
+_HEALTH_LAST_INFO_ERROR = ""
+_HEALTH_LAST_INFO_ERROR_AT = 0.0
+_HEALTH_STREAM_SAMPLE = {}
+_HEALTH_STREAM_RATES = {"video": {}, "audio": {}}
+_HEALTH_STREAM_PEAK_AGE = {"video": 0.0, "audio": 0.0}
+_HEALTH_STREAM_GAP_AT = {"video": 0.0, "audio": 0.0}
+_HEALTH_STREAM_HISTORY = deque(maxlen=40)
+_HEALTH_WS_STATE = {
+    "video": {"connections": 0, "disconnects": 0, "active": 0},
+    "audio": {"connections": 0, "disconnects": 0, "active": 0},
+}
+_HEALTH_BROWSER_TELEMETRY = {}
+_HEALTH_BROWSER_TELEMETRY_AT = 0.0
+_HEALTH_INDEX_CACHE = {}
+_HEALTH_INDEX_CACHE_AT = 0.0
+_HEALTH_ROUTE_HISTORY = deque(maxlen=30)
+_HEALTH_CONFIG_HISTORY = deque(maxlen=30)
+_HEALTH_CONFIG_SAVES = {"successes": 0, "failures": 0}
+_HEALTH_ACTIVITY = {"name": "", "phase": "", "started_at": 0.0, "detail": ""}
+_HEALTH_ACTIVITY_HISTORY = deque(maxlen=40)
+_HEALTH_CACHE_STATS = {
+    "image_hits": 0, "image_misses": 0, "image_evictions": 0,
+    "sid_materialise_hits": 0, "sid_materialise_misses": 0,
+}
+_HEALTH_SHUTDOWN = {"state": "not_requested", "requested_at": 0.0,
+                    "cleanup_started_at": 0.0, "cleanup_completed_at": 0.0,
+                    "phases": {}, "total_ms": None}
+_DRIVE_STATUS_LOCK = threading.RLock()
+_DRIVE_STATUS_READY_AT = 0.0
+_DRIVE_STATUS_TRANSIENT_FAILURES = 0
+_DRIVE_STATUS_LAST_FAILURE_AT = 0.0
+DRIVE_STATUS_TRANSIENT_WINDOW_SECONDS = 10.0
+DRIVE_STATUS_MAX_TRANSIENT_RETRIES = 3
+try:
+    _HEALTH_PROCESS = psutil.Process(os.getpid())
+    _HEALTH_PROCESS.cpu_percent(None)
+    psutil.cpu_percent(None)
+except Exception:
+    _HEALTH_PROCESS = None
 
 DEFAULT_CONFIG = {
     "u64_host": "",
@@ -173,6 +232,10 @@ DEFAULT_CONFIG = {
     "hvsc_path": "",
     # Auto-advance fallback when a tune's length is unknown (seconds; 0=off)
     "sid_default_secs": 180,
+    # Additional wait after a matched HVSC Songlengths duration before the
+    # next Jukebox tune is launched. This preserves short audible tails/fades
+    # without changing the duration sent to the Ultimate's native SID player.
+    "sid_jukebox_end_grace_secs": 0.5,
     # Last-used local SID metadata source. This is only a convenience value;
     # the scanner remains read-only and stores Ultimate-style paths in SQLite.
     "sid_local_source": "",
@@ -221,9 +284,16 @@ def load_config() -> dict:
 
 def save_config():
     """Persist current settings next to the server/exe so they survive restarts."""
+    started = time.perf_counter()
     try:
         _write_json_atomic(ROOT / "config.json", CFG, indent=2)
+        if "_health_record_config_save" in globals():
+            _health_record_config_save(True, (time.perf_counter() - started) * 1000.0)
     except OSError as e:
+        if "_health_record_config_save" in globals():
+            _health_record_config_save(
+                False, (time.perf_counter() - started) * 1000.0, str(e)
+            )
         # During the one-time config migration this can run before the
         # diagnostics deque is initialised. Never turn a harmless persistence
         # failure into an import-time crash.
@@ -449,6 +519,82 @@ def _diag_event(level: str, message: str, **extra):
         item["extra"] = {str(k): str(v)[:500] for k, v in extra.items()}
     DIAG_EVENTS.append(item)
 
+
+def _health_percentile(samples, percentile: float):
+    values = sorted(float(value) for value in samples if value is not None)
+    if not values:
+        return None
+    rank = max(0, min(len(values) - 1, int((len(values) - 1) * percentile + 0.999999)))
+    return round(values[rank], 3)
+
+
+def _health_set_activity(name: str, phase: str = "", detail: str = "") -> None:
+    now = time.time()
+    with _HEALTH_LOCK:
+        current = dict(_HEALTH_ACTIVITY)
+        if current.get("name") and current.get("name") != name:
+            completed = dict(current)
+            completed["finished_at"] = now
+            completed["elapsed_seconds"] = round(max(0.0, now - float(current.get("started_at") or now)), 3)
+            _HEALTH_ACTIVITY_HISTORY.append(completed)
+        if not name:
+            _HEALTH_ACTIVITY.update({"name": "", "phase": "", "started_at": 0.0, "detail": ""})
+            return
+        started = float(current.get("started_at") or 0.0) if current.get("name") == name else now
+        _HEALTH_ACTIVITY.update({"name": str(name), "phase": str(phase),
+                                 "started_at": started, "detail": str(detail)[:300]})
+
+
+def _health_finish_activity(outcome: str = "ok", detail: str = "") -> None:
+    now = time.time()
+    with _HEALTH_LOCK:
+        current = dict(_HEALTH_ACTIVITY)
+        if current.get("name"):
+            current.update({
+                "finished_at": now,
+                "elapsed_seconds": round(max(0.0, now - float(current.get("started_at") or now)), 3),
+                "outcome": str(outcome),
+            })
+            if detail:
+                current["detail"] = str(detail)[:300]
+            _HEALTH_ACTIVITY_HISTORY.append(current)
+        _HEALTH_ACTIVITY.update({"name": "", "phase": "", "started_at": 0.0, "detail": ""})
+
+
+def _health_record_config_save(success: bool, elapsed_ms: float, error: str = "") -> None:
+    with _HEALTH_LOCK:
+        key = "successes" if success else "failures"
+        _HEALTH_CONFIG_SAVES[key] = int(_HEALTH_CONFIG_SAVES.get(key, 0)) + 1
+        _HEALTH_CONFIG_HISTORY.append({
+            "time": time.time(), "success": bool(success),
+            "elapsed_ms": round(max(0.0, float(elapsed_ms)), 2),
+            "error": str(error)[:300],
+        })
+
+
+def _health_record_route(selected_host: str, control_host: str, reason: str) -> None:
+    with _HEALTH_LOCK:
+        _HEALTH_ROUTE_HISTORY.append({
+            "time": time.time(), "selected_host": str(selected_host or ""),
+            "control_host": str(control_host or ""),
+            "alternate": bool(control_host and selected_host and control_host != selected_host),
+            "reason": str(reason)[:160],
+        })
+
+
+def _health_record_client_replacement(reason: str) -> None:
+    global _HEALTH_REST_CLIENT_REPLACEMENTS
+    with _HEALTH_LOCK:
+        _HEALTH_REST_CLIENT_REPLACEMENTS += 1
+    _diag_event("info", f"REST client replaced: {reason}")
+
+
+def _health_record_stream_event(name: str, action: str, **extra) -> None:
+    row = {"time": time.time(), "stream": str(name), "action": str(action)}
+    row.update({str(k): v for k, v in extra.items()})
+    with _HEALTH_LOCK:
+        _HEALTH_STREAM_HISTORY.append(row)
+
 def _mount_mode(mode: str | None) -> str:
     value = str(mode or CFG.get("default_mount_mode", "readwrite")).lower()
     if value not in VALID_MOUNT_MODES:
@@ -505,6 +651,8 @@ def init_backends():
     selected_host = str(CFG.get("u64_host") or "").strip()
     control_host = _saved_control_host_for_selected(selected_host)
     rest = UltimateREST(control_host, CFG.get("password", ""), coordinator=DEVICE_OP)
+    _health_record_client_replacement("startup")
+    _health_record_route(selected_host, control_host, "startup")
     control_link = _persisted_address(control_host).get("link_type", LINK_UNKNOWN)
     timeout_link = LINK_ETHERNET if control_host != selected_host else control_link
     _configure_rest_timeout(rest, timeout_link)
@@ -944,6 +1092,8 @@ def cache_image(name: str, data: bytes) -> dict:
     token = uuid.uuid4().hex[:12]
     if len(IMAGE_CACHE) >= IMAGE_CACHE_MAX:
         IMAGE_CACHE.popitem(last=False)
+        with _HEALTH_LOCK:
+            _HEALTH_CACHE_STATS["image_evictions"] += 1
     IMAGE_CACHE[token] = {"name": name, "data": data, "img": img, "ts": time.time()}
     out = img.listing()
     out.update({"token": token, "image_name": name, "size": len(data)})
@@ -952,6 +1102,8 @@ def cache_image(name: str, data: bytes) -> dict:
 
 def get_cached(token: str):
     entry = IMAGE_CACHE.get(token)
+    with _HEALTH_LOCK:
+        _HEALTH_CACHE_STATS["image_hits" if entry else "image_misses"] += 1
     if not entry:
         raise HTTPException(410, "image no longer cached — re-open it")
     IMAGE_CACHE.move_to_end(token)
@@ -1048,6 +1200,7 @@ async def _run_discovery(subnet: str = "", port: int = 80) -> dict:
     if not DISCOVERY_SCAN_LOCK.acquire(blocking=False):
         raise HTTPException(409, "A device discovery scan is already running")
     DISCOVERY_ACTIVE.set()
+    _health_set_activity("Finder", "scanning", subnet or "local subnets")
     try:
         extra = [subnet] if subnet else None
         old_host = str(CFG.get("u64_host") or "").strip()
@@ -1082,7 +1235,13 @@ async def _run_discovery(subnet: str = "", port: int = 80) -> dict:
                     CFG["u64_host"] = preferred
                     _diag_event("info", f"Preferred address updated: {old_host or '(none)'} → {preferred}")
         save_config()
+        _health_set_activity("Finder", "complete",
+                             f"{len(result.get('devices', []))} device(s)")
+        _health_finish_activity("ok")
         return result
+    except Exception as exc:
+        _health_finish_activity("error", str(exc))
+        raise
     finally:
         DISCOVERY_ACTIVE.clear()
         DISCOVERY_SCAN_LOCK.release()
@@ -1102,6 +1261,7 @@ async def api_discover(subnet: str = Query(""), port: int = Query(80)):
 def _disconnect_discovery_session() -> None:
     """Drop the active device clients without disturbing local receivers."""
     global rest, cmd, devfs
+    _drive_status_mark_not_ready()
     # Backend replacement is a device operation too. Without this lifecycle
     # gate, browser /api/info polling can enter the old client while Clear or
     # Connect closes it, producing httpx's "client has been closed" runtime
@@ -1128,6 +1288,8 @@ def _disconnect_discovery_session() -> None:
             except Exception:
                 pass
         rest = UltimateREST("", CFG.get("password", ""), coordinator=DEVICE_OP)
+        _health_record_client_replacement("disconnect")
+        _health_record_route("", "", "disconnect")
         cmd = CommandSocket("", coordinator=DEVICE_OP)
         devfs = DeviceFS("", CFG.get("ftp_user", "anonymous"),
                          CFG.get("ftp_password", ""), coordinator=DEVICE_OP)
@@ -1171,6 +1333,7 @@ def api_connect(payload: dict = Body(...)):
     """Switch device and report timing for each connection stage."""
     started = time.perf_counter()
     timing: dict[str, float | bool | str] = {}
+    _health_set_activity("Connect", "preparing")
 
     def mark(name: str, stage_started: float) -> float:
         now = time.perf_counter()
@@ -1184,15 +1347,18 @@ def api_connect(payload: dict = Body(...)):
             timing["error"] = str(error)[:500]
         rendered = ", ".join(f"{key}={value}" for key, value in timing.items())
         _diag_event("info" if success else "warning", f"Connect timing: {rendered}")
+        _health_finish_activity("ok" if success else "error", error)
 
     host = (payload.get("host") or "").strip()
     if not host:
         raise HTTPException(400, "host required")
     if INDEXJOB.get("running"):
         raise HTTPException(409, "stop the storage index before switching devices")
+    _drive_status_mark_not_ready()
     global rest, cmd, devfs
     password = payload.get("password", CFG.get("password", ""))
 
+    _health_set_activity("Connect", "route selection", host)
     stage = time.perf_counter()
     control_host = _verified_control_host_for_selected(host)
     if control_host == host:
@@ -1201,6 +1367,7 @@ def api_connect(payload: dict = Body(...)):
     timing["selected_host"] = host
     timing["control_host"] = control_host
 
+    _health_set_activity("Connect", "creating clients", control_host)
     stage = time.perf_counter()
     new_rest = new_cmd = new_devfs = None
     try:
@@ -1230,6 +1397,7 @@ def api_connect(payload: dict = Body(...)):
     mark("verified_result_lookup_ms", stage)
     timing["reused_discovery"] = reused_discovery
 
+    _health_set_activity("Connect", "verifying device", control_host)
     stage = time.perf_counter()
     if not device_info:
         try:
@@ -1272,6 +1440,7 @@ def api_connect(payload: dict = Body(...)):
                         "connect_timing": timing}
     mark("live_verification_ms", stage)
 
+    _health_set_activity("Connect", "switching backend", host)
     wait_started = time.perf_counter()
     with DEVICE_OP.operation("interactive", "switching Ultimate device"):
         acquired = time.perf_counter()
@@ -1306,6 +1475,8 @@ def api_connect(payload: dict = Body(...)):
             )
 
         rest, cmd, devfs = new_rest, new_cmd, new_devfs
+        _health_record_client_replacement("Finder/manual connect")
+        _health_record_route(host, control_host, "connect")
         if host_changed or old_control_host != control_host:
             _reset_readmem_support(control_host)
         capability_started = time.perf_counter()
@@ -1316,6 +1487,7 @@ def api_connect(payload: dict = Body(...)):
         CFG["u64_host"] = host
         CFG["rest_control_host"] = control_host
         CFG["password"] = password
+        _drive_status_mark_ready()
         link_status = _link_payload(host, info_payload=device_info, force=False,
                                     persist=True, client=new_rest)
         save_config()
@@ -1353,16 +1525,35 @@ def api_connect(payload: dict = Body(...)):
 # --- basic / machine ----------------------------------------------------
 
 def _clean_shutdown():
+    overall = time.perf_counter()
+    with _HEALTH_LOCK:
+        _HEALTH_SHUTDOWN["state"] = "cleaning"
+        _HEALTH_SHUTDOWN["cleanup_started_at"] = time.time()
+        _HEALTH_SHUTDOWN["phases"] = {}
+
+    def phase(name: str, started: float) -> None:
+        with _HEALTH_LOCK:
+            _HEALTH_SHUTDOWN["phases"][name] = round(
+                (time.perf_counter() - started) * 1000.0, 2
+            )
+
     try:
+        stage = time.perf_counter()
         _juke_cancel_timer()
         _matrix_release_all(silent=True, cached_only=True, caller="shutdown")
+        phase("sid_and_input_ms", stage)
+
         global _INDEX_STORE, _INDEX_STORE_PATH, _INDEX_THREAD
+        stage = time.perf_counter()
         if INDEXJOB.get("running"):
             INDEXJOB["stop"] = True
             DEVICE_OP.set_background_paused(False)
             DEVICE_OP.wake()
             if _INDEX_THREAD and _INDEX_THREAD.is_alive():
                 _INDEX_THREAD.join(timeout=2.0)
+        phase("index_stop_ms", stage)
+
+        stage = time.perf_counter()
         if _INDEX_STORE is not None:
             try:
                 _INDEX_STORE.close()
@@ -1370,22 +1561,38 @@ def _clean_shutdown():
                 pass
             _INDEX_STORE = None
             _INDEX_STORE_PATH = ""
+        phase("sqlite_close_ms", stage)
+
+        stage = time.perf_counter()
         for resource in (cmd, rest, video, audio):
             try:
                 if resource:
                     resource.close() if hasattr(resource, "close") else resource.stop()
             except Exception:
                 pass
+        phase("client_and_stream_stop_ms", stage)
+
+        stage = time.perf_counter()
         for receiver in (video, audio):
             try:
                 if receiver and receiver.is_alive():
                     receiver.join(timeout=1.5)
             except Exception:
                 pass
+        phase("receiver_join_ms", stage)
     finally:
+        stage = time.perf_counter()
         if _APP_EXIT_REQUESTED.is_set():
             _close_launched_edge_app()
             _APP_EXIT_CLEANUP_COMPLETE.set()
+        phase("edge_close_ms", stage)
+        with _HEALTH_LOCK:
+            _HEALTH_SHUTDOWN["state"] = "complete"
+            _HEALTH_SHUTDOWN["cleanup_completed_at"] = time.time()
+            _HEALTH_SHUTDOWN["total_ms"] = round(
+                (time.perf_counter() - overall) * 1000.0, 2
+            )
+
 
 
 @app.get("/api/app_config")
@@ -1409,6 +1616,9 @@ def app_exit(request: Request):
 
     first_request = not _APP_EXIT_REQUESTED.is_set()
     _APP_EXIT_REQUESTED.set()
+    with _HEALTH_LOCK:
+        _HEALTH_SHUTDOWN["state"] = "requested"
+        _HEALTH_SHUTDOWN["requested_at"] = time.time()
     if first_request:
         _APP_EXIT_CLEANUP_COMPLETE.clear()
         _diag_event("info", "Exit requested from the local u64deck UI")
@@ -1532,12 +1742,16 @@ def info():
             "u64deck_busy_label": getattr(snapshot, "active_reason", "") or "Ultimate operation in progress",
             "u64deck_retry_ms": 1000,
         }
+    rest_started = None
+    rest_latency_ms = None
     try:
         # Status polling sits behind user actions but ahead of background work.
         with DEVICE_OP.operation("status", "checking Ultimate status"):
             active_rest = rest
             active_host = str(CFG.get("u64_host", "") or "").strip()
+            rest_started = time.perf_counter()
             payload = active_rest.info()
+            rest_latency_ms = (time.perf_counter() - rest_started) * 1000.0
             if isinstance(payload, dict):
                 payload = dict(payload)
                 known_identity, _known_record = _known_identity_for_host(active_host)
@@ -1545,8 +1759,13 @@ def info():
                     active_host, info_payload=payload,
                     persist=not bool(known_identity), client=active_rest)
                 payload["u64deck_input"] = _cached_input_status(active_rest)
+        _health_record_info(payload, rest_latency_ms or 0.0)
+        _drive_status_mark_ready()
         return payload
     except (UltimateError, httpx.HTTPError, RuntimeError) as e:
+        elapsed = ((time.perf_counter() - rest_started) * 1000.0
+                   if rest_started is not None else 0.0)
+        _health_record_info_error(e, elapsed)
         err(e)
 
 
@@ -1728,16 +1947,73 @@ def mount_options_set(payload: dict = Body(...)):
     save_config()
     return mount_options()
 
-def _drive_status_unavailable_payload(exc: Exception) -> dict:
-    """Return a controlled transient response for a backend lifecycle handover."""
-    message = "Drive status temporarily unavailable while the device connection changes — retrying…"
-    _diag_event("warning", message, error=str(exc))
+def _drive_status_mark_not_ready() -> None:
+    """Reset drive readiness while the active device connection changes."""
+    global _DRIVE_STATUS_READY_AT, _DRIVE_STATUS_TRANSIENT_FAILURES
+    global _DRIVE_STATUS_LAST_FAILURE_AT
+    with _DRIVE_STATUS_LOCK:
+        _DRIVE_STATUS_READY_AT = 0.0
+        _DRIVE_STATUS_TRANSIENT_FAILURES = 0
+        _DRIVE_STATUS_LAST_FAILURE_AT = 0.0
+
+
+def _drive_status_mark_ready() -> None:
+    """Allow drive polling after the current Ultimate has answered."""
+    global _DRIVE_STATUS_READY_AT, _DRIVE_STATUS_TRANSIENT_FAILURES
+    global _DRIVE_STATUS_LAST_FAILURE_AT
+    with _DRIVE_STATUS_LOCK:
+        _DRIVE_STATUS_READY_AT = time.time()
+        _DRIVE_STATUS_TRANSIENT_FAILURES = 0
+        _DRIVE_STATUS_LAST_FAILURE_AT = 0.0
+
+
+def _drive_status_waiting_payload(
+        message: str = "Waiting for the Ultimate connection before reading drive status…",
+        retry_ms: int = 750, *, terminal: bool = False, attempt: int = 0) -> dict:
+    """Return a neutral drive-state response without a diagnostic error."""
     return {
         "u64deck_drives_unavailable": True,
+        "u64deck_drives_waiting": not terminal,
+        "u64deck_drives_error": bool(terminal),
         "u64deck_drives_message": message,
-        "u64deck_retry_ms": 1000,
+        "u64deck_retry_ms": 0 if terminal else max(250, int(retry_ms)),
+        "u64deck_drive_attempt": max(0, int(attempt)),
         "u64deck_mounts": _mount_state_snapshot(),
     }
+
+
+def _transient_drive_connection_error(exc: Exception) -> bool:
+    """Identify connection/lifecycle failures worth a bounded retry."""
+    text = str(exc).casefold()
+    markers = (
+        "refused", "forcibly closed", "connection reset", "connecterror",
+        "client has been closed", "client is closed", "rest client is closed",
+        "rest client is unavailable", "temporarily unavailable",
+        "server disconnected", "remote protocol error",
+    )
+    return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout,
+                            httpx.ReadError, httpx.RemoteProtocolError, RuntimeError)) or any(
+        marker in text for marker in markers)
+
+
+def _drive_status_unavailable_payload(exc: Exception) -> dict:
+    """Bound transient startup/handover failures before reporting a fault."""
+    global _DRIVE_STATUS_TRANSIENT_FAILURES, _DRIVE_STATUS_LAST_FAILURE_AT
+    now = time.time()
+    with _DRIVE_STATUS_LOCK:
+        if now - _DRIVE_STATUS_LAST_FAILURE_AT > DRIVE_STATUS_TRANSIENT_WINDOW_SECONDS:
+            _DRIVE_STATUS_TRANSIENT_FAILURES = 0
+        _DRIVE_STATUS_LAST_FAILURE_AT = now
+        _DRIVE_STATUS_TRANSIENT_FAILURES += 1
+        attempt = _DRIVE_STATUS_TRANSIENT_FAILURES
+    if attempt <= DRIVE_STATUS_MAX_TRANSIENT_RETRIES:
+        return _drive_status_waiting_payload(
+            "Drive status temporarily unavailable — retrying the current connection…",
+            1000, attempt=attempt)
+    message = ("Drive status is still unavailable after automatic retries: "
+               f"{str(exc)[:300]}")
+    _diag_event("error", message, attempts=attempt)
+    return _drive_status_waiting_payload(message, terminal=True, attempt=attempt)
 
 
 def _decorate_drive_status(out: object) -> object:
@@ -1779,6 +2055,11 @@ def drives():
             "u64deck_retry_ms": 1000,
         }
 
+    with _DRIVE_STATUS_LOCK:
+        ready_at = _DRIVE_STATUS_READY_AT
+    if not ready_at:
+        return _drive_status_waiting_payload()
+
     # Capture the active REST backend only after the status operation owns the
     # device coordinator. Connect/Clear use the same coordinator before they
     # replace and close a backend, so a cold-start drive poll can no longer
@@ -1791,6 +2072,7 @@ def drives():
                 if active_rest is None:
                     raise RuntimeError("Ultimate REST client is unavailable")
                 out = active_rest.get_json("/v1/drives")
+            _drive_status_mark_ready()
             return _decorate_drive_status(out)
         except RuntimeError as exc:
             replacement = rest
@@ -1801,10 +2083,12 @@ def drives():
                     error=str(exc),
                 )
                 continue
-            if "closed" in str(exc).casefold() or "unavailable" in str(exc).casefold():
+            if _transient_drive_connection_error(exc):
                 return _drive_status_unavailable_payload(exc)
             err(exc)
         except (UltimateError, httpx.HTTPError) as exc:
+            if _transient_drive_connection_error(exc):
+                return _drive_status_unavailable_payload(exc)
             err(exc)
 
 
@@ -2329,6 +2613,7 @@ def _mount_and_boot(drive: str, mode: str, *, device_path: str = None,
     buffer path; a readmem 404 retains the fixed-delay readiness behaviour.
     """
     drive, mode = _drive_key(drive), _mount_mode(mode)
+    _health_set_activity("Mount & Run", "preparing", name or device_path or drive)
     with DEVICE_OP.operation("interactive", "mounting and booting disk"):
         _juke_disarm_machine_takeover("Mount & Run")
         cached_input = _cached_input_status(rest)
@@ -2342,23 +2627,28 @@ def _mount_and_boot(drive: str, mode: str, *, device_path: str = None,
             note = "CIA1 matrix release failed — Mount & Run aborted"
             _warn_event("mount-input-release", f"Mount & Run: {note}")
             return {"errors": [], "typed": "", "note": note}
+        _health_set_activity("Mount & Run", "SID recovery")
         _sid_runner_reboot_before_mount_run()
+        _health_set_activity("Mount & Run", "mounting image")
         if device_path:
             rest.mount_path(drive, device_path, mode=mode)
         else:
             rest.mount_attachment(drive, name, data, mode=mode)
         _remember_mount(drive, mode, path=device_path or "", name=name or (device_path or "").rsplit("/", 1)[-1])
+        _health_set_activity("Mount & Run", "reset and boot settle")
         rest.put("/v1/machine:reset")
         _boot_settle()
         bus_id = _bus_id_for(drive)
         load_line = f'LOAD"*",{bus_id},1'
 
+        _health_set_activity("Mount & Run", "waiting for BASIC")
         boot_gate = _basic_ready_gate("boot")
         if boot_gate == "timeout":
             note = "machine not ready — LOAD not typed"
             _warn_event("mount-boot-gate", f"Mount & Run: {note}")
             return {"errors": [], "typed": "", "note": note}
 
+        _health_set_activity("Mount & Run", "typing LOAD")
         load_sent, load_delivery = _type_mount_run_load(
             (load_line + "\r").encode()
         )
@@ -2369,11 +2659,13 @@ def _mount_and_boot(drive: str, mode: str, *, device_path: str = None,
 
         if boot_gate == "unsupported":
             time.sleep(0.4)
+            _health_set_activity("Mount & Run", "typing RUN")
             delivered, delivery = _dispatch_run_after_gate()
             if delivered:
                 return {"errors": [], "typed": f"{load_line} + RUN"}
             return {"errors": [], "typed": load_line, "note": delivery}
 
+        _health_set_activity("Mount & Run", "waiting for LOAD")
         load_gate = _basic_ready_gate("load", grace=1.0)
         if load_gate == "ready":
             delivered, delivery = _dispatch_run_after_gate()
@@ -2400,9 +2692,15 @@ def mount_run_device(drive: str = Query("a"), mode: str = Query("readwrite"),
     try:
         drive, mode = _drive_key(drive), _mount_mode(mode)
         _swap_build_from_device(image, drive, mode)
-        return _swap_response(_mount_and_boot(drive, mode, device_path=image))
+        result = _swap_response(_mount_and_boot(drive, mode, device_path=image))
+        _health_finish_activity("ok")
+        return result
     except (UltimateError, httpx.HTTPError) as e:
+        _health_finish_activity("error", str(e))
         err(e)
+    finally:
+        if _HEALTH_ACTIVITY.get("name") == "Mount & Run":
+            _health_finish_activity("complete")
 
 
 @app.post("/api/mount/run/upload")
@@ -2411,10 +2709,16 @@ async def mount_run_upload(drive: str = Form("a"), mode: str = Form("readwrite")
     """One click: mount an uploaded disk image and boot it."""
     name, data = await _read_upload(file, MAX_MOUNT_UPLOAD)
     try:
-        return await run_in_threadpool(_mount_and_boot, drive, mode,
-                                       name=name, data=data)
+        result = await run_in_threadpool(_mount_and_boot, drive, mode,
+                                         name=name, data=data)
+        _health_finish_activity("ok")
+        return result
     except (UltimateError, httpx.HTTPError) as e:
+        _health_finish_activity("error", str(e))
         err(e)
+    finally:
+        if _HEALTH_ACTIVITY.get("name") == "Mount & Run":
+            _health_finish_activity("complete")
 
 
 # --- runners ------------------------------------------------------------
@@ -2748,6 +3052,7 @@ STREAM_LAST = {}    # per-stream record of the last start/stop attempt
 
 
 def _stream_ctl(name: str, on: bool):
+    previous_on = bool(STREAM_STATE.get(name))
     if on and _current_link_payload().get("link_type") == LINK_WIFI:
         raise UltimateError(
             "Streaming is not available over the Ultimate Wi-Fi interface; connect using Ethernet")
@@ -2792,6 +3097,8 @@ def _stream_ctl(name: str, on: bool):
             except Exception as rest_error:
                 rec["rest_error"] = str(rest_error)
                 rec["ok"] = False
+                _health_record_stream_event(name, rec["action"], ok=False, via=rec.get("via"),
+                                            destination=dest, error=str(rest_error))
                 raise
     else:
         try:
@@ -2813,8 +3120,14 @@ def _stream_ctl(name: str, on: bool):
             except Exception as e2:
                 rec["socket_error"] = str(e2)
                 rec["ok"] = False
+                _health_record_stream_event(name, rec["action"], ok=False, via=rec.get("via"),
+                                            destination=dest, error=str(e2))
                 raise
     STREAM_STATE[name] = on
+    _health_record_stream_event(
+        name, rec["action"], ok=True, via=rec.get("via"), destination=dest,
+        restart=bool(on and previous_on), transport=rec.get("transport"),
+    )
 
 
 @app.get("/api/stream/transport")
@@ -2890,6 +3203,10 @@ async def ws_video(ws: WebSocket, buffer: int = 1):
                want all 50 fps even through brief hiccups.
     """
     await ws.accept()
+    with _HEALTH_LOCK:
+        _HEALTH_WS_STATE["video"]["connections"] += 1
+        _HEALTH_WS_STATE["video"]["active"] += 1
+    _health_record_stream_event("video", "websocket-open", buffer=int(buffer or 1))
     loop = asyncio.get_running_loop()
     depth = max(1, min(int(buffer or 1), 128))
     queue: asyncio.Queue = asyncio.Queue(maxsize=depth)
@@ -2914,6 +3231,10 @@ async def ws_video(ws: WebSocket, buffer: int = 1):
         pass                                   # client gone or server stopping
     finally:
         video.unsubscribe(on_frame)
+        with _HEALTH_LOCK:
+            _HEALTH_WS_STATE["video"]["disconnects"] += 1
+            _HEALTH_WS_STATE["video"]["active"] = max(0, _HEALTH_WS_STATE["video"]["active"] - 1)
+        _health_record_stream_event("video", "websocket-close")
         # Keyboard capture is associated with the screen/video session.  Run
         # the safety release in a worker thread so an Ultimate REST timeout
         # cannot block the asyncio event loop and freeze the whole UI.
@@ -2925,6 +3246,10 @@ async def ws_video(ws: WebSocket, buffer: int = 1):
 @app.websocket("/ws/audio")
 async def ws_audio(ws: WebSocket):
     await ws.accept()
+    with _HEALTH_LOCK:
+        _HEALTH_WS_STATE["audio"]["connections"] += 1
+        _HEALTH_WS_STATE["audio"]["active"] += 1
+    _health_record_stream_event("audio", "websocket-open")
     loop = asyncio.get_running_loop()
     # Keep latency bounded: eight ~32 ms chunks is enough to absorb a brief
     # browser hiccup without allowing a full second of stale audio to queue.
@@ -2949,6 +3274,10 @@ async def ws_audio(ws: WebSocket):
         pass                                   # client gone or server stopping
     finally:
         audio.unsubscribe(on_chunk)
+        with _HEALTH_LOCK:
+            _HEALTH_WS_STATE["audio"]["disconnects"] += 1
+            _HEALTH_WS_STATE["audio"]["active"] = max(0, _HEALTH_WS_STATE["audio"]["active"] - 1)
+        _health_record_stream_event("audio", "websocket-close")
         # Audio has no keyboard ownership.  Releasing matrix input here caused
         # duplicate cleanup requests when video and audio sockets closed
         # together, so only the video session performs the safety release.
@@ -4619,8 +4948,15 @@ _SIDFLOW_STALE_WARNED: set[str] = set()
 def _sidflow_stale_artifacts(include_downloads: bool = True) -> list[Path]:
     paths: list[Path] = []
     if include_downloads:
+        paths.extend(ROOT.glob(".sidflow-source-*.sqlite.gz.download"))
+        paths.extend(ROOT.glob(".sidflow-source-*.sqlite.decompressed"))
+        paths.extend(ROOT.glob(".sidflow-manifest-*.json.download"))
+        paths.extend(ROOT.glob(".sidflow-SHA256SUMS-*.download"))
+        # Also clean fixed names left by RC24 and earlier interrupted imports.
         paths.extend([
             ROOT / ".sidflow-source.sqlite.download",
+            ROOT / ".sidflow-source.sqlite.gz.download",
+            ROOT / ".sidflow-source.sqlite.decompressed",
             ROOT / ".sidflow-manifest.json.download",
             ROOT / ".sidflow-SHA256SUMS.download",
         ])
@@ -4709,71 +5045,93 @@ def _sidflow_public_status() -> dict:
     else:
         elapsed = 0.0
     job["elapsed"] = round(elapsed, 1)
+    try:
+        free_bytes = int(shutil.disk_usage(ROOT).free)
+    except OSError:
+        free_bytes = 0
     status.update({"job": job, "schema_required": SIDFLOW_SCHEMA,
+                   "supported_release": SIDFLOW_RELEASE_TAG,
+                   "free_disk_bytes": free_bytes,
                    "attribution": "Powered by SIDFlow (Chris Gleissner)"})
     return status
 
 
 def _sidflow_asset_plan(client: httpx.Client) -> dict:
-    """Resolve the latest full export containing perceptual features."""
+    """Resolve the pinned SIDFlow 0.8.0 full compressed export."""
     assets = {}
-    tag = "latest"
     published = ""
     try:
         response = client.get(SIDFLOW_RELEASE_API)
         response.raise_for_status()
         release = response.json()
-        tag = str(release.get("tag_name") or "latest")
+        found_tag = str(release.get("tag_name") or "")
+        if found_tag != SIDFLOW_RELEASE_TAG:
+            raise ValueError(
+                f"SIDFlow release API returned {found_tag or 'unknown'}; expected {SIDFLOW_RELEASE_TAG}"
+            )
         published = str(release.get("published_at") or "")
         assets = {
-            str(item.get("name") or ""): str(item.get("browser_download_url") or "")
+            str(item.get("name") or ""): {
+                "url": str(item.get("browser_download_url") or ""),
+                "size": int(item.get("size") or 0),
+                "digest": str(item.get("digest") or ""),
+            }
             for item in release.get("assets", []) if item.get("name")
         }
     except Exception:
-        # Stable latest/download URLs are the documented fallback and also
-        # avoid making the feature depend on GitHub's unauthenticated API quota.
+        # The tag-specific download URLs are immutable for this supported data
+        # contract and avoid making the feature depend on GitHub API quota.
         assets = {}
 
-    # The current mobile profile omits features_json, which is required for
-    # musically useful recommendations. Prefer the full export until a future
-    # mobile manifest explicitly advertises the same perceptual feature payload.
-    candidates = [(SIDFLOW_FULL_SQLITE, SIDFLOW_FULL_MANIFEST, "full")]
-    for sqlite_name, manifest_name, profile in candidates:
-        if assets and sqlite_name not in assets:
-            continue
-        if assets and manifest_name not in assets:
-            continue
-        return {
-            "sqlite_name": sqlite_name,
-            "manifest_name": manifest_name,
-            "profile": profile,
-            "sqlite_url": assets.get(sqlite_name) or f"{SIDFLOW_DOWNLOAD_BASE}/{sqlite_name}",
-            "manifest_url": assets.get(manifest_name) or f"{SIDFLOW_DOWNLOAD_BASE}/{manifest_name}",
-            "checksums_url": assets.get(SIDFLOW_CHECKSUMS) or f"{SIDFLOW_DOWNLOAD_BASE}/{SIDFLOW_CHECKSUMS}",
-            "tag": tag, "published_at": published,
-        }
-    # No mobile/full pair was visible in the release listing. Fall back to the
-    # stable full names; schema validation still prevents an unsafe import.
+    def asset_url(name: str) -> str:
+        return str((assets.get(name) or {}).get("url") or f"{SIDFLOW_DOWNLOAD_BASE}/{name}")
+
     return {
         "sqlite_name": SIDFLOW_FULL_SQLITE,
+        "gzip_name": SIDFLOW_FULL_SQLITE_GZ,
         "manifest_name": SIDFLOW_FULL_MANIFEST,
         "profile": "full",
-        "sqlite_url": f"{SIDFLOW_DOWNLOAD_BASE}/{SIDFLOW_FULL_SQLITE}",
-        "manifest_url": f"{SIDFLOW_DOWNLOAD_BASE}/{SIDFLOW_FULL_MANIFEST}",
-        "checksums_url": f"{SIDFLOW_DOWNLOAD_BASE}/{SIDFLOW_CHECKSUMS}",
-        "tag": tag, "published_at": published,
+        "gzip_url": asset_url(SIDFLOW_FULL_SQLITE_GZ),
+        "manifest_url": asset_url(SIDFLOW_FULL_MANIFEST),
+        "checksums_url": asset_url(SIDFLOW_CHECKSUMS),
+        "tag": SIDFLOW_RELEASE_TAG,
+        "published_at": published,
+        "gzip_bytes": int((assets.get(SIDFLOW_FULL_SQLITE_GZ) or {}).get("size") or SIDFLOW_GZIP_BYTES),
+        "sqlite_bytes": SIDFLOW_SQLITE_BYTES,
+        "gzip_sha256": SIDFLOW_GZIP_SHA256,
+        "sqlite_sha256": SIDFLOW_SQLITE_SHA256,
     }
 
 
-def _sidflow_download_file(client: httpx.Client, url: str, target: Path) -> int:
+def _sidflow_required_free_bytes(plan: dict) -> int:
+    # Keep the compressed download, decompressed source and compact build side
+    # by side until the new database has passed validation and been promoted.
+    payload = (int(plan.get("gzip_bytes") or SIDFLOW_GZIP_BYTES)
+               + int(plan.get("sqlite_bytes") or SIDFLOW_SQLITE_BYTES)
+               + int(SIDFLOW_COMPACT_ESTIMATE_BYTES))
+    return payload + max(384 * 1024 * 1024, payload // 10)
+
+
+def _sidflow_check_disk_space(plan: dict) -> tuple[int, int]:
+    free = int(shutil.disk_usage(ROOT).free)
+    required = _sidflow_required_free_bytes(plan)
+    if free < required:
+        raise ValueError(
+            "Not enough free disk space for SIDFlow 0.8.0: "
+            f"{required / (1024**3):.1f} GiB required, {free / (1024**3):.1f} GiB available"
+        )
+    return free, required
+
+
+def _sidflow_download_file(client: httpx.Client, url: str, target: Path, *, expected_bytes: int = 0) -> int:
     """Stream one release asset to disk while updating UI progress."""
     target.parent.mkdir(parents=True, exist_ok=True)
     downloaded = 0
     with client.stream("GET", url) as response:
         response.raise_for_status()
-        total = int(response.headers.get("content-length") or 0)
+        total = int(response.headers.get("content-length") or expected_bytes or 0)
         _sidflow_job_update(stage="downloading", downloaded=0, total=total,
-                            message="Downloading SIDFlow similarity export…")
+                            message="Downloading compressed SIDFlow 0.8.0 export…")
         with target.open("wb") as fh:
             for chunk in response.iter_bytes(1024 * 1024):
                 if not chunk:
@@ -4781,13 +5139,19 @@ def _sidflow_download_file(client: httpx.Client, url: str, target: Path) -> int:
                 fh.write(chunk)
                 downloaded += len(chunk)
                 _sidflow_job_update(downloaded=downloaded, total=total)
+    if expected_bytes and downloaded != int(expected_bytes):
+        raise ValueError(
+            f"SIDFlow download size {downloaded:,} does not match expected {int(expected_bytes):,}"
+        )
     return downloaded
 
 
 def _sidflow_import_worker() -> None:
-    download = ROOT / ".sidflow-source.sqlite.download"
-    manifest_temp = ROOT / ".sidflow-manifest.json.download"
-    checksum_temp = ROOT / ".sidflow-SHA256SUMS.download"
+    token = uuid.uuid4().hex[:8]
+    download = ROOT / f".sidflow-source-{token}.sqlite.gz.download"
+    decompressed = ROOT / f".sidflow-source-{token}.sqlite.decompressed"
+    manifest_temp = ROOT / f".sidflow-manifest-{token}.json.download"
+    checksum_temp = ROOT / f".sidflow-SHA256SUMS-{token}.download"
     # Clean what we can, but never let a locked legacy build file poison this
     # import. slim_and_promote always chooses a fresh unique destination.
     _sidflow_cleanup_stale_artifacts()
@@ -4795,14 +5159,20 @@ def _sidflow_import_worker() -> None:
         headers = {"User-Agent": f"u64deck/{VERSION}", "Accept": "application/vnd.github+json"}
         with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(60.0, read=180.0),
                           headers=headers) as client:
-            _sidflow_job_update(stage="manifest", message="Checking the latest SIDFlow export…")
+            _sidflow_job_update(stage="manifest", message="Checking pinned SIDFlow 0.8.0 metadata…")
             plan = _sidflow_asset_plan(client)
+            free, required = _sidflow_check_disk_space(plan)
+            _sidflow_job_update(
+                required_disk=required, free_disk=free, release=plan["tag"],
+                message="SIDFlow 0.8.0 metadata verified; preparing download…",
+            )
             manifest_response = client.get(plan["manifest_url"])
             manifest_response.raise_for_status()
             manifest_bytes = manifest_response.content
-            manifest = validate_manifest(manifest_response.json())
+            manifest = validate_pinned_manifest(manifest_response.json())
             manifest.update({
-                "u64deck_source_asset": plan["sqlite_name"],
+                "u64deck_source_asset": plan["gzip_name"],
+                "u64deck_uncompressed_asset": plan["sqlite_name"],
                 "u64deck_manifest_asset": plan["manifest_name"],
                 "u64deck_release_tag": plan["tag"],
                 "u64deck_release_published_at": plan["published_at"],
@@ -4818,30 +5188,40 @@ def _sidflow_import_worker() -> None:
                 actual_manifest = hashlib.sha256(manifest_bytes).hexdigest()
                 if actual_manifest != expected_manifest:
                     raise ValueError("SIDFlow manifest checksum verification failed")
-            expected_sqlite = checksums.get(plan["sqlite_name"])
-            if not expected_sqlite:
-                expected_sqlite = str((manifest.get("file_checksums") or {}).get("sqlite_sha256") or "").lower()
-            if len(expected_sqlite) != 64:
-                raise ValueError(f"No SHA-256 checksum was published for {plan['sqlite_name']}")
-            _sidflow_job_update(asset=plan["sqlite_name"], release=plan["tag"])
-            _sidflow_download_file(client, plan["sqlite_url"], download)
+            published_gzip = checksums.get(plan["gzip_name"], "")
+            published_sqlite = checksums.get(plan["sqlite_name"], "")
+            if published_gzip != plan["gzip_sha256"]:
+                raise ValueError("SIDFlow compressed-export checksum does not match the pinned 0.8.0 digest")
+            manifest_sqlite = str((manifest.get("file_checksums") or {}).get("sqlite_sha256") or "").lower()
+            if published_sqlite != plan["sqlite_sha256"] or manifest_sqlite != plan["sqlite_sha256"]:
+                raise ValueError("SIDFlow SQLite checksum does not match the pinned 0.8.0 digest")
+            _sidflow_job_update(asset=plan["gzip_name"], release=plan["tag"])
+            _sidflow_download_file(
+                client, plan["gzip_url"], download, expected_bytes=plan["gzip_bytes"]
+            )
 
-        _sidflow_job_update(stage="verifying", message="Verifying SIDFlow download…")
-        if sha256_file(download) != expected_sqlite:
-            raise ValueError("SIDFlow SQLite checksum verification failed")
+        _sidflow_job_update(stage="verifying", message="Verifying compressed SIDFlow download…")
+        if sha256_file(download) != plan["gzip_sha256"]:
+            raise ValueError("SIDFlow compressed export checksum verification failed")
 
         def progress(stage: str, current: int, total: int) -> None:
             messages = {
-                "extracting": "Extracting SIDFlow perceptual features…",
-                "normalising": "Normalising compact SIDFlow vectors…",
-                "neighbors": "Importing SIDFlow neighbour rows…",
+                "decompressing": "Decompressing SIDFlow 0.8.0 SQLite export…",
+                "extracting": "Extracting compact u64deck fallback features…",
+                "normalising": "Normalising compact fallback vectors…",
+                "neighbors": "Importing SIDFlow weighted neighbour graph…",
             }
             _sidflow_job_update(stage=stage, processed=current, process_total=total,
                                 message=messages.get(stage, "Building compact SIDFlow database…"))
 
+        gunzip_file(download, decompressed, expected_bytes=plan["sqlite_bytes"], progress=progress)
+        _sidflow_job_update(stage="verifying_sqlite", message="Verifying decompressed SIDFlow SQLite export…")
+        if sha256_file(decompressed) != plan["sqlite_sha256"]:
+            raise ValueError("SIDFlow decompressed SQLite checksum verification failed")
+
         SIDFLOW_STORE.invalidate()
         result = slim_and_promote(
-            download, SIDFLOW_DB_PATH, manifest, progress,
+            decompressed, SIDFLOW_DB_PATH, manifest, progress,
             promotion_lock=SIDFLOW_STORE.file_lock,
         )
         SIDFLOW_STORE.invalidate()
@@ -4851,7 +5231,9 @@ def _sidflow_import_worker() -> None:
         _sidflow_job_update(running=False, stage="ready", downloaded=0, total=0,
                             processed=result["tracks"], process_total=result["tracks"],
                             completed=time.strftime("%Y-%m-%d %H:%M"), error="",
-                            message=f"SIDFlow ready — {result['tracks']:,} tracks{delete_note}")
+                            message=(f"SIDFlow {SIDFLOW_RELEASE_TAG} ready — "
+                                     f"{result['tracks']:,} tracks · {result['neighbors']:,} neighbour rows"
+                                     f"{delete_note}"))
     except Exception as exc:
         _diag_event("error", f"SIDFlow import failed: {exc}")
         _sidflow_job_update(running=False, stage="error", error=str(exc),
@@ -4875,7 +5257,7 @@ def sidflow_download():
             "running": True, "stage": "starting", "downloaded": 0, "total": 0,
             "processed": 0, "process_total": 0, "message": "Starting SIDFlow download…",
             "error": "", "started": time.monotonic(), "completed": "", "asset": "",
-            "release": "",
+            "release": "", "required_disk": 0, "free_disk": 0,
         })
     SIDFLOW_THREAD = threading.Thread(target=_sidflow_import_worker, daemon=True,
                                       name="sidflow-import")
@@ -5066,6 +5448,7 @@ def _juke_state():
                        "path": i.get("path", ""),
                        "song": int(i.get("song") or i["meta"].get("start_song", 1) or 1),
                        "similarity": i.get("similarity"),
+                       "recommendation_source": i.get("recommendation_source", ""),
                        "lazy": i.get("data") is None,
                        "length": _juke_length(i, int(i.get("song") or i["meta"].get("start_song", 1) or 1))}
                       for i in JUKE["items"]],
@@ -5075,7 +5458,9 @@ def _juke_state():
             "loading": bool(JUKE.get("loading")),
             "source": JUKE.get("source", ""),
             "sidflow": {"available": bool(sidflow.get("available")),
-                        "tracks": int(sidflow.get("tracks") or 0)},
+                        "tracks": int(sidflow.get("tracks") or 0),
+                        "release": sidflow.get("release_tag", ""),
+                        "needs_update": bool(sidflow.get("needs_update"))},
             "songlengths_loaded": len(SONGLENGTHS)}
 
 
@@ -5106,6 +5491,34 @@ def _juke_length(it, song: int):
     if times and 1 <= song <= len(times):
         return round(times[song - 1], 1)
     return None
+
+
+def _juke_end_grace_seconds() -> float:
+    """Return the bounded post-Songlengths Jukebox grace period."""
+    try:
+        value = float(CFG.get("sid_jukebox_end_grace_secs", 0.5))
+    except (TypeError, ValueError):
+        value = 0.5
+    return round(max(0.0, min(value, 30.0)), 1)
+
+
+def _juke_auto_advance_plan(it: dict, song: int) -> tuple[float, float, float, str]:
+    """Return base length, grace, timer delay and duration source.
+
+    Matched Songlengths entries use the configurable post-end grace. Unknown
+    tunes retain the established one-second fallback allowance so this release
+    does not alter sid_default_secs behaviour.
+    """
+    length = _juke_length(it, song)
+    if length is not None:
+        grace = _juke_end_grace_seconds()
+        source = "songlengths"
+    else:
+        length = float(CFG.get("sid_default_secs", 180) or 0)
+        grace = 1.0 if length > 0 else 0.0
+        source = "fallback"
+    delay = length + grace if length > 0 else 0.0
+    return round(length, 1), round(grace, 1), round(delay, 1), source
 
 
 def _sid_placeholder(name: str) -> dict:
@@ -5226,11 +5639,13 @@ def _sidflow_item_track_id(item: dict, song: int | None = None) -> str | None:
     return str(match.get("track_id")) if match else sidflow_track_id(rel, selected)
 
 
-def _sidflow_recommendations(path: str, song: int, limit: int = 20) -> tuple[list[dict], dict]:
+def _sidflow_recommendations(path: str, song: int, limit: int = 20, *, radio: bool = False) -> tuple[list[dict], dict]:
     status = SIDFLOW_STORE.status()
     if not status.get("available"):
         detail = status.get("error") or "SIDFlow similarity data is not installed"
         raise HTTPException(409, detail)
+    if status.get("needs_update"):
+        raise HTTPException(409, f"SIDFlow {SIDFLOW_RELEASE_TAG} data is required; update it in Settings")
     if status.get("quality_warning"):
         raise HTTPException(409, status["quality_warning"])
     seed, reason = _sidflow_track_context(path, song)
@@ -5245,9 +5660,22 @@ def _sidflow_recommendations(path: str, song: int, limit: int = 20) -> tuple[lis
         track = _sidflow_item_track_id(item)
         if track:
             excluded.add(track)
+    excluded_paths = set()
+    if radio:
+        for track_id in excluded:
+            text = str(track_id)
+            if "#" in text:
+                excluded_paths.add(text.rsplit("#", 1)[0])
+        for item in JUKE.get("items", []):
+            item_path = str(item.get("path") or "")
+            rel = normalise_hvsc_relative(item_path, _configured_hvsc_root())
+            if rel:
+                excluded_paths.add(rel)
     ranked = SIDFLOW_STORE.rank(
         seed["track_id"], limit=max(1, min(int(limit or 20), 100)),
         present_paths=set(present), exclude_track_ids=excluded,
+        exclude_sid_paths=excluded_paths,
+        same_file_policy="exclude" if radio else "prefer_other",
     )
     device_paths = [present[row["sid_path"].casefold()] for row in ranked
                     if row["sid_path"].casefold() in present]
@@ -5263,13 +5691,14 @@ def _sidflow_recommendations(path: str, song: int, limit: int = 20) -> tuple[lis
         item["song"] = int(row["song_index"])
         item["similarity"] = round(float(row["similarity"]), 4)
         item["sidflow_track_id"] = row["track_id"]
+        item["recommendation_source"] = row.get("recommendation_source", "unknown")
         items.append(item)
     return items, seed
 
 
 def _sidflow_append(path: str, song: int, limit: int = 20, *, radio: bool = False,
                     insert_after: int | None = None) -> dict:
-    items, seed = _sidflow_recommendations(path, song, limit)
+    items, seed = _sidflow_recommendations(path, song, limit, radio=radio)
     if not items:
         raise HTTPException(404, "SIDFlow found no unseen matching tunes present on this Ultimate")
 
@@ -5290,9 +5719,20 @@ def _sidflow_append(path: str, song: int, limit: int = 20, *, radio: bool = Fals
         JUKE["folder"] = "SIDFlow Radio" if radio else "SIDFlow recommendations"
     JUKE["source"] = "SIDFlow similarity"
     _juke_new_generation()
+    source_counts = {}
+    for item in items:
+        source = str(item.get("recommendation_source") or "unknown")
+        source_counts[source] = source_counts.get(source, 0) + 1
+    _diag_event(
+        "info",
+        "SIDFlow recommendations: "
+        f"seed={seed['track_id']} mode={'radio' if radio else 'more-like-this'} "
+        + " ".join(f"{name}={count}" for name, count in sorted(source_counts.items())),
+    )
     out = _juke_state()
     out.update({"added": len(items), "inserted_at": insert_at,
                 "seed_track_id": seed["track_id"],
+                "recommendation_sources": source_counts,
                 "powered_by": "SIDFlow (Chris Gleissner)"})
     return out
 
@@ -5336,7 +5776,11 @@ def _juke_materialise(it: dict) -> dict:
     to one bounded device fetch.
     """
     if it.get("data") is not None and not it.get("meta", {}).get("lazy"):
+        with _HEALTH_LOCK:
+            _HEALTH_CACHE_STATS["sid_materialise_hits"] += 1
         return it
+    with _HEALTH_LOCK:
+        _HEALTH_CACHE_STATS["sid_materialise_misses"] += 1
     path = it.get("path") or ""
     if not path:
         raise HTTPException(400, "this play-queue entry has no device path")
@@ -5403,11 +5847,15 @@ def _juke_play(index: int, song: int = 0, *, expected_generation: int | None = N
             _sidflow_radio_topup()
             _juke_cancel_timer()
             generation = _juke_new_generation()
-            length = _juke_length(it, song)
-            if length is None:
-                length = float(CFG.get("sid_default_secs", 180) or 0)
-            if length > 0:
-                t = _threading.Timer(length + 1.0, _juke_auto_next,
+            length, grace, auto_delay, duration_source = _juke_auto_advance_plan(it, song)
+            play_timing.update({
+                "duration_source": duration_source,
+                "song_length_secs": length,
+                "end_grace_secs": grace,
+                "auto_advance_secs": auto_delay,
+            })
+            if auto_delay > 0:
+                t = _threading.Timer(auto_delay, _juke_auto_next,
                                      args=(generation,))
                 t.daemon = True
                 JUKE["timer"] = t
@@ -5424,7 +5872,10 @@ def _juke_play(index: int, song: int = 0, *, expected_generation: int | None = N
             + ", ".join(
                 f"{key}={value}"
                 for key, value in play_timing.items()
-                if key.endswith("_ms")
+                if key.endswith("_ms") or key in {
+                    "duration_source", "song_length_secs",
+                    "end_grace_secs", "auto_advance_secs",
+                }
             ),
         )
         out = _juke_state()
@@ -6813,19 +7264,490 @@ def library_run(name: str = Query(...), drive: str = Query("a")):
 
 def _receiver_stats(receiver, kind: str) -> dict:
     if not receiver:
-        return {"kind": kind, "running": False, "packets": 0, "dropped": 0}
+        return {"kind": kind, "running": False, "packets": 0, "dropped": 0,
+                "frames": 0, "bytes": 0, "last_packet_at": 0.0,
+                "packet_age_seconds": None, "last_packet_bytes": 0,
+                "gap_events": 0, "longest_gap_packets": 0,
+                "last_inter_packet_ms": 0.0, "longest_inter_packet_ms": 0.0}
+    last_packet_at = float(getattr(receiver, "last_packet_at", 0) or 0)
     return {"kind": kind, "running": bool(getattr(receiver, "running", False)),
             "packets": int(getattr(receiver, "packets", 0)),
             "dropped": int(getattr(receiver, "dropped", 0)),
             "frames": int(getattr(receiver, "frame_no", 0)),
+            "bytes": int(getattr(receiver, "bytes_received", 0)),
             "started_at": float(getattr(receiver, "started_at", 0) or 0),
-            "last_packet_bytes": int(getattr(receiver, "last_pkt_len", 0) or 0)}
+            "last_packet_at": last_packet_at,
+            "packet_age_seconds": round(max(0.0, time.time() - last_packet_at), 3)
+                if last_packet_at else None,
+            "last_packet_bytes": int(getattr(receiver, "last_pkt_len", 0) or 0),
+            "gap_events": int(getattr(receiver, "gap_events", 0) or 0),
+            "longest_gap_packets": int(getattr(receiver, "longest_gap_packets", 0) or 0),
+            "last_inter_packet_ms": round(float(getattr(receiver, "last_inter_packet_ms", 0.0) or 0.0), 3),
+            "longest_inter_packet_ms": round(float(getattr(receiver, "longest_inter_packet_ms", 0.0) or 0.0), 3)}
 
 @app.get("/api/stream/stats")
 def stream_stats():
     return {"video": _receiver_stats(video, "video"),
             "audio": _receiver_stats(audio, "audio"),
             "state": dict(STREAM_STATE), "last": dict(STREAM_LAST)}
+
+
+def _health_record_info(payload: dict, latency_ms: float) -> None:
+    global _HEALTH_LAST_DEVICE, _HEALTH_LAST_DEVICE_AT, _HEALTH_LAST_INFO_ERROR
+    global _HEALTH_REST_SUCCESSES, _HEALTH_REST_CONSECUTIVE_FAILURES
+    with _HEALTH_LOCK:
+        _HEALTH_REST_LATENCIES.append(round(max(0.0, float(latency_ms)), 1))
+        _HEALTH_REST_SUCCESSES += 1
+        _HEALTH_REST_CONSECUTIVE_FAILURES = 0
+        if isinstance(payload, dict):
+            _HEALTH_LAST_DEVICE = {
+                key: payload.get(key) for key in (
+                    "product", "firmware_version", "fpga_version", "core_version",
+                    "hostname", "unique_id") if payload.get(key) not in (None, "")
+            }
+        _HEALTH_LAST_DEVICE_AT = time.time()
+        _HEALTH_LAST_INFO_ERROR = ""
+
+
+def _health_record_info_error(exc: Exception, latency_ms: float) -> None:
+    global _HEALTH_LAST_INFO_ERROR, _HEALTH_LAST_INFO_ERROR_AT
+    global _HEALTH_REST_FAILURES, _HEALTH_REST_CONSECUTIVE_FAILURES
+    with _HEALTH_LOCK:
+        _HEALTH_REST_FAILURES += 1
+        _HEALTH_REST_CONSECUTIVE_FAILURES += 1
+        _HEALTH_LAST_INFO_ERROR = str(exc)[:500]
+        _HEALTH_LAST_INFO_ERROR_AT = time.time()
+
+
+def _health_latency_snapshot() -> dict:
+    with _HEALTH_LOCK:
+        samples = list(_HEALTH_REST_LATENCIES)
+        last_device = dict(_HEALTH_LAST_DEVICE)
+        last_device_at = _HEALTH_LAST_DEVICE_AT
+        last_error = _HEALTH_LAST_INFO_ERROR
+        last_error_at = _HEALTH_LAST_INFO_ERROR_AT
+    with _HEALTH_LOCK:
+        successes = int(_HEALTH_REST_SUCCESSES)
+        failures = int(_HEALTH_REST_FAILURES)
+        consecutive = int(_HEALTH_REST_CONSECUTIVE_FAILURES)
+        replacements = int(_HEALTH_REST_CLIENT_REPLACEMENTS)
+    attempts = successes + failures
+    return {
+        "samples": len(samples),
+        "latest_ms": samples[-1] if samples else None,
+        "minimum_ms": round(min(samples), 1) if samples else None,
+        "average_ms": round(sum(samples) / len(samples), 1) if samples else None,
+        "maximum_ms": round(max(samples), 1) if samples else None,
+        "p95_ms": _health_percentile(samples, 0.95),
+        "successes": successes,
+        "failures": failures,
+        "attempts": attempts,
+        "success_rate_percent": round((successes / attempts) * 100.0, 2) if attempts else None,
+        "consecutive_failures": consecutive,
+        "client_replacements": replacements,
+        "device": last_device,
+        "last_success_at": last_device_at or None,
+        "last_success_age_seconds": round(max(0.0, time.time() - last_device_at), 1)
+            if last_device_at else None,
+        "last_error": last_error,
+        "last_error_at": last_error_at or None,
+        "last_error_age_seconds": round(max(0.0, time.time() - last_error_at), 1)
+            if last_error_at else None,
+    }
+
+
+def _health_stream_snapshot() -> dict:
+    now = time.time()
+    raw = {"video": _receiver_stats(video, "video"),
+           "audio": _receiver_stats(audio, "audio")}
+    with _HEALTH_LOCK:
+        for name, row in raw.items():
+            previous = _HEALTH_STREAM_SAMPLE.get(name)
+            rate = dict(_HEALTH_STREAM_RATES.get(name) or {})
+            if previous:
+                elapsed = max(0.001, now - previous["time"])
+                if elapsed >= 0.20:
+                    rate = {
+                        "bitrate_bps": round(max(0, row["bytes"] - previous["bytes"]) * 8 / elapsed),
+                        "packets_per_second": round(max(0, row["packets"] - previous["packets"]) / elapsed, 1),
+                        "frames_per_second": round(max(0, row["frames"] - previous["frames"]) / elapsed, 1),
+                    }
+                    _HEALTH_STREAM_RATES[name] = rate
+                if (int(row.get("gap_events") or 0) > int(previous.get("gap_events") or 0)
+                        or int(row.get("dropped") or 0) > int(previous.get("dropped") or 0)):
+                    _HEALTH_STREAM_GAP_AT[name] = now
+            _HEALTH_STREAM_SAMPLE[name] = {
+                "time": now, "bytes": row["bytes"], "packets": row["packets"],
+                "frames": row["frames"], "gap_events": row.get("gap_events", 0),
+                "dropped": row.get("dropped", 0),
+            }
+            age = float(row.get("packet_age_seconds") or 0.0)
+            if row.get("last_packet_at"):
+                _HEALTH_STREAM_PEAK_AGE[name] = max(float(_HEALTH_STREAM_PEAK_AGE.get(name, 0.0)), age)
+            row.update(rate)
+            row["commanded_on"] = bool(STREAM_STATE.get(name))
+            row["peak_packet_age_seconds"] = round(float(_HEALTH_STREAM_PEAK_AGE.get(name, 0.0)), 3)
+            gap_at = float(_HEALTH_STREAM_GAP_AT.get(name, 0.0) or 0.0)
+            row["last_gap_at"] = gap_at or None
+            row["recent_gap_age_seconds"] = round(max(0.0, now - gap_at), 2) if gap_at else None
+            ws = dict(_HEALTH_WS_STATE.get(name) or {})
+            row["websocket"] = ws
+            history = [event for event in _HEALTH_STREAM_HISTORY if event.get("stream") == name]
+            row["start_count"] = sum(1 for event in history if event.get("action") == "start" and event.get("ok"))
+            row["stop_count"] = sum(1 for event in history if event.get("action") == "stop" and event.get("ok"))
+            row["restart_count"] = sum(1 for event in history if event.get("restart"))
+        browser = dict(_HEALTH_BROWSER_TELEMETRY)
+        browser_at = float(_HEALTH_BROWSER_TELEMETRY_AT or 0.0)
+        history = [dict(row) for row in list(_HEALTH_STREAM_HISTORY)[-20:]]
+    return {
+        "video": raw["video"], "audio": raw["audio"],
+        "transport": CFG.get("stream_transport", "unicast"),
+        "local_ip": CFG.get("local_ip") or "(auto)",
+        "last_command": dict(STREAM_LAST),
+        "browser": browser,
+        "browser_sample_age_seconds": round(max(0.0, now - browser_at), 2) if browser_at else None,
+        "history": history,
+    }
+
+def _health_process_snapshot() -> dict:
+    process = _HEALTH_PROCESS
+    result = {
+        "uptime_seconds": round(max(0.0, time.time() - APP_STARTED_AT), 1),
+        "pid": os.getpid(), "cpu_count": psutil.cpu_count() or 0,
+    }
+    try:
+        if process is not None:
+            mem = process.memory_info()
+            io_counts = process.io_counters() if hasattr(process, "io_counters") else None
+            result.update({
+                "cpu_percent": round(process.cpu_percent(None), 1),
+                "memory_rss_bytes": int(mem.rss),
+                "memory_vms_bytes": int(mem.vms),
+                "threads": int(process.num_threads()),
+                "handles": int(process.num_handles()) if hasattr(process, "num_handles") else None,
+                "read_bytes": int(getattr(io_counts, "read_bytes", 0)) if io_counts else None,
+                "write_bytes": int(getattr(io_counts, "write_bytes", 0)) if io_counts else None,
+            })
+        vm = psutil.virtual_memory()
+        disk = psutil.disk_usage(str(ROOT))
+        result["host"] = {
+            "cpu_percent": round(psutil.cpu_percent(None), 1),
+            "memory_percent": round(vm.percent, 1),
+            "memory_available_bytes": int(vm.available),
+            "disk_free_bytes": int(disk.free),
+            "disk_percent": round(disk.percent, 1),
+        }
+    except Exception as exc:
+        result["error"] = str(exc)[:300]
+    return result
+
+
+def _health_coordinator_snapshot() -> dict:
+    snap = DEVICE_OP.snapshot()
+    return {
+        "active_priority": snap.active_priority, "active_reason": snap.active_reason,
+        "active_seconds": snap.active_seconds,
+        "waiting_interactive": snap.waiting_interactive,
+        "waiting_status": snap.waiting_status,
+        "waiting_background": snap.waiting_background,
+        "manual_paused": snap.manual_paused,
+        "manual_pause_reason": snap.manual_pause_reason,
+        "completed": snap.completed,
+        "total_wait_seconds": snap.total_wait_seconds,
+        "longest_wait_seconds": snap.longest_wait_seconds,
+        "average_wait_seconds": snap.average_wait_seconds,
+        "p95_wait_seconds": snap.p95_wait_seconds,
+        "completed_by_priority": {
+            "interactive": snap.completed_interactive,
+            "status": snap.completed_status,
+            "background": snap.completed_background,
+        },
+        "cancelled": snap.cancelled,
+        "recent_operations": DEVICE_OP.recent_operations(20),
+    }
+
+def _health_index_snapshot() -> dict:
+    global _HEALTH_INDEX_CACHE, _HEALTH_INDEX_CACHE_AT
+    now = time.time()
+    with _HEALTH_LOCK:
+        cached = dict(_HEALTH_INDEX_CACHE) if _HEALTH_INDEX_CACHE and now - _HEALTH_INDEX_CACHE_AT < 15.0 else None
+    if cached is None:
+        try:
+            stats = cache_stats()
+            db = dict(stats.get("database") or {})
+            cached = {key: db.get(key) for key in (
+                "path", "disk_bytes", "directories", "file_entries", "images",
+                "image_entries", "parse_failures", "sid_metadata")}
+        except Exception as exc:
+            cached = {"error": str(exc)[:300]}
+        with _HEALTH_LOCK:
+            _HEALTH_INDEX_CACHE = dict(cached)
+            _HEALTH_INDEX_CACHE_AT = now
+    _index_update_progress()
+    with _INDEX_JOB_LOCK:
+        job = {key: value for key, value in INDEXJOB.items() if key != "stop"}
+    with _SID_INDEX_LOCK:
+        sid_job = {key: value for key, value in SID_INDEX_JOB.items() if key != "stop"}
+    result = dict(cached)
+    result["job"] = job
+    result["sid_job"] = sid_job
+    sidflow = _sidflow_public_status()
+    result["sidflow"] = {
+        "available": bool(sidflow.get("available")),
+        "needs_update": bool(sidflow.get("needs_update")),
+        "release": sidflow.get("release_tag", ""),
+        "supported_release": sidflow.get("supported_release", SIDFLOW_RELEASE_TAG),
+        "hvsc_version": sidflow.get("hvsc_version", ""),
+        "similarity_metric": sidflow.get("similarity_metric", ""),
+        "feature_schema_version": sidflow.get("feature_schema_version", ""),
+        "vector_dimensions": int(sidflow.get("vector_dimensions") or 0),
+        "tracks": int(sidflow.get("tracks") or 0),
+        "neighbors": int(sidflow.get("neighbors") or 0),
+        "recommendation_engine": sidflow.get("recommendation_engine", ""),
+        "job": sidflow.get("job", {}),
+    }
+    return result
+
+
+def _health_cache_snapshot() -> dict:
+    now = time.time()
+    with _HEALTH_LOCK:
+        counters = dict(_HEALTH_CACHE_STATS)
+    entries = []
+    total_bytes = 0
+    for token, row in list(IMAGE_CACHE.items()):
+        size = len(row.get("data") or b"")
+        total_bytes += size
+        entries.append({
+            "token": token, "name": str(row.get("name") or ""), "bytes": size,
+            "age_seconds": round(max(0.0, now - float(row.get("ts") or now)), 1),
+        })
+    image_attempts = counters["image_hits"] + counters["image_misses"]
+    sid_attempts = counters["sid_materialise_hits"] + counters["sid_materialise_misses"]
+    return {
+        **counters,
+        "image_entries": len(entries),
+        "image_capacity": IMAGE_CACHE_MAX,
+        "image_bytes": total_bytes,
+        "image_hit_rate_percent": round(counters["image_hits"] / image_attempts * 100.0, 1) if image_attempts else None,
+        "sid_hit_rate_percent": round(counters["sid_materialise_hits"] / sid_attempts * 100.0, 1) if sid_attempts else None,
+        "oldest_image_age_seconds": max((row["age_seconds"] for row in entries), default=None),
+        "newest_image_age_seconds": min((row["age_seconds"] for row in entries), default=None),
+        "entries": entries,
+    }
+
+def _health_event_epoch(row: dict) -> float:
+    value = row.get("time") if isinstance(row, dict) else None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return datetime.fromisoformat(str(value)).timestamp()
+    except (TypeError, ValueError, OSError):
+        return 0.0
+
+
+def _health_event_snapshot() -> dict:
+    now = time.time()
+    events = list(DIAG_EVENTS)
+    noteworthy = []
+    for row in events:
+        level = str(row.get("level") or "").lower()
+        if level not in {"warning", "error"}:
+            continue
+        item = dict(row)
+        epoch = _health_event_epoch(row)
+        item["time_epoch"] = epoch or None
+        item["age_seconds"] = round(max(0.0, now - epoch), 1) if epoch else None
+        # A later successful Ultimate status sample is a practical recovery
+        # marker for transient startup/network errors. Explicit subsystem state
+        # (config-save result, stream freshness, queue ownership) remains the
+        # authority for faults that are not REST-related.
+        item["recovered"] = bool(epoch and _HEALTH_LAST_DEVICE_AT and epoch <= _HEALTH_LAST_DEVICE_AT)
+        noteworthy.append(item)
+    errors = [row for row in noteworthy if row.get("level") == "error"]
+    warnings = [row for row in noteworthy if row.get("level") == "warning"]
+    active_window = 300.0
+    active_errors = [row for row in errors if not row.get("recovered") and (row.get("age_seconds") or 0) <= active_window]
+    active_warnings = [row for row in warnings if not row.get("recovered") and (row.get("age_seconds") or 0) <= active_window]
+    return {
+        "retained": len(events),
+        "warnings": len(warnings),
+        "errors": len(errors),
+        "active_warnings": len(active_warnings),
+        "active_errors": len(active_errors),
+        "last": events[-1] if events else None,
+        "last_warning": warnings[-1] if warnings else None,
+        "last_error": errors[-1] if errors else None,
+        "last_error_age_seconds": errors[-1].get("age_seconds") if errors else None,
+        "events": noteworthy[-20:],
+        "active_window_seconds": active_window,
+    }
+
+
+def _health_link_snapshot() -> dict:
+    selected_host = str(CFG.get("u64_host") or "").strip()
+    if not selected_host:
+        return {"ip": "", "link_type": "unknown", "label": "Not configured",
+                "control_ip": "", "rest_route_label": "",
+                "streaming_available": False}
+    row = _persisted_address(selected_host)
+    link_type = str(row.get("link_type") or LINK_UNKNOWN)
+    return {
+        "ip": selected_host, "link_type": link_type,
+        "label": "Ethernet" if link_type == LINK_ETHERNET else
+                 "Wi-Fi" if link_type == LINK_WIFI else "Unknown",
+        "streaming_available": link_type != LINK_WIFI,
+        **_control_route_payload(selected_host, rest),
+    }
+
+
+def _health_activity_snapshot() -> dict:
+    now = time.time()
+    with _HEALTH_LOCK:
+        current = dict(_HEALTH_ACTIVITY)
+        history = [dict(row) for row in list(_HEALTH_ACTIVITY_HISTORY)[-20:]]
+    if current.get("name") and current.get("started_at"):
+        current["elapsed_seconds"] = round(max(0.0, now - float(current["started_at"])), 2)
+    if INDEXJOB.get("running"):
+        current = {
+            "name": "Storage index",
+            "phase": "paused" if INDEXJOB.get("paused") else "scanning",
+            "detail": INDEXJOB.get("current") or INDEXJOB.get("root") or "",
+            "started_at": INDEXJOB.get("started") or now,
+            "elapsed_seconds": INDEXJOB.get("elapsed") or 0.0,
+        }
+    elif SID_INDEX_JOB.get("running"):
+        current = {
+            "name": "SID metadata index",
+            "phase": "paused" if SID_INDEX_JOB.get("paused") else "scanning",
+            "detail": SID_INDEX_JOB.get("current") or SID_INDEX_JOB.get("root") or "",
+            "started_at": SID_INDEX_JOB.get("started") or now,
+            "elapsed_seconds": SID_INDEX_JOB.get("elapsed") or 0.0,
+        }
+    return {"current": current, "history": history}
+
+
+def _health_persistence_snapshot() -> dict:
+    with _HEALTH_LOCK:
+        config_history = [dict(row) for row in list(_HEALTH_CONFIG_HISTORY)[-20:]]
+        route_history = [dict(row) for row in list(_HEALTH_ROUTE_HISTORY)[-20:]]
+        saves = dict(_HEALTH_CONFIG_SAVES)
+        shutdown = copy.deepcopy(_HEALTH_SHUTDOWN)
+    latest = config_history[-1] if config_history else None
+    return {
+        "config": {**saves, "last": latest, "history": config_history},
+        "routes": route_history,
+        "shutdown": shutdown,
+    }
+
+
+def _health_summary(ultimate: dict, streams: dict, coordinator: dict,
+                    diagnostics: dict, persistence: dict) -> dict:
+    reasons = []
+    severity = "healthy"
+    configured = bool(ultimate.get("configured"))
+    age = ultimate.get("last_success_age_seconds")
+    if not configured:
+        severity = "attention"
+        reasons.append("Ultimate not configured")
+    elif age is None or age > 65:
+        severity = "attention"
+        reasons.append("Ultimate status is stale")
+    elif int(ultimate.get("consecutive_failures") or 0) > 0:
+        severity = "degraded"
+        reasons.append(f"{ultimate.get('consecutive_failures')} consecutive REST failure(s)")
+    for name in ("video", "audio"):
+        row = streams.get(name) or {}
+        if row.get("commanded_on") and (row.get("packet_age_seconds") is None or row.get("packet_age_seconds") > 2.0):
+            severity = "attention"
+            reasons.append(f"{name.title()} stream is stale")
+        elif row.get("recent_gap_age_seconds") is not None and float(row["recent_gap_age_seconds"]) <= 60.0:
+            if severity == "healthy":
+                severity = "degraded"
+            reasons.append(f"Recent {name} packet gap")
+    if float(coordinator.get("active_seconds") or 0.0) > 15.0:
+        if severity == "healthy": severity = "degraded"
+        reasons.append("Device operation has been active for over 15 s")
+    config = (persistence.get("config") or {}) if isinstance(persistence, dict) else {}
+    last_config = config.get("last") or {}
+    if last_config and last_config.get("success") is False:
+        if severity == "healthy": severity = "degraded"
+        reasons.append("Latest configuration save failed")
+    active_errors = int(diagnostics.get("active_errors") or 0)
+    active_warnings = int(diagnostics.get("active_warnings") or 0)
+    if active_errors:
+        if severity == "healthy": severity = "degraded"
+        reasons.append(f"{active_errors} recent unresolved diagnostic error(s)")
+    elif active_warnings:
+        if severity == "healthy": severity = "degraded"
+        reasons.append(f"{active_warnings} recent unresolved warning(s)")
+    if not reasons:
+        reasons = ["REST responsive", "streams stable", "queue healthy", "no active faults"]
+    labels = {"healthy": "HEALTHY", "degraded": "DEGRADED", "attention": "ATTENTION"}
+    return {"state": severity, "label": labels[severity], "reasons": reasons}
+
+
+def health_snapshot() -> dict:
+    latency = _health_latency_snapshot()
+    link = _health_link_snapshot()
+    streams = _health_stream_snapshot()
+    coordinator = _health_coordinator_snapshot()
+    diagnostics = _health_event_snapshot()
+    persistence = _health_persistence_snapshot()
+    ultimate = {
+        "configured": bool(CFG.get("u64_host")),
+        "selected_ip": CFG.get("u64_host", ""),
+        "control_ip": getattr(rest, "host", "") if rest else "",
+        "link": link,
+        **latency,
+    }
+    return {
+        "generated_at": time.time(),
+        "poll_hint_ms": 2000,
+        "summary": _health_summary(ultimate, streams, coordinator, diagnostics, persistence),
+        "activity": _health_activity_snapshot(),
+        "ultimate": ultimate,
+        "streams": streams,
+        "u64deck": {
+            "version": VERSION, "release_label": RELEASE_LABEL,
+            "build": BUILD, "frozen": FROZEN,
+            "process": _health_process_snapshot(),
+        },
+        "coordinator": coordinator,
+        "index": _health_index_snapshot(),
+        "cache": _health_cache_snapshot(),
+        "diagnostics": diagnostics,
+        "persistence": persistence,
+        "limitations": {
+            "ultimate_cpu_available": False,
+            "fpga_utilisation_available": False,
+            "temperature_available": False,
+            "detail": "The current Ultimate REST API does not expose CPU, FPGA utilisation or temperature telemetry.",
+        },
+    }
+
+
+@app.post("/api/health/browser")
+def health_browser_report(request: Request, payload: dict = Body(...)):
+    global _HEALTH_BROWSER_TELEMETRY, _HEALTH_BROWSER_TELEMETRY_AT
+    allowed = {
+        "video_render_fps", "video_frames_total", "video_ws_connects",
+        "video_ws_disconnects", "audio_ws_connects", "audio_ws_disconnects",
+        "audio_reconnects", "audio_underruns", "audio_dropped_ahead",
+        "audio_queue_ms", "audio_context_state", "page_visible",
+    }
+    clean = {key: payload.get(key) for key in allowed if key in payload}
+    clean["client"] = request.client.host if request.client else ""
+    with _HEALTH_LOCK:
+        _HEALTH_BROWSER_TELEMETRY = clean
+        _HEALTH_BROWSER_TELEMETRY_AT = time.time()
+    return {"ok": True}
+
+
+@app.get("/api/health")
+def health_get():
+    # Local process/stream/index counters only. No Ultimate request is made.
+    return health_snapshot()
 
 def _diagnostic_clean(value, key: str = ""):
     low = key.lower()
@@ -6870,6 +7792,7 @@ def diagnostics_export(payload: dict = Body(default={})):
         "device": device,
         "input": _input_status(),
         "stream": stream_stats(),
+        "health": health_snapshot(),
         "index": fs_index_status(),
         "sid_index": juke_index_status(),
         "sidflow": _sidflow_public_status(),

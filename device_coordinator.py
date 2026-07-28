@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Iterator
@@ -29,6 +30,14 @@ class CoordinatorSnapshot:
     manual_pause_reason: str
     completed: int
     total_wait_seconds: float
+    active_seconds: float
+    longest_wait_seconds: float
+    average_wait_seconds: float
+    p95_wait_seconds: float
+    completed_interactive: int
+    completed_status: int
+    completed_background: int
+    cancelled: int
 
 
 class DeviceOperationCoordinator:
@@ -48,11 +57,16 @@ class DeviceOperationCoordinator:
         self._active_priority: str | None = None
         self._active_reason = ""
         self._active_owner: int | None = None
+        self._active_started = 0.0
         self._manual_paused = False
         self._manual_pause_reason = "paused by user"
         self._local = threading.local()
         self._completed = 0
         self._total_wait = 0.0
+        self._wait_samples = deque(maxlen=240)
+        self._completed_by_priority = {name: 0 for name in self.PRIORITIES}
+        self._cancelled = 0
+        self._history = deque(maxlen=40)
 
     def _priority_number(self, priority: str) -> int:
         try:
@@ -82,6 +96,28 @@ class DeviceOperationCoordinator:
                 return f"waiting for {priority} operation"
         return "waiting for device"
 
+    @staticmethod
+    def _percentile(samples: list[float], percentile: float) -> float:
+        if not samples:
+            return 0.0
+        ordered = sorted(float(value) for value in samples)
+        rank = max(0, min(len(ordered) - 1, int((len(ordered) - 1) * percentile + 0.999999)))
+        return ordered[rank]
+
+    def _record_history(self, *, priority: str, reason: str, wait_seconds: float,
+                        duration_seconds: float, outcome: str, error: str = "",
+                        started_at: float | None = None) -> None:
+        self._history.append({
+            "started_at": float(started_at or time.time()),
+            "finished_at": time.time(),
+            "priority": priority,
+            "reason": reason,
+            "wait_seconds": round(max(0.0, wait_seconds), 4),
+            "duration_seconds": round(max(0.0, duration_seconds), 4),
+            "outcome": outcome,
+            "error": str(error)[:300],
+        })
+
     @contextmanager
     def operation(
         self,
@@ -108,32 +144,58 @@ class DeviceOperationCoordinator:
 
         number = self._priority_number(priority)
         start_wait = time.monotonic()
-        with self._cond:
-            self._waiting[number] += 1
-            try:
-                while not self._can_start(number):
+        started_wall = time.time()
+        acquired_at = 0.0
+        wait_seconds = 0.0
+        try:
+            with self._cond:
+                self._waiting[number] += 1
+                try:
+                    while not self._can_start(number):
+                        if cancel_check and cancel_check():
+                            raise OperationCancelled("device operation cancelled")
+                        if wait_callback:
+                            wait_callback(self._blocked_reason(number))
+                        self._cond.wait(timeout=0.10)
                     if cancel_check and cancel_check():
                         raise OperationCancelled("device operation cancelled")
-                    if wait_callback:
-                        wait_callback(self._blocked_reason(number))
-                    self._cond.wait(timeout=0.10)
-                if cancel_check and cancel_check():
-                    raise OperationCancelled("device operation cancelled")
-                self._active = True
-                self._active_priority = priority
-                self._active_reason = reason
-                self._active_owner = threading.get_ident()
-                self._local.depth = 1
-                self._local.priority = priority
-                self._total_wait += max(0.0, time.monotonic() - start_wait)
-            finally:
-                self._waiting[number] -= 1
-            if wait_callback:
-                wait_callback("")
+                    acquired_at = time.monotonic()
+                    wait_seconds = max(0.0, acquired_at - start_wait)
+                    self._active = True
+                    self._active_priority = priority
+                    self._active_reason = reason
+                    self._active_owner = threading.get_ident()
+                    self._active_started = acquired_at
+                    self._local.depth = 1
+                    self._local.priority = priority
+                    self._total_wait += wait_seconds
+                    self._wait_samples.append(wait_seconds)
+                finally:
+                    self._waiting[number] -= 1
+                if wait_callback:
+                    wait_callback("")
+        except OperationCancelled as exc:
+            with self._cond:
+                self._cancelled += 1
+                self._record_history(
+                    priority=priority, reason=reason,
+                    wait_seconds=max(0.0, time.monotonic() - start_wait),
+                    duration_seconds=0.0, outcome="cancelled", error=str(exc),
+                    started_at=started_wall,
+                )
+            raise
 
+        outcome = "ok"
+        error = ""
         try:
             yield
+        except BaseException as exc:
+            outcome = "error"
+            error = str(exc)
+            raise
         finally:
+            finished = time.monotonic()
+            duration = max(0.0, finished - acquired_at) if acquired_at else 0.0
             with self._cond:
                 self._local.depth = 0
                 self._local.priority = None
@@ -141,7 +203,14 @@ class DeviceOperationCoordinator:
                 self._active_priority = None
                 self._active_reason = ""
                 self._active_owner = None
+                self._active_started = 0.0
                 self._completed += 1
+                self._completed_by_priority[priority] += 1
+                self._record_history(
+                    priority=priority, reason=reason, wait_seconds=wait_seconds,
+                    duration_seconds=duration, outcome=outcome, error=error,
+                    started_at=started_wall,
+                )
                 self._cond.notify_all()
 
     def set_background_paused(self, paused: bool, reason: str = "paused by user") -> None:
@@ -162,6 +231,8 @@ class DeviceOperationCoordinator:
 
     def snapshot(self) -> CoordinatorSnapshot:
         with self._cond:
+            samples = list(self._wait_samples)
+            average = (sum(samples) / len(samples)) if samples else 0.0
             return CoordinatorSnapshot(
                 active_priority=self._active_priority,
                 active_reason=self._active_reason,
@@ -172,4 +243,18 @@ class DeviceOperationCoordinator:
                 manual_pause_reason=self._manual_pause_reason,
                 completed=self._completed,
                 total_wait_seconds=round(self._total_wait, 3),
+                active_seconds=round(max(0.0, time.monotonic() - self._active_started), 3)
+                if self._active and self._active_started else 0.0,
+                longest_wait_seconds=round(max(samples), 3) if samples else 0.0,
+                average_wait_seconds=round(average, 3),
+                p95_wait_seconds=round(self._percentile(samples, 0.95), 3),
+                completed_interactive=self._completed_by_priority["interactive"],
+                completed_status=self._completed_by_priority["status"],
+                completed_background=self._completed_by_priority["background"],
+                cancelled=self._cancelled,
             )
+
+    def recent_operations(self, limit: int = 20) -> list[dict]:
+        with self._cond:
+            rows = list(self._history)[-max(0, int(limit)):]
+            return [dict(row) for row in rows]

@@ -1,5 +1,91 @@
 # Changelog
 
+## 1.9.0 — Release Candidate 25
+
+**Public build:** `bd0bbaf`
+
+- Pins u64deck to the SIDFlow 0.8.0 data contract for HVSC 85 instead of following a mutable latest release. The installer now selects the tag-specific compressed full export and verifies the published manifest plus hard-pinned SHA-256 digests for both the 194 MB gzip asset and its byte-identical 982 MB SQLite payload.
+- Adds streamed gzip decompression, explicit download/decompression/import progress and a preflight free-space check. The updater allows approximately 1.8 GiB for the compressed source, decompressed source and compact build to coexist, while preserving the previous working similarity database unless validation and promotion complete successfully.
+- Validates the 58-dimensional weighted-cosine contract, published vector weights, HVSC 85 identity and populated neighbour graph before import. Settings, Health and Diagnostics now surface the SIDFlow release, HVSC version, feature schema, metric, dimensions, track count, neighbour count and recommendation engine.
+- Uses SIDFlow's 2,196,700 precomputed weighted neighbour rows as the primary engine. **More like this** prefers different SID files before sibling subtunes; **Radio** excludes the current, recently played and already queued SID files to reduce repetitive multi-subtune runs.
+- Keeps the existing local 48-dimensional scan only as a clearly labelled fallback when the fixed-depth SIDFlow graph is exhausted after local-library and session filtering. Diagnostics records `sidflow-neighbors` and `u64deck-fallback` counts for each recommendation batch.
+- Marks older installed SIDFlow data as **Update required** and blocks recommendation use until 0.8.0 is installed. If the network is unavailable, the failed update leaves the older database untouched but still gated; ordinary SID browsing and playback continue while More like this and Radio remain unavailable.
+- Hardware validation completed the real 194 MB download/import in about 48 seconds, produced a 269,389,824-byte (about 257 MiB) compact database, and confirmed two More like this batches used `sidflow-neighbors=20` with no fallback results.
+- Credits Christian Gleissner and links the SIDFlow repository, 0.8.0 data release and u64deck migration guide in README and Help. No Finder, routing, streaming, Mount & Run, drive-status, Jukebox timing, playlist or machine-control behaviour changed from RC24.
+
+## 1.9.0 — Release Candidate 24
+
+- Changes the local-evaluation default for `sid_jukebox_end_grace_secs` from 3.0 to 0.5 seconds after hardware listening tests found the shorter allowance produced more natural transitions across several HVSC tunes. The value remains configurable and the Ultimate still receives the original documented Songlengths duration.
+- Keeps the Play Queue panel and saved-play-queue controls visible when the active queue is empty, so an existing saved queue can be selected and loaded before playback. This covers fresh/direct Jukebox entry, the post-Clear Queue state, and the shared empty state used before Search, folder-browser, local-upload, Storage, Favourites or Recent Items entry has populated the queue.
+- Adds a clear **No tunes queued** empty state. **Save** and **Clear Queue** are disabled until the active queue contains a tune, while **Delete** is enabled only when a saved queue is selected.
+- No Finder, routing, streaming, Mount & Run, drive-status, Health, native SID duration or other device-control behaviour changed from RC23. This remains a local evaluation build while additional Ultimate hardware feedback is collected.
+
+## 1.9.0 — Release Candidate 23
+
+- Adds a configurable post-Songlengths Jukebox end grace so the next track does not replace a SID during its final audible tail or fade. The local-evaluation default is 3 seconds, replacing the previous fixed one-second allowance for matched Songlengths entries.
+- Keeps the original HVSC duration in the generated `.ssl` attachment and native Ultimate display; only u64deck's own auto-advance deadline is delayed.
+- Preserves the established one-second allowance for unknown-length tunes using `sid_default_secs`, avoiding an unrelated fallback-timing change.
+- Records duration source, base song length, end grace and final auto-advance deadline in the existing SID Jukebox Play timing diagnostic.
+- No Finder, routing, streaming, Mount & Run, drive-status, Health or device-control behaviour changed from RC22. This remains a local evaluation build.
+
+## 1.9.0 — Release Candidate 22
+
+- Orders cold-start status so the UI waits for a successful Ultimate information response before requesting mounted-drive state. Drive A/B now populate automatically without opening Storage.
+- Shows a neutral **Waiting for the Ultimate connection…** state during startup and device handover instead of surfacing a refused connection as a drive fault.
+- Retries transient drive-status connection/lifecycle failures a bounded three times without adding Diagnostics errors; a persistent fourth failure becomes a genuine visible error and Health degradation.
+- Resets the transient failure streak after a successful drive response and preserves manual Storage refresh as a recovery path.
+- No Finder, routing, mounting, streaming, SID, Health telemetry cadence or other device behaviour changed from RC21. This remains a local evaluation build.
+
+## 1.9.0 — Release Candidate 21
+
+- Makes System Health status current-state driven: recovered diagnostic errors and old packet gaps remain visible but no longer keep the dashboard degraded.
+- Adds an inspectable Recent warnings and errors history with active/recovered state and event age.
+- Removes the redundant manual Health refresh button; the visible timestamp now states the automatic two-second cadence.
+- Consolidates stream state into one card badge, removes duplicated idle badges and makes history status indicators compact and centred.
+
+## 1.9.0 — Release Candidate 20
+
+- Expanded the local **System Health** dashboard with REST success rate, p95
+  latency, failure streaks and client-replacement counts; coordinator average,
+  p95 and longest waits; priority totals, cancellations and recent operation
+  history; stream gap events, longest gaps, restart/WebSocket lifecycle and
+  browser render/audio queue telemetry; live task phases; index throughput and
+  ETA; image/SID cache hit rates; config-save, route and shutdown history.
+- Added a derived HEALTHY / DEGRADED / ATTENTION summary using cautious rules,
+  while keeping all raw values visible. Healthy states use restrained green,
+  transient activity and degradation use amber, and red is reserved for actual
+  failures or stale required services.
+- Kept the expanded view readable through grouped cards, compact badges and
+  collapsible history panels rather than displaying every diagnostic counter at
+  once.
+- Added local browser telemetry reporting for rendered video FPS, WebSocket
+  reconnects, Web Audio queue depth and underruns. The report is sent only to
+  the local u64deck backend while Health is visible and never calls the Ultimate.
+- Extended sanitised Diagnostics with the same operation, route, stream, cache,
+  config and lifecycle histories. No telemetry database or additional recurring
+  Ultimate REST polling was introduced.
+- No Finder, routing, Mount & Run, SID playback, storage, settings or device
+  control behaviour changed from RC19. This remains a local evaluation build.
+
+## 1.9.0 — Release Candidate 19
+
+- Added a local-only **System Health** dashboard showing cached Ultimate identity
+  and REST latency, video/audio bitrate and packet health, u64deck process CPU,
+  memory, threads and uptime, device-operation queue state, index size/counts and
+  retained warning/error totals.
+- Health refreshes every two seconds only while its tab is visible. It reads
+  local counters and the existing 30-second status samples; it does not create a
+  new recurring Ultimate REST poll. Index statistics are cached for 15 seconds.
+- Added byte and last-packet counters to the UDP receivers and active-duration
+  reporting to the device coordinator so stream and queue diagnostics are based
+  on measured local activity.
+- Added the complete health snapshot to sanitised Diagnostics exports, including
+  an explicit note that current Ultimate firmware does not expose CPU load, FPGA
+  utilisation or temperature telemetry through REST.
+- No Finder, routing, Mount & Run, SID, storage, settings, machine-control or
+  existing stream-control behaviour changed from RC18. This RC is intended for
+  local evaluation before any publication decision.
+
 ## 1.9.0 — Release Candidate 18
 
 - Fixed the confirmed Windows frozen-executable lifecycle issue where **Exit

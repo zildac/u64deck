@@ -30,7 +30,7 @@ when testing the Ethernet REST endpoint itself.
 
 # u64deck
 
-**v1.9.0 — Release Candidate 18**
+**v1.9.0 — Release Candidate 25 · build bd0bbaf**
 
 
 A lightweight, self-hosted control deck for the **Ultimate 64** (and, minus the
@@ -57,16 +57,25 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
   keys use CIA1 matrix-level press/release events, including held keys, chords,
   cracktros, games and the Ultimate menu. Older firmware and unsupported
   hardware fall back automatically to the established KERNAL keyboard buffer.
+- **System Health dashboard** — view cached Ultimate REST latency and
+  reliability, stream throughput and gap history, browser render/audio health,
+  device-queue contention, active-task phases, index throughput, cache hit rates,
+  process/host resources and persistence/lifecycle history. Clear cards, badges
+  and restrained status colours keep the expanded view readable. The dashboard
+  polls only local counters while visible and does not add a recurring request
+  to the Ultimate. The complete snapshot and detailed histories are included in
+  sanitised Diagnostics exports.
 - **Accurate native SID durations** — when HVSC `Songlengths.md5` is loaded,
   u64deck pre-populates the Jukebox **Length** column from the queued HVSC path
   and subtune, then generates the compact per-SID `.ssl` duration data expected
   by the Ultimate so its native SID-player screen also shows the documented
   length instead of the generic five-minute estimate.
-- **SIDFlow-powered recommendations and Radio** — download SIDFlow's verified
-  full portable export once, slim its perceptual fingerprints into compact
-  normalised 48-dimensional vectors, then use **♪ More like this** or Radio mode
-  to discover unseen HVSC tunes already present on the Ultimate. Powered by
-  **SIDFlow (Chris Gleissner)**.
+- **SIDFlow 0.8.0 recommendations and Radio** — download the pinned, checksum-
+  verified compressed full export and use its precomputed weighted 58-dimensional
+  neighbour graph for **♪ More like this** and Radio. Results are filtered to
+  HVSC tunes present on the Ultimate, sibling subtunes are de-emphasised, and a
+  clearly labelled local feature scan is used only if the fixed-depth graph is
+  exhausted. Powered by **SIDFlow (Chris Gleissner)**.
 - **Audio mirror** — the U64 audio stream, played in the browser.
 - **Reliable, cartridge-safe SID Stop delivery** — under dual-interface split
   routing, Jukebox Stop parks any configured fast cartridge, resets through the
@@ -384,33 +393,74 @@ index files until the merged counts have been checked.
 
 ## SIDFlow recommendations and Radio
 
-The SID Jukebox can use the portable similarity export published by
-**SIDFlow**, created by **Chris Gleissner**. Open **Settings → Search Index &
-Cache → SIDFlow Similarity Data** to download it. u64deck fetches the manifest
-first, requires schema `sidcorr-1`, verifies `SHA256SUMS`, and downloads the
-full feature export. The source is about 400 MB and is needed only once: u64deck
-extracts the documented perceptual fields, corpus-normalises them into compact
-48-dimensional unit vectors in `.sidflow-similarity.sqlite`, then deletes the
-large source file. The retained database is normally well under 40 MB. The
-mobile profile is not used because its current form omits `features_json`.
+The SID Jukebox integrates the portable similarity export published by
+[**SIDFlow**](https://github.com/chrisgleissner/sidflow), created by
+**Christian (Chris) Gleissner**. u64deck v1.9.0 is pinned to the immutable
+[`sidflow-data` 0.8.0 full export](https://github.com/chrisgleissner/sidflow-data/releases/tag/0.8.0)
+for HVSC 85. Open **Settings → Search Index & Cache → SIDFlow Similarity Data**
+to install or update it. Christian's
+[u64deck migration guide](https://github.com/chrisgleissner/sidflow/blob/main/doc/migration/0.5-to-0.8-u64deck.md)
+documents the upstream schema and model changes.
+
+u64deck downloads `sidcorr-hvsc-full-sidcorr-1.sqlite.gz` (194,351,886 bytes,
+about 194 MB), verifies its pinned SHA-256 digest, streams it to disk,
+decompresses it to the byte-identical 982,155,264-byte SQLite export and
+verifies the uncompressed digest as well. It then imports 87,868 tracks and
+2,196,700 precomputed neighbour rows into `.sidflow-similarity.sqlite`. The
+hardware-tested import produced a 269,389,824-byte local database (about 257
+MiB / 269 MB). Allow roughly 1.8 GiB free while the compressed source,
+decompressed source and compact build coexist; temporary files are removed
+when the update completes.
+
+On the hardware-tested Windows system, the real download, verification,
+decompression and import completed in about 48 seconds. Allow roughly one
+minute on a fast connection and SSD, but expect longer on slower broadband or
+storage. Progress is reported separately for metadata, download, checksum
+verification, decompression, compact import, neighbour import and promotion.
+
+The existing working database remains in place until the replacement has
+passed manifest, checksum, schema, model, row-count and SQLite validation and
+has been promoted successfully. A failed or interrupted download/import leaves
+the previous database untouched and removes temporary files where possible.
+
+The primary recommendation engine is SIDFlow's weighted-cosine ranking over its
+58-dimensional model. **♪ More like this** prefers results from different SID
+files and uses sibling subtunes only when needed to fill the result set.
+**Radio** excludes the current file, recently played files and files already in
+the queue so one multi-subtune composition cannot dominate a station. SIDFlow's
+published graph is fixed at 25 neighbours per seed; when local-HVSC filtering or
+a long session exhausts it, u64deck can fill the remainder with its older local
+48-dimensional feature scan. That fallback is explicitly labelled
+`u64deck-fallback` in the queue tooltip and Diagnostics and is never presented
+as SIDFlow's weighted result.
+
+Settings and Health show the installed SIDFlow release, HVSC release, feature
+schema, similarity metric, vector dimensions, track count and neighbour count.
+Diagnostics records `sidflow-neighbors` and `u64deck-fallback` counts for each
+recommendation batch.
+
+An older installed dataset is retained on disk and displayed as **Update required**, but **More like this** and **Radio** will not use it. Selecting either
+feature offers the pinned 0.8.0 update and opens Settings. With no network
+available, the update reports the download error, the old database remains
+untouched but gated, and ordinary SID browsing, queueing and playback continue;
+recommendations remain unavailable until 0.8.0 is installed. With no dataset at
+all, the same features offer installation and otherwise remain unavailable.
 
 Selecting an individual SID from Search or the folder browser creates a one-tune
 queue and plays it immediately. Use **＋** to append only that tune, or explicitly
-choose **♫ Play This Folder** to load every SID in the current folder.
+choose **♫ Play This Folder** to load every SID in the current folder. **Clear
+Queue** turns Radio off and removes queued tunes while allowing a SID already
+playing to finish naturally; saved play queues, favourites and the similarity
+database remain untouched. Local uploads, non-HVSC tunes and collection-version
+path drift fail gracefully with a one-line explanation.
 
-Use **♪ More like this** beside Now Playing or on a Play Queue row to insert up
-to 20 closest matches immediately after the current tune. The active subsong is
-preserved. **Radio** leaves the current queue intact and tops it up near its end
-using the most recently played tune while preventing repeats within the current
-radio session. **Clear Queue** turns Radio off and removes queued tunes while
-allowing a SID already playing to finish naturally; saved play queues,
-favourites and the similarity database remain untouched. Local uploads,
-non-HVSC tunes and paths that no longer match the installed HVSC version fail
-gracefully with a one-line explanation and normal playback is unchanged when no
-similarity database is installed.
+All recommendation work is local. u64deck does not upload listening activity,
+ratings, favourites or queue contents to SIDFlow.
 
 Attribution: recommendation data and similarity analysis are provided by
-**SIDFlow (Chris Gleissner)** and the public `sidflow-data` releases.
+[**SIDFlow (Christian Gleissner)**](https://github.com/chrisgleissner/sidflow)
+and the public
+[`sidflow-data` 0.8.0 release](https://github.com/chrisgleissner/sidflow-data/releases/tag/0.8.0).
 
 ## Help and diagnostics
 
@@ -456,7 +506,7 @@ The repo includes a PyInstaller spec and a GitHub Actions workflow
 1. Push this folder to a GitHub repo.
 2. The **build-exe** action runs on every push — grab `u64deck.exe` from the
    workflow's artifacts (Actions tab → latest run → *u64deck-windows*).
-3. Tag a release (`git tag v1.9.0-rc.18 && git push --tags`) and the exe is attached
+3. Tag a release (`git tag v1.9.0-rc.25 && git push --tags`) and the exe is attached
    to the GitHub Release automatically.
 
 Double-click the exe: it starts the server, opens the dedicated Edge app, and
@@ -666,6 +716,14 @@ title. Folder and saved-play-queue entries are loaded lazily, browser requests
 have timeouts and status polling cannot overlap, so a busy native SID player
 does not make the whole interface unresponsive.
 
+Saved play queues can be loaded before any tune is selected. The selector and
+**Load** button remain visible on a fresh start or direct Jukebox visit, after
+**Clear Queue**, and before choosing content through Search, folder browsing or
+the local-SID picker. The same empty-queue state is used while entry from
+Storage, Favourites or Recent Items is waiting to populate. **Save** and **Clear
+Queue** remain disabled until an active queue exists, while **Delete** is enabled
+only after a saved queue is selected.
+
 **Auto-advance and native duration display**: tunes advance automatically. With
 HVSC's `Songlengths.md5` configured (`songlengths_path` in `config.json`),
 u64deck generates a tiny per-SID `.ssl` duration array and attaches that when it
@@ -673,9 +731,12 @@ uploads a SID, allowing the Ultimate's own SID-player screen to show the
 documented length for the selected subtune. The complete Songlengths database
 is never uploaded to the device. Queue lengths are resolved from the path
 catalogue before lazy tunes are fetched, then confirmed by digest once a tune is
-played. Each tune plays for its documented length in u64deck;
-without Songlengths, `sid_default_secs`
-(default 180) applies (0 = loop forever). If your HVSC lives on the device, you don't even need to set it:
+played. For matched Songlengths entries, u64deck waits a configurable short
+end grace before launching the next tune so audible tails and fades are not cut
+off; `sid_jukebox_end_grace_secs` defaults to 0.5 seconds and may be adjusted in
+`config.json`. The original documented duration is still sent to the Ultimate
+for its native display. Without Songlengths, `sid_default_secs` (default 180)
+applies (0 = loop forever) with the established fallback timing. If your HVSC lives on the device, you don't even need to set it:
 on first jukebox use u64deck **auto-detects the HVSC root** (a folder
 with MUSICIANS + DOCUMENTS, e.g. `/Usb0/HVSC` or `/Usb0/C64Music`),
 saves it as `hvsc_path`, wires `songlengths_path` to its
@@ -840,11 +901,14 @@ discovery: Ethernet and Wi-Fi endpoints are verified independently, grouped into
 one physical device using the Ultimate `unique_id`, and used to recommend the
 preferred link and explain or gate network-dependent UI features.
 
-**SIDFlow-powered recommendations are made possible by Chris Gleissner**, who
-created SIDFlow, published the portable similarity export and explicitly
-invited u64deck to use it for selecting and playing similar songs. u64deck's
-**♪ More like this** and **Radio** features consume the public `sidflow-data`
-release locally; no ratings or listening data are uploaded back to SIDFlow.
+**SIDFlow-powered recommendations are made possible by Christian (Chris)
+Gleissner**, who created [SIDFlow](https://github.com/chrisgleissner/sidflow),
+published the portable
+[`sidflow-data` export](https://github.com/chrisgleissner/sidflow-data/releases/tag/0.8.0)
+and provided a dedicated
+[u64deck migration guide](https://github.com/chrisgleissner/sidflow/blob/main/doc/migration/0.5-to-0.8-u64deck.md).
+u64deck's **♪ More like this** and **Radio** features consume that release
+locally; no ratings or listening data are uploaded back to SIDFlow.
 
 ## Security notes (honest ones too)
 
@@ -897,7 +961,7 @@ d64.py             D64/D71/D81 directory parser + file extractor
 index_store.py     SQLite filesystem and disk-image catalogue
 local_indexer.py   read-only local USB scanner and path mapper
 sid_indexer.py     read-only local SID-header metadata scanner
-sidflow_similarity.py  SIDFlow schema validation, slimming and cosine ranking
+sidflow_similarity.py  SIDFlow 0.8.0 validation, decompression, import and recommendation ranking
 device_coordinator.py  priority scheduling for Ultimate operations
 static/index.html  the whole UI
 config.json        host + ports + Assembly64 endpoint templates

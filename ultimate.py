@@ -477,8 +477,14 @@ class VideoReceiver(threading.Thread, MulticastMixin):
         self.frame_no = 0
         self.packets = 0
         self.dropped = 0
+        self.bytes_received = 0
+        self.last_packet_at = 0.0
         self._last_seq = None
         self.started_at = time.time()
+        self.gap_events = 0
+        self.longest_gap_packets = 0
+        self.longest_inter_packet_ms = 0.0
+        self.last_inter_packet_ms = 0.0
         self._subs = set()
         self._subs_lock = threading.Lock()
         self._buf = bytearray(FRAME_BYTES)
@@ -507,11 +513,20 @@ class VideoReceiver(threading.Thread, MulticastMixin):
                 break
             if len(pkt) < 12:
                 continue
+            self.bytes_received += len(pkt)
+            packet_now = time.time()
+            if self.last_packet_at:
+                delta_ms = max(0.0, (packet_now - self.last_packet_at) * 1000.0)
+                self.last_inter_packet_ms = delta_ms
+                self.longest_inter_packet_ms = max(self.longest_inter_packet_ms, delta_ms)
+            self.last_packet_at = packet_now
             _seq, _frm, line_raw, width, lpp, _bpp, _enc = struct.unpack_from("<HHHHBBH", pkt, 0)
             if self._last_seq is not None:
                 gap = (_seq - self._last_seq - 1) & 0xFFFF
                 if 0 < gap < 0x8000:
                     self.dropped += gap
+                    self.gap_events += 1
+                    self.longest_gap_packets = max(self.longest_gap_packets, gap)
             self._last_seq = _seq
             line = line_raw & 0x7FFF
             last = bool(line_raw & 0x8000)
@@ -554,8 +569,14 @@ class AudioReceiver(threading.Thread, MulticastMixin):
         self.running = True
         self.packets = 0
         self.dropped = 0
+        self.bytes_received = 0
+        self.last_packet_at = 0.0
         self._last_seq = None
         self.started_at = time.time()
+        self.gap_events = 0
+        self.longest_gap_packets = 0
+        self.longest_inter_packet_ms = 0.0
+        self.last_inter_packet_ms = 0.0
         self.last_pkt_len = 0
         self._subs = set()
         self._subs_lock = threading.Lock()
@@ -586,11 +607,20 @@ class AudioReceiver(threading.Thread, MulticastMixin):
                 break
             if len(pkt) <= 2:
                 continue
+            self.bytes_received += len(pkt)
+            packet_now = time.time()
+            if self.last_packet_at:
+                delta_ms = max(0.0, (packet_now - self.last_packet_at) * 1000.0)
+                self.last_inter_packet_ms = delta_ms
+                self.longest_inter_packet_ms = max(self.longest_inter_packet_ms, delta_ms)
+            self.last_packet_at = packet_now
             seq = int.from_bytes(pkt[:2], "little")
             if self._last_seq is not None:
                 gap = (seq - self._last_seq - 1) & 0xFFFF
                 if 0 < gap < 0x8000:
                     self.dropped += gap
+                    self.gap_events += 1
+                    self.longest_gap_packets = max(self.longest_gap_packets, gap)
             self._last_seq = seq
             self.packets += 1
             self.last_pkt_len = len(pkt)

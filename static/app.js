@@ -90,6 +90,7 @@ function tab(name){
   if(name==="settings"){if(!SET.loaded)loadCats();sidflowStatusLoad()}
   if(name==="disks"&&!FS.loaded){fsGo("/");refreshDrives()}
   if(name==="asm64")asmFormInit();
+  if(name==="health")healthStart();else healthStop();
   if(name==="sid"){jkRefresh();jkPollStart();jkSidIndexInit();sidflowStatusLoad();
     // (re)browse whenever the folder list isn't populated — a failed first
     // attempt (device busy, FTP hiccup) must not leave the browser dead
@@ -250,12 +251,177 @@ async function downloadDiagnostics(){
   }
 }
 
+/* ---------- system health ---------- */
+const HEALTH={timer:null,busy:false,last:null};
+function healthBytes(value){
+  const n=Number(value);if(!Number.isFinite(n)||n<0)return"—";
+  const units=["B","KiB","MiB","GiB","TiB"];let v=n,u=0;
+  while(v>=1024&&u<units.length-1){v/=1024;u++}
+  return (u===0?Math.round(v):v.toFixed(v>=100?0:v>=10?1:2))+" "+units[u];
+}
+function healthDuration(value){
+  let s=Math.max(0,Math.round(Number(value)||0));const d=Math.floor(s/86400);s%=86400;
+  const h=Math.floor(s/3600);s%=3600;const m=Math.floor(s/60);s%=60;
+  return [d?d+"d":"",h?h+"h":"",m?m+"m":"",(!d&&!h||s)?s+"s":""].filter(Boolean).join(" ");
+}
+function healthAge(value){
+  if(value==null||!Number.isFinite(Number(value)))return"never";
+  const n=Number(value);return n<1?"now":healthDuration(n)+" ago";
+}
+function healthRate(value){
+  const n=Number(value);if(!Number.isFinite(n))return"—";
+  if(n>=1000000)return(n/1000000).toFixed(2)+" Mbit/s";
+  if(n>=1000)return(n/1000).toFixed(1)+" kbit/s";
+  return Math.round(n)+" bit/s";
+}
+function healthText(id,value){const el=$(id);if(el)el.textContent=value==null?"—":String(value)}
+function healthBadge(id,text,on=false,bad=false,warn=false){const el=$(id);if(!el)return;el.textContent=text;el.className="badge"+(on?" on":"")+(bad?" bad":"")+(warn?" warn":"")}
+function healthBrowserPayload(){return {
+  video_render_fps:HEALTH_BROWSER.videoRenderFps,video_frames_total:HEALTH_BROWSER.videoFramesTotal,
+  video_ws_connects:HEALTH_BROWSER.videoWsConnects,video_ws_disconnects:HEALTH_BROWSER.videoWsDisconnects,
+  audio_ws_connects:HEALTH_BROWSER.audioWsConnects,audio_ws_disconnects:HEALTH_BROWSER.audioWsDisconnects,
+  audio_reconnects:HEALTH_BROWSER.audioReconnects,audio_underruns:HEALTH_BROWSER.audioUnderruns,
+  audio_dropped_ahead:HEALTH_BROWSER.audioDroppedAhead,
+  audio_queue_ms:actx?Math.max(0,(nextT-actx.currentTime)*1000):0,
+  audio_context_state:actx?actx.state:"unavailable",page_visible:!document.hidden};}
+async function healthReportBrowser(){try{await api("/api/health/browser",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify(healthBrowserPayload()),timeoutMs:1500})}catch(e){}}
+function healthEscape(value){return String(value??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+function healthClock(value){const n=Number(value);return Number.isFinite(n)&&n>0?new Date(n*1000).toLocaleTimeString():"—"}
+function healthMs(value,digits=1){const n=Number(value);return Number.isFinite(n)?n.toFixed(digits)+" ms":"—"}
+function healthNumber(value){const n=Number(value);return Number.isFinite(n)?n.toLocaleString():"—"}
+function healthHistory(container,rows,renderer){const el=$(container);if(!el)return;el.innerHTML=rows.length?rows.map(renderer).join(""):'<div class="hint">No events recorded yet.</div>'}
+function healthRender(h){
+  HEALTH.last=h;
+  const u=h.ultimate||{},d=u.device||{},link=u.link||{},streams=h.streams||{},browser=streams.browser||{};
+  const proc=h.u64deck?.process||{},host=proc.host||{},q=h.coordinator||{},idx=h.index||{},job=idx.job||{},cache=h.cache||{},diag=h.diagnostics||{};
+  const activity=h.activity?.current||{},persist=h.persistence||{},config=persist.config||{},routes=persist.routes||[],shutdown=persist.shutdown||{};
+
+  const summary=h.summary||{state:"neutral",label:"WAITING",reasons:[]},summaryEl=$("#healthSummary");
+  if(summaryEl)summaryEl.className="health-summary state-"+(summary.state||"neutral");
+  healthText("#healthSummaryBadge",summary.label||"WAITING");
+  healthText("#healthSummaryTitle",summary.state==="healthy"?"Everything looks healthy":summary.state==="degraded"?"Some telemetry deserves attention":summary.state==="attention"?"Action may be required":"Waiting for telemetry");
+  healthText("#healthSummaryReasons",(summary.reasons||[]).join(" · ")||"—");
+
+  const fresh=u.last_success_age_seconds!=null&&u.last_success_age_seconds<65;
+  const ultimateWarn=!!u.consecutive_failures||(!fresh&&u.configured);
+  healthBadge("#healthUltimateState",!u.configured?"not configured":fresh?"online":"stale",fresh,!u.configured,ultimateWarn);
+  healthText("#healthUltimateName",u.configured?(d.product||"Ultimate")+(d.hostname?" · "+d.hostname:""):"Not configured");
+  healthText("#healthUltimateVersions",[d.firmware_version?"FW "+d.firmware_version:"",d.core_version?"Core "+d.core_version:"",d.fpga_version?"FPGA "+d.fpga_version:""].filter(Boolean).join(" · ")||"No successful status response yet");
+  healthText("#healthUltimateRoutes",`${link.label||"Unknown"} / ${link.rest_route_label||link.control_ip||"—"}`);
+  healthText("#healthRestLatestP95",`${healthMs(u.latest_ms)} / ${healthMs(u.p95_ms)}`);
+  healthText("#healthRestRange",u.samples?`${Number(u.minimum_ms).toFixed(1)} / ${Number(u.average_ms).toFixed(1)} / ${Number(u.maximum_ms).toFixed(1)} ms`:"—");
+  healthText("#healthRestSuccess",u.success_rate_percent==null?"—":`${Number(u.success_rate_percent).toFixed(2)}% (${healthNumber(u.successes)}/${healthNumber(u.attempts)})`);
+  healthText("#healthRestFailures",`${healthNumber(u.failures||0)} / ${healthNumber(u.consecutive_failures||0)}`);
+  healthText("#healthLastResponse",healthAge(u.last_success_age_seconds));
+  healthText("#healthRestReconnects",healthNumber(u.client_replacements||0));
+  healthText("#healthRestSamples",healthNumber(u.samples||0));
+  const ue=$("#healthUltimateError");if(ue){ue.style.display=u.last_error?"block":"none";ue.textContent=u.last_error?`Last REST error (${healthAge(u.last_error_age_seconds)}): ${u.last_error}`:""}
+
+  healthText("#healthStreamTransport","Transport: "+(streams.transport||"—"));
+  const videoState=streams.video||{},audioState=streams.audio||{};
+  const streamRows=[videoState,audioState],commanded=streamRows.filter(row=>!!row.commanded_on).length;
+  const receiving=streamRows.filter(row=>row.commanded_on&&row.packet_age_seconds!=null&&row.packet_age_seconds<2).length;
+  const recentGaps=streamRows.filter(row=>row.recent_gap_age_seconds!=null&&Number(row.recent_gap_age_seconds)<=60).length;
+  const streamBad=commanded>0&&receiving<commanded,streamWarn=!streamBad&&recentGaps>0;
+  const streamLabel=commanded===0?"off":streamBad?(receiving?"partial":"stale"):streamWarn?"recent gap":commanded===2?"both receiving":"receiving";
+  healthBadge("#healthStreamsState",streamLabel,commanded>0&&!streamBad&&!streamWarn,streamBad,streamWarn);
+  healthText("#healthVideoRate",healthRate(videoState.bitrate_bps));
+  healthText("#healthAudioRate",healthRate(audioState.bitrate_bps));
+  healthText("#healthVideoFps",`${streams.video?.frames_per_second==null?"—":Number(streams.video.frames_per_second).toFixed(1)} / ${browser.video_render_fps==null?"—":Number(browser.video_render_fps).toFixed(1)} fps`);
+  healthText("#healthVideoGaps",`${healthNumber(streams.video?.dropped||0)} / ${healthNumber(streams.video?.gap_events||0)}`);
+  healthText("#healthVideoLongestGap",`${healthNumber(streams.video?.longest_gap_packets||0)} pkt · ${healthMs(streams.video?.longest_inter_packet_ms)}`);
+  healthText("#healthVideoAge",`${streams.video?.packet_age_seconds==null?"—":healthAge(streams.video.packet_age_seconds)} / ${streams.video?.peak_packet_age_seconds==null?"—":healthDuration(streams.video.peak_packet_age_seconds)}`);
+  healthText("#healthVideoRestarts",`${healthNumber(streams.video?.start_count||0)} / ${healthNumber(streams.video?.restart_count||0)}`);
+  healthText("#healthVideoWs",`${healthNumber(browser.video_ws_connects??streams.video?.websocket?.connections??0)} / ${healthNumber(browser.video_ws_disconnects??streams.video?.websocket?.disconnects??0)}`);
+  healthText("#healthVideoFrames",healthNumber(browser.video_frames_total??streams.video?.frames??0));
+  healthText("#healthAudioPps",streams.audio?.packets_per_second==null?"—":Number(streams.audio.packets_per_second).toFixed(1)+" pkt/s");
+  healthText("#healthAudioGaps",`${healthNumber(streams.audio?.dropped||0)} / ${healthNumber(streams.audio?.gap_events||0)}`);
+  healthText("#healthAudioLongestGap",`${healthNumber(streams.audio?.longest_gap_packets||0)} pkt · ${healthMs(streams.audio?.longest_inter_packet_ms)}`);
+  healthText("#healthAudioAge",`${streams.audio?.packet_age_seconds==null?"—":healthAge(streams.audio.packet_age_seconds)} / ${streams.audio?.peak_packet_age_seconds==null?"—":healthDuration(streams.audio.peak_packet_age_seconds)}`);
+  healthText("#healthAudioQueue",`${browser.audio_queue_ms==null?"—":Number(browser.audio_queue_ms).toFixed(0)+" ms"} / ${healthNumber(browser.audio_underruns||0)} underrun`+(Number(browser.audio_underruns||0)===1?"":"s"));
+  healthText("#healthAudioReconnects",`${healthNumber(browser.audio_reconnects||0)} / ${healthNumber(browser.audio_ws_disconnects??streams.audio?.websocket?.disconnects??0)}`);
+  healthText("#healthAudioContext",browser.audio_context_state||"—");
+
+  const active=!!q.active_priority,waiters=(q.waiting_interactive||0)+(q.waiting_status||0)+(q.waiting_background||0),task=activity.name||"";
+  healthText("#healthActivityName",task||"Idle");
+  healthText("#healthActivityDetail",task?(activity.detail||"Operation in progress."):"No operation in progress.");
+  healthText("#healthActivityPhase",activity.phase||"—");
+  healthText("#healthActivityElapsed",activity.elapsed_seconds==null?"—":healthDuration(activity.elapsed_seconds));
+  healthText("#healthActiveOperation",active?`${q.active_reason||q.active_priority}${q.active_seconds?` · ${Number(q.active_seconds).toFixed(1)}s`:""}`:"idle");
+  healthText("#healthWaiters",`${q.waiting_interactive||0} / ${q.waiting_status||0} / ${q.waiting_background||0}`);
+  healthText("#healthQueueWaitStats",`${Number(q.average_wait_seconds||0).toFixed(3)} / ${Number(q.p95_wait_seconds||0).toFixed(3)} / ${Number(q.longest_wait_seconds||0).toFixed(3)} s`);
+  const by=q.completed_by_priority||{};healthText("#healthCompletedByPriority",`${by.interactive||0} / ${by.status||0} / ${by.background||0}`);
+  healthText("#healthCancelled",healthNumber(q.cancelled||0));
+  healthText("#healthQueueWait",Number(q.total_wait_seconds||0).toFixed(2)+" s");
+
+  const indexRunning=!!job.running,indexBad=!!job.error||Number(job.scan_errors||0)>0;
+  healthText("#healthIndexCurrent",indexRunning?(job.mode==="local"?"Local volume index":"Ultimate storage index"):"Indexer idle");
+  healthText("#healthIndexDetail",indexRunning?(job.current||job.root||"scanning"):(job.error||"No indexing operation is active."));
+  healthText("#healthIndexCounts",`${healthNumber(idx.images)} / ${healthNumber(idx.sid_metadata)}`);
+  healthText("#healthIndexDatabase",`${healthBytes(idx.disk_bytes)} / ${healthNumber(idx.parse_failures)}`);
+  healthText("#healthIndexRates",`${Number(job.files_per_sec||0).toFixed(2)} / ${Number(job.dirs_per_sec||0).toFixed(2)}`);
+  healthText("#healthIndexEta",`${Number(job.images_per_sec||0).toFixed(2)} img/s / ${job.eta_secs==null?"—":healthDuration(job.eta_secs)}`);
+  healthText("#healthIndexChanges",`${healthNumber(job.images_new||0)} / ${healthNumber(job.images_changed||0)} / ${healthNumber(job.scan_errors||0)}`);
+  healthText("#healthImageCache",`${healthNumber(cache.image_entries||0)}/${healthNumber(cache.image_capacity||0)} · ${healthBytes(cache.image_bytes)}`);
+  healthText("#healthImageCacheHits",cache.image_hit_rate_percent==null?`${healthNumber(cache.image_hits||0)} hit / ${healthNumber(cache.image_misses||0)} miss`:`${Number(cache.image_hit_rate_percent).toFixed(1)}% · ${healthNumber(cache.image_evictions||0)} evicted`);
+  healthText("#healthSidCacheHits",cache.sid_hit_rate_percent==null?`${healthNumber(cache.sid_materialise_hits||0)} hit / ${healthNumber(cache.sid_materialise_misses||0)} fetch`:`${Number(cache.sid_hit_rate_percent).toFixed(1)}% · ${healthNumber(cache.sid_materialise_misses||0)} fetch`);
+  const sf=idx.sidflow||{};
+  healthText("#healthSidflowModel",sf.available?`${sf.release||sf.supported_release||"—"} · ${sf.hvsc_version||"HVSC ?"} · ${sf.similarity_metric||"—"} · ${sf.vector_dimensions||"—"}D`:(sf.needs_update?"update required":"not installed"));
+  healthText("#healthSidflowCounts",sf.available?`${healthNumber(sf.tracks||0)} / ${healthNumber(sf.neighbors||0)}`:"—");
+
+  healthBadge("#healthFrozen",h.u64deck?.frozen?"EXE":"source",true,false);
+  healthText("#healthProcessLoad",`${proc.cpu_percent==null?"—":Number(proc.cpu_percent).toFixed(1)+"%"} / ${healthBytes(proc.memory_rss_bytes)}`);
+  healthText("#healthProcessShape",`${proc.threads==null?"—":proc.threads} / ${proc.handles==null?"—":proc.handles}`);
+  healthText("#healthProcessUptime",healthDuration(proc.uptime_seconds));
+  healthText("#healthHostLoad",host.cpu_percent==null?"—":`${Number(host.cpu_percent).toFixed(1)}% / ${Number(host.memory_percent).toFixed(1)}%`);
+  healthText("#healthDiskFree",healthBytes(host.disk_free_bytes));
+  healthText("#healthProcessIo",`${healthBytes(proc.read_bytes)} / ${healthBytes(proc.write_bytes)}`);
+  healthText("#healthBuild",h.u64deck?.build||"—");
+  healthText("#healthDiagCounts",`${healthNumber(diag.warnings||0)} / ${healthNumber(diag.errors||0)}`);
+  healthText("#healthDiagActive",`${healthNumber(diag.active_warnings||0)} / ${healthNumber(diag.active_errors||0)}`);
+  healthText("#healthLastErrorAge",healthAge(diag.last_error_age_seconds));
+
+  const lastConfig=config.last||{},lastRoute=routes.length?routes[routes.length-1]:null;
+  const latestConfigFailed=!!lastConfig&&lastConfig.success===false;
+  healthBadge("#healthPersistenceState",latestConfigFailed?"save failed":"ready",!latestConfigFailed,latestConfigFailed);
+  healthText("#healthConfigSaves",`${healthNumber(config.successes||0)} / ${healthNumber(config.failures||0)}`);
+  healthText("#healthConfigLast",lastConfig.time?`${healthClock(lastConfig.time)} · ${healthMs(lastConfig.elapsed_ms,2)}`:"—");
+  healthText("#healthRouteChanges",healthNumber(routes.length));
+  healthText("#healthLastRoute",lastRoute?`${lastRoute.selected_host||"—"} → ${lastRoute.control_host||"—"}`:"—");
+  healthText("#healthShutdownState",String(shutdown.state||"not requested").replaceAll("_"," "));
+  healthText("#healthShutdownTime",shutdown.total_ms==null?"—":healthMs(shutdown.total_ms,2));
+  healthText("#healthDiagRetained",healthNumber(diag.retained||0));
+  healthText("#healthLastEvent",diag.last?`${diag.last.level}: ${diag.last.message}`:"—");
+
+  const diagnosticEvents=diag.events||[];healthText("#healthDiagnosticHistoryCount",diagnosticEvents.length);
+  healthHistory("#healthDiagnosticHistory",[...diagnosticEvents].reverse(),row=>{const level=row.level==="error"?"bad":"warn",symbol=row.level==="error"?"×":"!",state=row.recovered?"recovered":"active";return `<div class="health-history-row"><span class="health-history-time">${healthClock(row.time_epoch)}</span><span class="health-outcome ${level}" title="${healthEscape(row.level)}">${symbol}</span><b>${healthEscape(row.message)}</b><span class="health-event-state ${state}">${row.recovered?"recovered / historical":"recent / unresolved"} · ${healthAge(row.age_seconds)}</span></div>`});
+
+  const ops=q.recent_operations||[];healthText("#healthOpHistoryCount",ops.length);
+  healthHistory("#healthOperationHistory",[...ops].reverse(),row=>{const state=row.outcome==="ok"?"ok":row.outcome==="cancelled"?"warn":"bad",symbol=row.outcome==="ok"?"✓":row.outcome==="cancelled"?"!":"×";return `<div class="health-history-row"><span class="health-history-time">${healthClock(row.finished_at)}</span><span class="health-outcome ${state}" title="${healthEscape(row.outcome)}">${symbol}</span><b>${healthEscape(row.reason)}</b><span>${healthEscape(row.priority)} · wait ${Number(row.wait_seconds||0).toFixed(3)}s · run ${Number(row.duration_seconds||0).toFixed(3)}s</span></div>`});
+  const streamHistory=streams.history||[];healthText("#healthStreamHistoryCount",streamHistory.length);
+  healthHistory("#healthStreamHistory",[...streamHistory].reverse(),row=>`<div class="health-history-row"><span class="health-history-time">${healthClock(row.time)}</span><span class="badge ${row.ok===false?"bad":row.action?.includes("close")?"warn":"on"}">${healthEscape(row.stream)}</span><b>${healthEscape(row.action)}</b><span>${healthEscape(row.via||row.transport||row.destination||"")}</span></div>`);
+  const life=[...(h.activity?.history||[]).map(row=>({...row,_kind:"activity",time:row.finished_at||row.started_at})),...(config.history||[]).map(row=>({...row,_kind:"config"})),...routes.map(row=>({...row,_kind:"route"}))].sort((a,b)=>(b.time||0)-(a.time||0)).slice(0,30);
+  healthText("#healthLifecycleHistoryCount",life.length);
+  healthHistory("#healthLifecycleHistory",life,row=>{let title="",detail="",state="on";if(row._kind==="route"){title="Route";detail=`${row.selected_host||"—"} → ${row.control_host||"—"} · ${row.reason||""}`}else if(row._kind==="config"){title="Config save";detail=`${row.success?"success":"failed"} · ${healthMs(row.elapsed_ms,2)}`;state=row.success?"on":"bad"}else{title=row.name||"Activity";detail=`${row.phase||""} · ${row.outcome||"complete"} · ${Number(row.elapsed_seconds||0).toFixed(2)}s`;state=row.outcome==="error"?"bad":"on"}return `<div class="health-history-row"><span class="health-history-time">${healthClock(row.time)}</span><span class="badge ${state}">${healthEscape(row._kind)}</span><b>${healthEscape(title)}</b><span>${healthEscape(detail)}</span></div>`});
+  healthText("#healthUpdated","auto-updated "+new Date((h.generated_at||Date.now()/1000)*1000).toLocaleTimeString()+" · every 2 s");
+}
+
+async function healthLoad(force=false){
+  if(HEALTH.busy)return;if(!force&&(!document.querySelector("#tab-health.active")||document.hidden))return;
+  HEALTH.busy=true;try{await healthReportBrowser();healthRender(await api("/api/health",{timeoutMs:5000}))}
+  catch(e){healthText("#healthUpdated","health unavailable: "+e.message)}finally{HEALTH.busy=false}
+}
+function healthStart(){healthLoad(true);if(!HEALTH.timer)HEALTH.timer=setInterval(healthLoad,2000)}
+function healthStop(){if(HEALTH.timer){clearInterval(HEALTH.timer);HEALTH.timer=null}}
+document.addEventListener("visibilitychange",()=>{if(document.querySelector("#tab-health.active")){if(document.hidden)healthStop();else healthStart()}});
+
 /* ---------- discovery ---------- */
 let DISCOVERY_SCAN_ACTIVE=false,DISCOVERY_DIALOG_OPEN=false;
 const DISCOVERY_SELECTION={};
 function closeDiscover(resumePolling=true){
   DISCOVERY_DIALOG_OPEN=false;const ov=$("#discOverlay");if(ov)ov.remove();
-  if(resumePolling&&!DISCOVERY_SCAN_ACTIVE)setTimeout(()=>{loadInfo();refreshDrives()},0);
+  if(resumePolling&&!DISCOVERY_SCAN_ACTIVE)setTimeout(()=>{loadInfo();if(DRIVE_STATUS_READY)refreshDrives()},0);
 }
 function openDiscover(){
   DISCOVERY_DIALOG_OPEN=true;let ov=$("#discOverlay");
@@ -327,7 +493,7 @@ async function runDiscover(){
   }catch(e){body.innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`}
   finally{
     DISCOVERY_SCAN_ACTIVE=false;btn.disabled=false;if(clear)clear.disabled=false;
-    if(!DISCOVERY_DIALOG_OPEN)setTimeout(()=>{loadInfo();refreshDrives()},0);
+    if(!DISCOVERY_DIALOG_OPEN)setTimeout(()=>{loadInfo();if(DRIVE_STATUS_READY)refreshDrives()},0);
   }
 }
 async function clearDiscoveredDevices(){
@@ -341,14 +507,14 @@ async function clearDiscoveredDevices(){
     const r=await api("/api/discover/clear"+(sub?"?subnet="+encodeURIComponent(sub):""),{method:"POST",timeoutMs:30000});
     closeLocalStreamsForLinkChange();
     LINK_STATUS={ip:"",link_type:"unknown",label:"Unknown",addresses:[],ethernet_ip:"",wifi_ip:"",control_ip:"",control_link_type:"unknown",rest_via_alternate:false,rest_route_label:"",streaming_available:true,rest_timeout:8};
-    LAST_DEVICE_INFO=null;INPUT_STATUS={available:false,mode:"buffer",label:"Legacy KERNAL buffer",status:0};
+    LAST_DEVICE_INFO=null;DRIVE_STATUS_READY=false;INPUT_STATUS={available:false,mode:"buffer",label:"Legacy KERNAL buffer",status:0};
     applyLinkStatus(LINK_STATUS);matrixClearLocalState();renderInputMode();
     $("#devinfo").innerHTML='<span style="color:var(--err)">No device configured — choose a verified result below</span>';
     toast("Discovery history cleared — scanning for Ultimate devices.","ok");
     renderDiscoveryResults(r);
   }catch(e){body.innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`}
   finally{DISCOVERY_SCAN_ACTIVE=false;if(btn)btn.disabled=false;if(clear)clear.disabled=false;
-    if(!DISCOVERY_DIALOG_OPEN)setTimeout(()=>{loadInfo();refreshDrives()},0)}
+    if(!DISCOVERY_DIALOG_OPEN)setTimeout(()=>{loadInfo();if(DRIVE_STATUS_READY)refreshDrives()},0)}
 }
 function scheduleInputProbe(delay=2500){
   clearTimeout(INPUT_PROBE_TIMER);INPUT_PROBE_TIMER=setTimeout(()=>{
@@ -359,6 +525,7 @@ function scheduleInputProbe(delay=2500){
 }
 async function connectTo(host){
   host=(host||"").trim();if(!host||uiInteractive())return;
+  const previousDriveReady=DRIVE_STATUS_READY;DRIVE_STATUS_READY=false;
   const connectStarted=performance.now(),body=$("#discBody");
   if(body)body.innerHTML=`Connecting to <b>${esc(host)}</b>… <span class='cursor'></span>`;
   toast("Connecting to "+host+"…","ok");
@@ -371,14 +538,16 @@ async function connectTo(host){
       toast("Connected to "+host+(r.rest_via_alternate?" · REST control via "+r.control_host:"")+` · ${elapsed} ms`,"ok");
       if(r.input){INPUT_STATUS=r.input;renderInputMode()}
       if(r.link)applyLinkStatus(r.link);
-      if(r.info){LAST_DEVICE_INFO=r.info;INFO_FAILURES=0;renderDeviceInfo(r.info)}
+      if(r.info){LAST_DEVICE_INFO=r.info;INFO_FAILURES=0;DRIVE_STATUS_READY=true;renderDeviceInfo(r.info)}
       matrixClearLocalState();closeDiscover(false);
       if(INPUT_STATUS.pending||INPUT_STATUS.available===null)scheduleInputProbe();
+      if(DRIVE_STATUS_READY)setTimeout(refreshDrives,0);
     }else{
+      DRIVE_STATUS_READY=previousDriveReady;
       if(body)body.innerHTML=`<span style="color:var(--err)">Could not connect to ${esc(host)}: ${esc(r.error||"unknown error")}</span>`;
       toast("Could not connect to "+host+": "+r.error,"err");
     }
-  }catch(e){if(body)body.innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`;toast(e.message,"err")}
+  }catch(e){DRIVE_STATUS_READY=previousDriveReady;if(body)body.innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`;toast(e.message,"err")}
   finally{uiInteractiveEnd()}
 }
 
@@ -569,6 +738,8 @@ async function loadInfo(){
     if(i.u64deck_input){INPUT_STATUS=i.u64deck_input;renderInputMode();
       if(INPUT_STATUS.pending||INPUT_STATUS.available===null)scheduleInputProbe()}
     renderDeviceInfo(i);
+    const firstDriveReady=!DRIVE_STATUS_READY;DRIVE_STATUS_READY=true;
+    if(firstDriveReady)setTimeout(refreshDrives,0);
   }catch(e){
     const unconfig=/No device configured/.test(e.message);
     if(!unconfig&&LAST_DEVICE_INFO&&INFO_FAILURES===0){
@@ -862,6 +1033,8 @@ const ctx2d=screenEl.getContext("2d");
 const imgData=ctx2d.createImageData(384,272);
 const px32=new Uint32Array(imgData.data.buffer);
 let wsV=null,frames=0,videoOn=false,videoWanted=false,videoHasFrame=false,videoPlaceholderMessage="VIDEO NOT CONNECTED",achunks=0;
+const HEALTH_BROWSER={videoFramesTotal:0,videoRenderFps:0,videoWsConnects:0,videoWsDisconnects:0,
+  audioWsConnects:0,audioWsDisconnects:0,audioReconnects:0,audioUnderruns:0,audioDroppedAhead:0};
 let VIDEO_NO_FRAME_TIMER=null;
 let wsA=null,actx=null,nextT=0,audioOn=false,audioWanted=false,audioState="off",audioRate=0;
 let audioReconnectTimer=null;
@@ -869,6 +1042,7 @@ const AUDIO_SOURCES=new Set(),AUDIO_MAX_AHEAD=0.32,AUDIO_START_LEAD=0.04;
 let AUDIO_JUKE_STOP_MUTED=false;
 
 setInterval(()=>{
+  HEALTH_BROWSER.videoRenderFps=frames;
   $("#fps").textContent=frames+" fps";
   $("#fps").classList.toggle("on",frames>0);frames=0;
   audioRate=achunks;achunks=0;
@@ -878,7 +1052,7 @@ function drawFrame(buf){
   const b=new Uint8Array(buf);
   for(let i=0,p=0;i<b.length;i++){const v=b[i];
     px32[p++]=PAL32[v&15];px32[p++]=PAL32[v>>4]}
-  ctx2d.putImageData(imgData,0,0);frames++;videoHasFrame=true;
+  ctx2d.putImageData(imgData,0,0);frames++;HEALTH_BROWSER.videoFramesTotal++;videoHasFrame=true;
   clearTimeout(VIDEO_NO_FRAME_TIMER);VIDEO_NO_FRAME_TIMER=null;const streamHint=$("#streamHint");if(streamHint)streamHint.style.display="none";
   screenEl.setAttribute("aria-label","Live C64 screen — click to focus, then keys are sent to the machine");
   // dynamic bezel: the stream includes the VIC border — sample it and let
@@ -931,9 +1105,11 @@ function openVideoWS(){
   wsV=new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host
     +"/ws/video?buffer="+buf);
   wsV.binaryType="arraybuffer";
+  wsV.onopen=()=>{HEALTH_BROWSER.videoWsConnects++};
   wsV.onmessage=ev=>drawFrame(ev.data);
   wsV.onerror=()=>{};
   wsV.onclose=()=>{
+    HEALTH_BROWSER.videoWsDisconnects++;
     // The backend video disconnect handler performs the single coalesced
     // hardware release. Clear only browser-side held/queued state here so the
     // same socket close cannot create a second matrix REST request.
@@ -968,13 +1144,14 @@ function flushBrowserAudio(){
   AUDIO_SOURCES.clear();nextT=actx?actx.currentTime:0;achunks=0;
 }
 function playChunk(ab){if(!actx||!audioWanted||AUDIO_JUKE_STOP_MUTED)return;const i16=new Int16Array(ab);const n=i16.length>>1;if(!n)return;
-  const now=actx.currentTime;if(nextT>now+AUDIO_MAX_AHEAD)return;
+  const now=actx.currentTime;if(nextT&&nextT<now-0.015)HEALTH_BROWSER.audioUnderruns++;
+  if(nextT>now+AUDIO_MAX_AHEAD){HEALTH_BROWSER.audioDroppedAhead++;return}
   const buf=actx.createBuffer(2,n,47983);
   const L=buf.getChannelData(0),R=buf.getChannelData(1);
   for(let i=0;i<n;i++){L[i]=i16[2*i]/32768;R[i]=i16[2*i+1]/32768}
   const src=actx.createBufferSource();src.buffer=buf;src.connect(actx.destination);
   if(REC.audioDest)src.connect(REC.audioDest);
-  const t=Math.max(now+AUDIO_START_LEAD,nextT);if(t>now+AUDIO_MAX_AHEAD){try{src.disconnect()}catch(e){}return}
+  const t=Math.max(now+AUDIO_START_LEAD,nextT);if(t>now+AUDIO_MAX_AHEAD){HEALTH_BROWSER.audioDroppedAhead++;try{src.disconnect()}catch(e){}return}
   AUDIO_SOURCES.add(src);src.onended=()=>{AUDIO_SOURCES.delete(src);try{src.disconnect()}catch(e){}};
   src.start(t);nextT=t+n/47983}
 function setAudioState(state,rate=audioRate){
@@ -990,14 +1167,15 @@ function setAudioState(state,rate=audioRate){
   if(!videoHasFrame)drawVideoPlaceholder(videoPlaceholderMessage);
 }
 function openAudioWS(reconnecting=false){
-  clearTimeout(audioReconnectTimer);audioReconnectTimer=null;
+  clearTimeout(audioReconnectTimer);audioReconnectTimer=null;if(reconnecting)HEALTH_BROWSER.audioReconnects++;
   setAudioState(reconnecting?"reconnecting":"connecting");
   wsA=new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/ws/audio");
   wsA.binaryType="arraybuffer";
-  wsA.onopen=()=>{audioOn=true};
+  wsA.onopen=()=>{audioOn=true;HEALTH_BROWSER.audioWsConnects++};
   wsA.onmessage=ev=>{audioOn=true;achunks++;if(audioState!=="live")setAudioState("live",Math.max(1,audioRate));playChunk(ev.data)};
   wsA.onerror=()=>{};
   wsA.onclose=()=>{
+    HEALTH_BROWSER.audioWsDisconnects++;
     // Audio has no relationship to keyboard capture; never release CIA1 input
     // merely because the audio stream reconnects or stops.
     wsA=null;
@@ -1220,6 +1398,7 @@ window.addEventListener("beforeunload",e=>{if(REC.active){e.preventDefault();e.r
 let DEFAULT_MOUNT_MODE="unlinked";
 let DRIVE_STATE={a:{},b:{}};
 let DRIVE_STATUS_RETRY_TIMER=null;
+let DRIVE_STATUS_READY=false;
 function mountMode(){return $("#mountModeDefault")?.value||DEFAULT_MOUNT_MODE||"unlinked"}
 function mountModeShort(mode=mountMode()){return mode==="readonly"?"RO":mode==="readwrite"?"RW":"UNLINKED"}
 function mountModeLong(mode=mountMode()){return mode==="readonly"?"Read-only":mode==="readwrite"?"Read/write":"Unlinked — temporary writes"}
@@ -1696,6 +1875,11 @@ function jumpToMountedDrives(){
 }
 async function refreshDrives(){
   if(DISCOVERY_SCAN_ACTIVE||DISCOVERY_DIALOG_OPEN||uiInteractive()||DRIVES_IN_FLIGHT)return;
+  if(!DRIVE_STATUS_READY){
+    renderDrivePanel("Waiting for the Ultimate connection before reading drive status…");
+    if(!INFO_IN_FLIGHT)loadInfo();
+    return;
+  }
   DRIVES_IN_FLIGHT=true;
   try{const r=await api("/api/drives");
     if(r?.u64deck_discovery_busy||r?.u64deck_operation_busy){
@@ -1712,10 +1896,13 @@ async function refreshDrives(){
     if(r?.u64deck_drives_unavailable){
       MOUNT_RUN_BUSY=false;applyBusyMountSnapshot(r.u64deck_mounts);
       renderDrivePanel(r.u64deck_drives_message||"Drive status temporarily unavailable — retrying…");
-      const retry=Math.max(500,Number(r.u64deck_retry_ms)||1000);
-      DRIVE_STATUS_RETRY_TIMER=setTimeout(()=>{DRIVE_STATUS_RETRY_TIMER=null;refreshDrives()},retry);
+      const retry=Number(r.u64deck_retry_ms)||0;
+      if(!r.u64deck_drives_error&&retry>0){
+        DRIVE_STATUS_RETRY_TIMER=setTimeout(()=>{DRIVE_STATUS_RETRY_TIMER=null;refreshDrives()},Math.max(500,retry));
+      }
       return;
     }
+    DRIVE_STATUS_READY=true;
     MOUNT_RUN_BUSY=false;DRIVE_STATE={a:{enabled:false},b:{enabled:false}};
     for(const d of (r.drives||[])){for(const k of ["a","b"]){if(d[k]){
       const v=d[k],m=v.u64deck_mount||{},mode=m.mode||v.mode||v.mount_mode||"";
@@ -2335,29 +2522,39 @@ function jkRender(s){
     songSel.innerHTML="<select onchange='jkPlaySong(this.value)'>"+
       Array.from({length:n.meta.songs},(_,i)=>`<option value="${i+1}" ${i+1===n.song?"selected":""}>song ${i+1}</option>`).join("")+"</select>";
   }else songSel.style.display="none";
-  const lp=$("#jkListPanel");
-  if(!s.items.length){lp.style.display="none";JK.listSignature="";return}
+  const lp=$("#jkListPanel"),items=Array.isArray(s.items)?s.items:[];
   lp.style.display="flex";
-  const itemAuthors=s.items.map(it=>String(it.meta?.author||"").trim());
+  plControlsSync(s);
+  if(!items.length){
+    $("#jkListTitle").textContent="PLAY QUEUE — 0 TUNES";
+    $("#jkListContext").textContent="";
+    $("#jkListContext").title="";
+    if(JK.listSignature!=="empty"){
+      JK.listSignature="empty";
+      $("#jkList").innerHTML='<div class="sid-queue-empty" role="status"><strong>No tunes queued</strong><span>Choose a saved play queue above, add a SID, or play a folder.</span></div>';
+    }
+    return;
+  }
+  const itemAuthors=items.map(it=>String(it.meta?.author||"").trim());
   const knownAuthors=[...new Set(itemAuthors.filter(Boolean))];
   const singleAuthor=knownAuthors.length===1&&itemAuthors.every(a=>a===knownAuthors[0]);
-  const tuneWord=s.items.length===1?"TUNE":"TUNES";
+  const tuneWord=items.length===1?"TUNE":"TUNES";
   $("#jkListTitle").textContent=singleAuthor
-    ?`PLAY QUEUE — ${knownAuthors[0]} · ${s.items.length} ${tuneWord}`
-    :`PLAY QUEUE — ${s.items.length} ${tuneWord}`;
+    ?`PLAY QUEUE — ${knownAuthors[0]} · ${items.length} ${tuneWord}`
+    :`PLAY QUEUE — ${items.length} ${tuneWord}`;
   $("#jkListContext").textContent=[s.folder||"",s.source||"",s.loading?"loading…":""].filter(Boolean).join(" · ");
   $("#jkListContext").title=$("#jkListContext").textContent;
   const sig=jkListSignature(s)+"|singleAuthor:"+(singleAuthor?knownAuthors[0]:"");
   if(sig!==JK.listSignature){
     JK.listSignature=sig;
     const authorHead=singleAuthor?"":'<div class="jkq-cell jkq-author" role="columnheader">Author</div>';
-    const rows=s.items.map((it,i)=>{
+    const rows=items.map((it,i)=>{
       const m=it.meta||{},author=String(m.author||""),released=String(m.released||"");
       const compactMeta=[singleAuthor?"":author,released].filter(Boolean).join(" · ");
       const authorCell=singleAuthor?"":`<div class="jkq-cell jkq-author" role="cell">${esc(author)}</div>`;
       return `<div class="jkq-row" role="row" data-juke-index="${i}" onclick="jkPlay(${i},${Number(it.song||0)})">
         <div class="jkq-cell jkq-index" role="cell">${i+1}</div>
-        <div class="jkq-cell jkq-title" role="cell">${esc(m.name||it.label)}${it.similarity!=null?` <span class="jkq-similarity" title="SIDFlow cosine similarity">${Math.round(Number(it.similarity)*100)}% match</span>`:""}${it.lazy?' <span class="hint">· loads when played</span>':""}<div class="jkq-submeta">${esc(compactMeta)}${it.song&&m.songs>1?` · song ${it.song}`:""}</div></div>
+        <div class="jkq-cell jkq-title" role="cell">${esc(m.name||it.label)}${it.similarity!=null?` <span class="jkq-similarity" title="${it.recommendation_source==="u64deck-fallback"?"u64deck fallback feature similarity":"SIDFlow 0.8.0 weighted neighbour similarity"}">${Math.round(Number(it.similarity)*100)}% match</span>`:""}${it.lazy?' <span class="hint">· loads when played</span>':""}<div class="jkq-submeta">${esc(compactMeta)}${it.song&&m.songs>1?` · song ${it.song}`:""}</div></div>
         ${authorCell}<div class="jkq-cell jkq-chip" role="cell">${sidChipBadge(m)}</div>
         <div class="jkq-cell jkq-released hint" role="cell">${esc(released)}</div>
         <div class="jkq-cell jkq-length" role="cell">${fmtLen(it.length)}</div>
@@ -2614,6 +2811,14 @@ async function jkRandom(){
       (s.loading?" — loading its folder in the background":""),"ok");
     if(s.selected)rememberRecent(itemSpec("sid",s.selected.split("/").pop().replace(/\.sid$/i,""),s.selected,"sid_play",{folder:parentPath(s.selected),name:s.selected.split("/").pop()}))}
   catch(e){toast(e.message,"err")}}
+function plControlsSync(s=JK.state||{}){
+  const hasItems=Array.isArray(s.items)&&s.items.length>0;
+  const selected=!!$("#plSel")?.value;
+  const save=$("#plSaveBtn"),clear=$("#jkClearQueueBtn"),del=$("#plDeleteBtn");
+  if(save)save.disabled=!hasItems;
+  if(clear)clear.disabled=!hasItems;
+  if(del)del.disabled=!selected;
+}
 async function plRefresh(){
   try{
     const r=await api("/api/playlists");
@@ -2621,6 +2826,7 @@ async function plRefresh(){
     sel.innerHTML='<option value="">— saved play queues —</option>'+
       r.playlists.map(p=>`<option value="${esc(p.name)}">${esc(p.name)} (${p.count})</option>`).join("");
     if([...sel.options].some(o=>o.value===cur))sel.value=cur;
+    plControlsSync();
   }catch(e){}}
 async function plSave(){
   const name=$("#plName").value.trim();
@@ -2725,11 +2931,18 @@ function sidflowStatusRender(s){
   }
   if(SIDFLOWUI.poll){clearInterval(SIDFLOWUI.poll);SIDFLOWUI.poll=null}
   bar.style.display="none";bar.value=0;dl.disabled=false;
-  if(s.available){
-    const schema=s.schema_version?` · ${s.schema_version}`:"",generated=s.generated_at?` · export ${s.generated_at}`:"",profile=s.export_profile?` · ${s.export_profile} profile`:"",release=s.release_tag?` · ${s.release_tag}`:"";
+  if(s.available&&!s.needs_update){
+    const release=s.release_tag||s.supported_release||"",hvsc=s.hvsc_version?` · ${s.hvsc_version}`:"";
+    const model=s.similarity_metric?` · ${s.similarity_metric}`:"",dims=s.vector_dimensions?` · ${s.vector_dimensions}D`:"";
+    const feature=s.feature_schema_version?` · features ${s.feature_schema_version}`:"";
+    const neighbours=s.neighbors?` · ${Number(s.neighbors).toLocaleString()} neighbours`:"";
     const warning=s.quality_warning?` · ⚠ ${s.quality_warning}`:"";
-    out.textContent=`Ready — ${Number(s.tracks||0).toLocaleString()} tracks · ${sidflowBytes(s.bytes)}${schema}${profile}${release}${generated}${warning}`;
-    dl.textContent="Re-download Similarity Data";rm.style.display="inline-block";
+    out.textContent=`Ready — SIDFlow ${release}${hvsc} · ${Number(s.tracks||0).toLocaleString()} tracks${neighbours}${model}${dims}${feature} · ${sidflowBytes(s.bytes)}${warning}`;
+    dl.textContent="Re-download SIDFlow 0.8.0";rm.style.display="inline-block";
+  }else if(s.available&&s.needs_update){
+    const installed=s.release_tag||"legacy data";
+    out.textContent=`Update required — ${installed} is installed; SIDFlow ${s.supported_release||"0.8.0"} is required for the new weighted neighbour model.`;
+    dl.textContent=`Update to SIDFlow ${s.supported_release||"0.8.0"}`;rm.style.display="inline-block";
   }else{
     const issue=j.error||s.error||"";
     out.textContent=issue?`Not available — ${issue}`:"Not downloaded — More like this and Radio will offer to install it.";
@@ -2741,7 +2954,7 @@ async function sidflowStatusLoad(){
     if($("#sidflowStatus"))$("#sidflowStatus").textContent="SIDFlow status unavailable: "+e.message;return null}
 }
 async function sidflowDownload(skipConfirm=false){
-  if(!skipConfirm&&!confirm("Download the latest SIDFlow similarity export?\n\nThe full source may be several hundred MB, is checksum-verified, slimmed to a compact local database, and then deleted."))return false;
+  if(!skipConfirm&&!confirm("Download the pinned SIDFlow 0.8.0 similarity export?\n\nThe download is about 194 MB. It expands temporarily to about 982 MB and needs roughly 1.8 GiB free while u64deck verifies, imports and safely promotes the new database. Your current working SIDFlow database is kept unless the entire update succeeds."))return false;
   try{const s=await api("/api/sidflow/download",{method:"POST",timeoutMs:10000});sidflowStatusRender(s);toast("SIDFlow similarity download started","ok");return true}
   catch(e){toast(e.message,"err");return false}
 }
@@ -2752,7 +2965,11 @@ async function sidflowRemove(){
 }
 async function sidflowEnsure(){
   const s=await sidflowStatusLoad();
-  if(s?.available&&!s?.quality_warning)return true;
+  if(s?.available&&!s?.needs_update&&!s?.quality_warning)return true;
+  if(s?.needs_update){
+    if(confirm(`SIDFlow ${s.supported_release||"0.8.0"} is required for the improved weighted recommendations.\n\nUpdate it now?`))await sidflowDownload(true);
+    tab("settings");return false
+  }
   if(s?.quality_warning){toast(s.quality_warning,"err");tab("settings");return false}
   if(s?.job?.running){toast("SIDFlow similarity data is still being prepared","ok");tab("settings");return false}
   if(confirm("More like this and Radio use SIDFlow similarity data by Chris Gleissner.\n\nDownload and prepare it now?")){
@@ -2821,5 +3038,6 @@ for(const id of ["fslist","inspector"]){
 }
 
 /* ---------- boot ---------- */
-loadQuality();loadTransport();loadIfaces();loadBootOptions();loadMountOptions();loadRecSettings();setAudioState("off",0);clearVideoCanvas();itemsLoad();qlRefresh();refreshDrives();idxPollStart();
+loadQuality();loadTransport();loadIfaces();loadBootOptions();loadMountOptions();loadRecSettings();setAudioState("off",0);clearVideoCanvas();itemsLoad();qlRefresh();idxPollStart();
+renderDrivePanel("Waiting for the Ultimate connection before reading drive status…");
 loadInfo();setInterval(loadInfo,30000);
