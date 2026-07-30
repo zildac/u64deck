@@ -145,11 +145,19 @@ jobs:
             if ($p.ExitCode -ne 0) { throw "u64deck.exe exited with code $($p.ExitCode)" }
 
             $stdout = if (Test-Path $stdoutPath) { Get-Content $stdoutPath -Raw } else { "" }
-            $expectedBanner = "u64deck v$env:U64DECK_EXPECTED_VERSION · $env:U64DECK_EXPECTED_RELEASE · build $env:U64DECK_EXPECTED_BUILD"
-            if (-not $stdout.Contains($expectedBanner)) {
-              throw "EXE startup banner did not report the documented identity. Output: $stdout"
+            # Redirected Windows console output can replace the decorative U+00B7
+            # separators when the runner's capture encoding differs. Assert the
+            # identity-bearing fields independently so encoding cannot weaken or
+            # falsely fail the version/release/build guarantee.
+            $expectedBannerVersion = "u64deck v$env:U64DECK_EXPECTED_VERSION"
+            $expectedBannerRelease = $env:U64DECK_EXPECTED_RELEASE
+            $expectedBannerBuild = "build $env:U64DECK_EXPECTED_BUILD"
+            if (-not $stdout.Contains($expectedBannerVersion) -or
+                -not $stdout.Contains($expectedBannerRelease) -or
+                -not $stdout.Contains($expectedBannerBuild)) {
+              throw "EXE startup banner did not report the documented version, release and build. Output: $stdout"
             }
-            Write-Host "frozen banner identity OK: $expectedBanner"
+            Write-Host "frozen banner identity OK: $expectedBannerVersion / $expectedBannerRelease / $expectedBannerBuild"
             Write-Host "normal Edge app, graceful cleanup, EXE exit and console retirement OK"
           } finally {
             $p.Refresh()
