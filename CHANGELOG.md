@@ -1,5 +1,206 @@
 # Changelog
 
+## 1.9.0 — Release Candidate 44
+
+**Public release-candidate build:** `fc1e0fb`
+
+- Corrects IPv4-mapped IPv6 loopback handling for `/api/app/exit` by unmapping the embedded IPv4 address before applying the loopback test. This is portable across the Python 3.12 Windows build runner and later Python versions.
+- Sets `proxy_headers=False` explicitly in the managed Uvicorn configuration so forwarded headers cannot influence the client address used by local-only Exit enforcement.
+- Serialises the Exit request check-and-set with a module-level lock so concurrent confirmed requests schedule shutdown exactly once.
+- Hides **Exit u64deck** in the initial HTML and reveals it only after `/api/app_config` confirms the control is locally available.
+- Retains the GitHub executable smoke check requiring an unconfirmed Exit request to return HTTP 403.
+- Supersedes the first public RC44 package (`490d847`). That package contained the mapped-loopback test without the corresponding Python 3.12-compatible implementation, so its reported all-green validation was not valid for the target Windows CI environment.
+- Applies a presentation-only sentence-case audit across tooltips, helper text, status copy, dropdown labels and user-facing notifications. Technical names and abbreviations such as WebSocket, SIDFlow, CIA1, REST, CPU, RAM, D64/D71/D81 and HVSC retain their established casing.
+- Corrects the live audio-rate tooltip to **Audio WebSocket chunks received per second** and capitalises the remaining literal tooltip text consistently throughout Screen, Storage, Settings, Assembly64 and SID Jukebox.
+- Aligns dynamically generated tooltips and concise status/toast messages with the same sentence-case rule, including recording, indexing, disk-image actions, queue controls and Health history labels.
+- No input, Mount & Run, Retro Replay, Reset/Reboot, readiness polling, streaming, recording, SID/Jukebox, discovery, routing, firmware-settings, SQLite or device-control behaviour changed from RC43.
+- Public promotion packaging now writes the exact source build ID into the PyInstaller bundle. Frozen `release.py` reads that stamp instead of recomputing from a bundle without top-level Python sources.
+- The Windows workflow records the documented source identity, verifies the generated stamp, checks the frozen API and startup banner against it, and exercises the rejected HTTP 403 Exit path before the confirmed graceful Exit smoke.
+- Adds `.gitattributes` LF rules for Python, JavaScript, HTML and CSS so the source fingerprint remains stable on the Windows CI runner.
+- Restores the explicit Legacy/Retro Replay best-effort carry in README and Help: tested C64U + Retro Replay only, allow approximately 3–5 seconds between Reset/Reboot and Mount & Run, other freezer/fastload cartridges not comprehensively tested, and no occurrence observed on CIA1.
+
+## 1.9.0 — Release Candidate 43
+
+**Local release-candidate build:** `4f7723b`
+
+- Fixes the Auto F7 tooltip on confirmed Legacy devices whose input-capability response omits `pending` or uses non-boolean values. The header, input badge, effective Auto F7 state, tooltip, Legacy F7 suppression and cartridge guidance now use one shared input-mode classifier.
+- Adds regression coverage for Legacy responses with `available=false`, `available=0` and omitted `pending`, plus normal CIA1 and capability-pending responses.
+- This is a frontend-only input-mode consistency correction. Standalone Reset/Reboot readiness monitoring, Mount & Run, CIA1 matrix F7, Legacy LOAD/RUN delivery and cartridge handling are unchanged.
+
+## 1.9.0 — Release Candidate 42
+
+**Local release-candidate build:** `26d60ed`
+
+- Makes the standalone Legacy + Retro Replay Reset/Reboot guidance self-clearing. The informational overlay still does not detect the physical F7 keypress or hold the coordinator; instead, the browser requests one short `$00CC` BASIC-readiness sample at a time and requires two consecutive ready readings.
+- Each standalone readiness sample uses status priority, expires quickly rather than waiting behind another device operation, and releases the coordinator immediately. When Fastload/BASIC is detected, the overlay briefly shows **Fastload detected — ready** and then disappears. Firmware without `machine:readmem` retains the existing **Dismiss**-only behaviour.
+- Fixes the Auto F7 tooltip mode selection when Legacy capability is represented by a falsey non-boolean value. Detected Legacy devices now reliably show the Legacy/Freeze Menu explanation; CIA1 devices retain the automatic-F7 wording.
+- Updates README and in-app Help. Mount & Run readiness, CIA1 Auto F7, Legacy LOAD/RUN delivery, cartridge preflight and all unrelated RC41 behaviour remain unchanged.
+
+## 1.9.0 — Release Candidate 41
+
+**Local release-candidate build:** `3196caf`
+
+- Recognises the Ultimate firmware cartridge identifiers `rr38pal` and `rr38ntsc` as Retro Replay rather than treating the supported cartridge as unknown.
+- Uses distinct cartridge-startup wording for CIA1 and Legacy input. Legacy prompts explain that only automatic F7 is unavailable and require the physical C64 keyboard; CIA1 prompts never mention the Legacy Freeze Menu limitation.
+- Adds a non-blocking **Physical F7 required** Screen-Mirror overlay after standalone Reset/Reboot when Legacy input, Retro Replay and the saved Auto F7 preference are active. The card has **Dismiss** and performs no key polling, coordinator hold or timeout.
+- Keeps the existing active Mount & Run overlay separate: it still waits for BASIC readiness, then continues with LOAD and RUN automatically.
+- Expands the Auto F7 tooltip to explain the detected-mode behaviour and retained preference. Informational overlays are cleared by another Reset/Reboot, Mount & Run, device change, CIA1 detection or a temporary CRT launch.
+- Updates README and in-app Help. CIA1 F7 automation, Legacy LOAD/RUN delivery, readiness gates, cartridge preflight, temporary-CRT normalisation and all unrelated RC40 behaviour remain unchanged.
+
+## 1.9.0 — Release Candidate 40
+
+**Local release-candidate build:** `0d58cba`
+
+- Makes Auto F7 cartridge-aware. Before Mount & Run, u64deck reads the current firmware **C64 and Cartridge Settings → Cartridge** value and records its classification and source in Diagnostics.
+- With no configured cartridge, Mount & Run follows the normal BASIC readiness, LOAD and RUN path with no F7 action and no Screen-Mirror prompt.
+- Limits automatic fastload-menu handling to the hardware-tested **Retro Replay** flow: CIA1 retains automatic matrix F7, while Legacy retains the physical-F7 overlay and never receives buffer-injected F7.
+- Uses a generic **Cartridge startup requires attention** overlay for other configured cartridges and sends no guessed function key.
+- Maintains a per-device cartridge cache for UI/Diagnostics, refreshing it on device connection, firmware Cartridge changes, Load from Flash, Factory Defaults and Reboot. Mount & Run still performs a live preflight; only a recent same-device cache may be used as a short fallback, otherwise the operation stops before reset.
+- Tracks CRT images launched directly through u64deck as temporary runner-cartridge state. The next Mount & Run performs one full Ultimate reboot to clear that temporary CRT, restores the firmware-configured cartridge, and then performs the live cartridge preflight.
+- Updates README and in-app Help to state that Legacy fastload handling is currently supported for Retro Replay. Existing explicitly configured non-F7 advanced boot keys remain unchanged. CIA1 input, Legacy LOAD/RUN delivery, readiness gates, SID playback, streaming, recording, discovery, routing and SQLite behaviour are unchanged.
+
+## 1.9.0 — Release Candidate 39
+
+**Local release-candidate build:** `0407287`
+
+- Replaces unreliable Retro Replay F7 injection on detected Legacy KERNAL-buffer devices with a physical-key handoff. Hardware testing showed that injected PETSCII code 136 can enter the cartridge Freeze Menu while the physical C64 F7 key remains reliable.
+- Keeps the saved **Auto F7 Fastload** preference intact but disables it as an effective capability while Legacy input is active. CIA1-capable devices retain the existing fully automatic matrix F7 path unchanged.
+- During Legacy Mount & Run, overlays a compact persistent **Physical F7 required** card on the live Screen Mirror, continues automatically once BASIC readiness is detected, and provides **Cancel Mount & Run**. Firmware without `machine:readmem` receives an explicit **Continue** confirmation after BASIC READY.
+- Suppresses remote Screen-Mirror F7 on Legacy input and suppresses automatic Legacy F7 after u64deck Reset/Reboot actions. Other Legacy keys and the established Legacy LOAD/RUN command-buffer delivery remain unchanged.
+- Extends browser-side Mount & Run request deadlines so the persistent prompt and genuine long disk loads are not abandoned by the normal short device-request timeout. Local busy/status polling remains available throughout.
+- Updates README and in-app Help to describe the hardware-tested split accurately. No CIA1 keyboard, LOAD/RUN readiness gate, SID, streaming, recording, discovery, routing, SQLite or firmware-settings behaviour changed.
+
+## 1.9.0 — Release Candidate 38
+
+**Local release-candidate build:** `39b03b5`
+
+- Displays the automatic Screen & Recording network-interface choice as **AUTO**, including the resolved interface address, to match the existing recording Format enum presentation. The stored interface value remains unchanged.
+- Retains RC37's verified Assembly64 first-mount multi-disk handling, scalable disk-image naming controls, Play Queue scrolling and Health presentation. No streaming route, recording, input, Mount & Run, SID, discovery or device-control behaviour changed.
+
+## 1.9.0 — Release Candidate 37
+
+**Local release-candidate build:** `01f377b`
+
+- Capitalises the primary connection states as **Connecting…** and **Reconnecting…**.
+- Fixes Assembly64 multi-disk detection on the first clean mount. The release-file manifest is matched before deployment, only the confident disk family is downloaded, Disk Swap is armed in memory, and the disk selected by the user is mounted or started. Single and ambiguous releases remain unchanged.
+- Replaces **Approve all shown** with **Approve all ambiguous (count)** so large disk-image catalogues can approve every current ambiguous set rather than only representative examples. Large approvals receive an extra confirmation.
+- Renames **Copy Report** to **Copy Analysis Report** and pages approved exact sets 50 at a time so collections with hundreds or thousands of approvals do not create an impractically large panel.
+- Retains RC36's verified Play Queue scrolling and Health presentation. No Legacy/CIA1 input, Mount & Run command delivery, SID playback, fade, discovery, routing or firmware-settings behaviour changed.
+
+## 1.9.0 — Release Candidate 36
+
+**Local release-candidate build:** `76f90cf`
+
+- Corrects the Play Queue current-row reveal calculation to use the row and scroll-container bounding rectangles, so automatic reveal and **◎ Current** position the actual playing row instead of jumping roughly ten rows ahead.
+- Strengthens the Health dashboard hierarchy by making panel headings larger than live status text, slightly enlarging metric labels and badges, and adding a little more row spacing.
+- Standardises visible Health status casing, including **Online**, **Both Receiving**, **Idle**, **Indexer Idle**, **Running**, **Ready**, **Not Requested** and **Auto-updated**.
+- No playback, queue order, SIDFlow, recording, Health calculations, polling, Diagnostics or device-control behaviour changed.
+
+## 1.9.0 — Release Candidate 35
+
+**Local release-candidate build:** `8bc12c1`
+
+- Refines the primary header presentation: vertically centres the decorative stars and standardises device labels as **FW**, **Core** and **Input: CIA1/Legacy KERNAL buffer**.
+- Moves the occasional-use Ultimate firmware configuration into a collapsed section below **Search Index & Cache**, keeping index statistics and SIDFlow controls visible without scrolling while firmware settings continue to load normally in the background.
+- Improves SID Jukebox readability by enlarging the Songlengths/SIDFlow information line, adding thousands separators and capitalising visible recording option labels without changing their stored values.
+- Rebalances Play Queue columns so Title and Author stay visually associated, adds full-name hover text, and replaces redundant SIDFlow provenance with **More like &lt;seed tune&gt;** or **SIDFlow Radio**.
+- Makes the playing queue row unmistakable with a persistent ▶ marker, stronger row highlight and wider left accent distinct from hover. Playback changes reveal the row once, and **◎ Current** jumps back to it without continuous forced scrolling.
+- Makes no recommendation-ranking, queue-ordering, fade, recording, Settings API, SQLite, discovery, routing, Mount & Run, input or machine-control changes from RC34.
+
+## 1.9.0 — Release Candidate 34
+
+**Local release-candidate build:** `95872f5`
+
+- Enlarges the primary header identity and connected-device status so the u64deck version, release/build, Ultimate model, firmware, core, hostname, active interface and input method are easier to read at a glance.
+- Uses the same larger status styling for connecting, reconnecting and busy messages.
+- Reduces the secondary flashing `READY.` line slightly so it no longer visually outranks the primary status information.
+- Makes no queue, SIDFlow, SID-index, fade, storage-index, discovery, routing, Settings, Mount & Run, input or machine-control changes from RC33. The earlier SIDFlow failure was confirmed to be caused by copying an unpopulated SQLite index rather than by an upgrade or database migration.
+
+## 1.9.0 — Release Candidate 33
+
+**Local release-candidate build:** `550c763`
+
+- Fixes SIDFlow local-presence filtering when the SID metadata catalogue is only partially populated. u64deck now unions metadata-backed paths with every indexed `.sid` file beneath the configured HVSC root instead of treating any non-empty metadata table as complete.
+- Prevents playing or indexing one SID from making **More like this** or Radio incorrectly report that no matching tunes are present while the full collection still exists in the storage index.
+- Removes the old SQLite file-stat presence cache from the recommendation path because WAL-backed index changes can be live without changing the main database file timestamp.
+- Adds SIDFlow candidate Diagnostics with metadata-path, file-index, combined mapped, played/recent, queue, excluded, ranked and final result counts.
+- Leaves the hardware-verified RC31 fade handoff and the working RC32 queue auto-advance, Currently Playing presentation and Year filter unchanged.
+
+## 1.9.0 — Release Candidate 32
+
+**Local release-candidate build:** `29bdf7b`
+
+- Separates active SID playback generation from Play Queue revision. Adding individual SIDs, inserting **More like this** recommendations, or removing a non-current queue entry no longer invalidates the current tune's auto-advance timer; the queue continues in order regardless of how future entries were added.
+- Keeps current-entry removal, direct playback replacement, Stop, Reset, Reboot and other machine takeovers on the existing generation-invalidating path.
+- Enlarges the Currently Playing title, chip badge, subtune and duration presentation for improved readability.
+- Clarifies the small ♪ queue-row action: it uses that row as the SIDFlow similarity seed and inserts matches after the currently playing tune, while the larger **More like this** action uses Now Playing.
+- Adds an exact four-digit **Year** filter to SID search. It combines with text, Chip and Format and matches a standalone 1900–2099 year extracted from indexed SID release metadata.
+- Leaves the RC31 streamed fade handoff, live PCM audio quality, native Screen Mirror stream, disk-image analysis, Finder, routing, Mount & Run and Legacy/Retro Replay safeguards unchanged.
+
+## 1.9.0 — Release Candidate 31
+
+**Local release-candidate build:** `d36c50e`
+
+- Fixes the streamed SID fade transition so browser gain remains locked at zero after the fade completes. u64deck now waits for a new backend playback generation, clears any buffered tail from the previous SID, and only then restores full gain for the replacement tune.
+- While streamed fade is enabled for a matched Songlengths tune, the fade duration replaces the separate `sid_jukebox_end_grace_secs` allowance rather than being combined with it. Unknown-length fallback timing remains unchanged.
+- Manual Next, Previous, direct queue/subtune selection and one-tune replacement mute and clear the outgoing browser audio while the replacement starts; a failed replacement restores normal gain.
+- Adds a **＋** action beside SID entries in Favourites and Recently Used so an individual favourite SID can be appended to the current play queue without interrupting playback. The existing **Play** action still creates and starts a one-tune queue.
+- Leaves the uncompressed live audio mirror, fixed native 384×272 screen-mirror stream, RC29 disk-image analysis, Finder, routing, Mount & Run and Legacy/Retro Replay safeguards unchanged.
+
+## 1.9.0 — Release Candidate 30
+
+**Local release-candidate build:** `e074d2d`
+
+- Adds an optional **Fade streamed SID ending** control to the SID Jukebox, enabled by default at 2.5 seconds and adjustable from 1 to 5 seconds in the UI.
+- For matched Songlengths tunes, starts a linear browser gain fade at the documented endpoint, extends only the selected subtune's compact `.ssl` duration by the fade allowance, and waits for the fade to complete before auto-advance. Unknown-length fallback tunes retain their existing timing and do not fade.
+- Applies the fade to audio heard through the u64deck browser and to browser recordings. The UI and Help explicitly state that Ultimate HDMI and analogue output do not fade; they remain at full volume until the extended native endpoint.
+- Uses the existing Jukebox generation/state model to cancel stale fades on Next, Previous, direct selection, Stop and replacement playback. Reloading or starting browser audio during a tune reconstructs the remaining fade from backend monotonic timing.
+- Keeps RC29 disk-image analysis, batch approvals, local-rule reset, Finder, routing, Mount & Run, Legacy/Retro Replay safeguards, SIDFlow and Settings readiness behaviour unchanged.
+
+## 1.9.0 — Release Candidate 29
+
+**Local release-candidate build:** `3f024f1`
+
+- Adds checkbox-based **Approve selected**, **Approve all shown** and per-row **Approve folder** actions for ambiguous disk-image naming results. Batch approval always creates exact ordered set overrides; it never creates a reusable filename pattern.
+- Shows a confirmation summary with the affected set, file and folder counts before any ambiguous batch approval is written. Protected/rejected naming families remain excluded from batch approval.
+- Adds bulk enable, disable and remove controls for approved exact sets.
+- Adds **Remove all local approvals**, protected by two confirmations, to remove every user-approved reusable rule and exact-set override in one rollback-safe SQLite transaction. Built-in grouping, files and index entries are not changed.
+- Makes the optional behaviour explicit: users who never run the analyser receive only the built-in matcher; analysis itself remains read-only, while previously approved local rules continue to apply automatically.
+- No Finder, routing, Settings readiness, SIDFlow, Jukebox timing, streaming, Mount & Run, stale-operation protection or Legacy/Retro Replay workaround behaviour changed from RC28.
+
+## 1.9.0 — Release Candidate 28
+
+**Local release-candidate build:** `f6f6794`
+
+- Adds case-insensitive automatic grouping for terminal hyphen-delimited disk pairs such as `the-hat-7a825b1-a.d64` / `the-hat-7a825b1-b.d64`, while retaining the unsuffixed-sibling veto and all established ambiguity safeguards.
+- Adds **Settings → Search Index & Cache → Analyse Disk-Image Names**, a read-only analysis of D64, D71, D81 and G64 filenames already present in the SQLite index. It reports recognised sets, high-confidence unrecognised patterns, ambiguous candidates and protected/rejected naming families with counts, examples and a copyable text report.
+- Allows a high-confidence analyser result to be approved only after explicit preview and confirmation, either globally or for one folder. Approved reusable rules use a constrained terminal/delimiter/marker/extension/scope model; arbitrary regular expressions are not accepted.
+- Adds confirmed exact ordered set overrides for one-off naming conventions, plus enable, disable and remove controls for both reusable rules and exact sets. Local approvals persist across index refreshes, index rebuilds and Clear Storage Index, and apply immediately without renaming or modifying any files.
+- Keeps GoodTools `[a]` / `[b]`, matching unsuffixed siblings, glued sequel-like numbering and other ambiguous families protected from reusable automatic approval.
+- Adds SQLite schema v5 tables for local disk-grouping rules and exact-set overrides, surfaces their counts in index statistics and records approval/state/removal operations in Diagnostics.
+- No Finder, routing, Settings readiness, SIDFlow, Jukebox timing, streaming, Mount & Run command delivery, stale-operation protection or Legacy/Retro Replay workaround behaviour changed from RC27.
+
+## 1.9.0 — Release Candidate 27
+
+**Local final-candidate build:** `2fa9f8e`
+
+- Gates the firmware Settings category reads on the normal successful Ultimate information check. A startup or Ctrl+F5 refresh now shows a neutral waiting/retrying state and automatically loads Settings when the connection is ready instead of surfacing an early connection refusal.
+- Retries transient Settings category-list and category-detail reads within bounded limits. A persistent failure remains visible with a manual retry control; mutating Apply/Save/Load/Factory actions are not automatically replayed.
+- Makes backend Settings diagnostics name the exact operation that failed, including category-list reads, category-detail reads, item writes, bulk apply and firmware actions.
+- Documents the hardware-tested Legacy/Retro Replay timing limitation: rapid Reset, Reboot or Mount & Run transitions can intermittently enter the Freeze Menu; allow approximately 3–5 seconds between transitions. RC26 stale-operation protections remain enabled. Other freezer cartridges have not been comprehensively tested, and the issue was not observed with CIA1 matrix input.
+- No Mount & Run sequence, SID Stop path, CIA1 input, Legacy key mapping, discovery, routing, streaming, SIDFlow, Jukebox timing, storage or index behaviour changed from RC26.
+
+## 1.9.0 — Release Candidate 26
+
+**Local hardware-test build:** `9ed2b85`
+
+- Prevents manual Legacy keyboard requests from waiting behind a long device operation and arriving after the C64 or cartridge has changed state. Screen-mirror and type-line requests are rejected while Mount & Run owns the device and otherwise expire after two seconds without sending any byte.
+- Prevents manual Reset and Reboot requests from being queued during Mount & Run. Duplicate Reset/Reboot requests are coalesced, and a request that cannot reach the device within two seconds expires with a clear message rather than executing later.
+- Records expired coordinator operations separately from cancellations. Legacy delivery diagnostics now include the request origin, byte count, decimal codes and measured wait for boot prekeys, Mount & Run LOAD/RUN and manual Legacy input.
+- Adds matching browser-side guards so Legacy screen-mirror keys, typed text and manual Reset/Reboot controls report that they were not queued while Mount & Run is active. Backend enforcement remains authoritative.
+- Deliberately leaves CIA1 matrix input, held-key handling, `release_all`, Jukebox Stop's immediate/fallback reset paths, Mount & Run's inline reset, SID playback, streaming, discovery and SIDFlow behaviour unchanged.
+- This is a local hardware-test build focused on reproducing the previously observed Retro Replay Fastload/Freeze interaction without stale keyboard or machine-control operations contaminating the sequence.
+
 ## 1.9.0 — Release Candidate 25
 
 **Public build:** `bd0bbaf`

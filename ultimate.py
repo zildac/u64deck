@@ -22,6 +22,8 @@ from ftplib import FTP, error_perm
 
 import httpx
 
+from device_coordinator import OperationExpired
+
 # TCP command socket opcodes (port 64)
 CMD_KEYB = 0xFF03
 CMD_RESET = 0xFF04
@@ -332,9 +334,9 @@ class CommandSocket:
         self._lock = threading.Lock()
         self._type_lock = threading.Lock()
 
-    def _operation(self, reason: str):
+    def _operation(self, reason: str, **kwargs):
         coordinator = getattr(self, "coordinator", None)
-        return coordinator.operation("interactive", reason) if coordinator else nullcontext()
+        return coordinator.operation("interactive", reason, **kwargs) if coordinator else nullcontext()
 
     def _ensure(self):
         if self._sock is None:
@@ -397,19 +399,59 @@ class CommandSocket:
                 raise UltimateError(
                     f"cannot reach command socket {self.host}:{self.port}") from exc
 
-    def type_petscii(self, data: bytes, chunk: int = 8, delay: float = 0.02):
+    def type_petscii(
+        self,
+        data: bytes,
+        chunk: int = 8,
+        delay: float = 0.02,
+        *,
+        max_wait_seconds: float | None = None,
+        reason: str = "keyboard input",
+    ) -> dict:
         """Inject PETSCII bytes into the KERNAL keyboard buffer in order.
 
         FastAPI may run multiple /api/keys requests on different worker
-        threads.  Keep the complete character sequence under one lock so
+        threads. Keep the complete character sequence under one lock so
         separate browser batches cannot overtake or interleave one another.
+
+        ``max_wait_seconds`` is used only by time-sensitive manual Legacy
+        input. Internal Mount & Run and boot-prekey delivery retain their
+        established unlimited/re-entrant path.
         """
-        with self._type_lock:
-            with self._operation("keyboard input"):
+        requested_at = time.time()
+        wait_started = time.monotonic()
+        acquired_type_lock = False
+        try:
+            if max_wait_seconds is None:
+                self._type_lock.acquire()
+                acquired_type_lock = True
+                remaining = None
+            else:
+                limit = max(0.0, float(max_wait_seconds))
+                acquired_type_lock = self._type_lock.acquire(timeout=limit)
+                if not acquired_type_lock:
+                    raise OperationExpired(
+                        f"{reason} expired while waiting for ordered keyboard input"
+                    )
+                remaining = max(0.0, limit - (time.monotonic() - wait_started))
+            with self._operation(
+                reason,
+                max_wait_seconds=remaining,
+            ):
+                delivered_at = time.time()
                 for i in range(0, len(data), chunk):
                     self._send(CMD_KEYB, data[i:i + chunk])
                     if i + chunk < len(data):
                         time.sleep(delay)
+            return {
+                "requested_at": requested_at,
+                "delivered_at": delivered_at,
+                "wait_seconds": max(0.0, delivered_at - requested_at),
+                "sent": len(data),
+            }
+        finally:
+            if acquired_type_lock:
+                self._type_lock.release()
 
     def stream_on(self, stream_id: int, dest: str = ""):
         payload = b"\x00\x00" + dest.encode("ascii")   # duration 0 = forever

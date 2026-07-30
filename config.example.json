@@ -19,6 +19,8 @@
   "songlengths_path": "",
   "sid_default_secs": 180,
   "sid_jukebox_end_grace_secs": 0.5,
+  "sid_jukebox_browser_fade_enabled": true,
+  "sid_jukebox_browser_fade_secs": 2.5,
   "sid_local_source": "",
   "sid_index_root": "",
   "hvsc_path": "",

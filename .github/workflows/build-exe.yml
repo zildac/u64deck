@@ -35,8 +35,28 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         run: python gallery_check.py
 
+      - name: Record expected release identity
+        shell: pwsh
+        run: |
+          $identity = python -c "from pathlib import Path; from release import VERSION, RELEASE_LABEL, source_build_id; print(VERSION + '|' + RELEASE_LABEL + '|' + source_build_id(Path('.'), Path('.')))"
+          $parts = $identity.Trim().Split('|')
+          if ($parts.Count -ne 3) { throw "Could not determine expected release identity: $identity" }
+          "U64DECK_EXPECTED_VERSION=$($parts[0])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "U64DECK_EXPECTED_RELEASE=$($parts[1])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "U64DECK_EXPECTED_BUILD=$($parts[2])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Expected identity: v$($parts[0]) · $($parts[1]) · $($parts[2])"
+
       - name: Build
         run: pyinstaller u64deck.spec
+
+      - name: Verify packaging build stamp
+        shell: pwsh
+        run: |
+          $stamp = (Get-Content "build/u64deck-build-id.txt" -Raw).Trim()
+          if ($stamp -ne $env:U64DECK_EXPECTED_BUILD) {
+            throw "Packaging stamp '$stamp' does not match expected build '$env:U64DECK_EXPECTED_BUILD'"
+          }
+          Write-Host "packaging build stamp OK: $stamp"
 
       - name: Verify embedded executable icon
         shell: pwsh
@@ -55,11 +75,15 @@ jobs:
           print("embedded icon resources OK")
           '@ | python -
 
-      - name: Smoke test normal Edge app exit
+      - name: Smoke test normal Edge app exit and frozen identity
         shell: pwsh
         run: |
           $profileNeedle = "u64deck\EdgeProfile"
-          $p = Start-Process -FilePath "dist/u64deck.exe" -ArgumentList "--u64","203.0.113.9" -PassThru
+          $stdoutPath = Join-Path $env:RUNNER_TEMP "u64deck-stdout.log"
+          $stderrPath = Join-Path $env:RUNNER_TEMP "u64deck-stderr.log"
+          Remove-Item $stdoutPath,$stderrPath -Force -ErrorAction SilentlyContinue
+          $p = Start-Process -FilePath "dist/u64deck.exe" -ArgumentList "--u64","203.0.113.9" `
+            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
           $ready = $false
           $edgeStarted = $false
           $deadline = (Get-Date).AddSeconds(35)
@@ -68,7 +92,8 @@ jobs:
               Start-Sleep -Milliseconds 500
               $p.Refresh()
               if ($p.HasExited) {
-                throw "u64deck.exe exited before the UI became ready (exit code $($p.ExitCode))"
+                $stderr = if (Test-Path $stderrPath) { Get-Content $stderrPath -Raw } else { "" }
+                throw "u64deck.exe exited before the UI became ready (exit code $($p.ExitCode)): $stderr"
               }
               try {
                 $r = Invoke-WebRequest -Uri "http://127.0.0.1:8064/" -UseBasicParsing -TimeoutSec 2
@@ -82,6 +107,25 @@ jobs:
 
             if (-not $ready) { throw "UI did not serve within 35 seconds" }
             if (-not $edgeStarted) { throw "dedicated Edge app process was not observed" }
+
+            $identity = Invoke-RestMethod -Uri "http://127.0.0.1:8064/api/app_config" -TimeoutSec 5
+            if ($identity.version -ne $env:U64DECK_EXPECTED_VERSION) {
+              throw "EXE API version '$($identity.version)' does not match '$env:U64DECK_EXPECTED_VERSION'"
+            }
+            if ($identity.release_label -ne $env:U64DECK_EXPECTED_RELEASE) {
+              throw "EXE API release '$($identity.release_label)' does not match '$env:U64DECK_EXPECTED_RELEASE'"
+            }
+            if ($identity.build -ne $env:U64DECK_EXPECTED_BUILD) {
+              throw "EXE API build '$($identity.build)' does not match documented source build '$env:U64DECK_EXPECTED_BUILD'"
+            }
+            Write-Host "frozen API identity OK: v$($identity.version) · $($identity.release_label) · $($identity.build)"
+
+            $rejected = Invoke-WebRequest -Uri "http://127.0.0.1:8064/api/app/exit" `
+              -Method Post -UseBasicParsing -TimeoutSec 5 -SkipHttpErrorCheck
+            if ($rejected.StatusCode -ne 403) {
+              throw "Unconfirmed Exit request returned $($rejected.StatusCode), expected 403"
+            }
+            Write-Host "unconfirmed local Exit rejection OK: HTTP 403"
 
             $exit = Invoke-WebRequest -Uri "http://127.0.0.1:8064/api/app/exit" `
               -Method Post -Headers @{"X-U64deck-Local-Exit"="1"} `
@@ -99,6 +143,13 @@ jobs:
             if (-not $p.HasExited) { throw "u64deck.exe and its console remained after Exit u64deck" }
             if ($edgeRemaining) { throw "dedicated Edge app process remained after Exit u64deck" }
             if ($p.ExitCode -ne 0) { throw "u64deck.exe exited with code $($p.ExitCode)" }
+
+            $stdout = if (Test-Path $stdoutPath) { Get-Content $stdoutPath -Raw } else { "" }
+            $expectedBanner = "u64deck v$env:U64DECK_EXPECTED_VERSION · $env:U64DECK_EXPECTED_RELEASE · build $env:U64DECK_EXPECTED_BUILD"
+            if (-not $stdout.Contains($expectedBanner)) {
+              throw "EXE startup banner did not report the documented identity. Output: $stdout"
+            }
+            Write-Host "frozen banner identity OK: $expectedBanner"
             Write-Host "normal Edge app, graceful cleanup, EXE exit and console retirement OK"
           } finally {
             $p.Refresh()

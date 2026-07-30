@@ -30,7 +30,7 @@ when testing the Ethernet REST endpoint itself.
 
 # u64deck
 
-**v1.9.0 — Release Candidate 25 · build bd0bbaf**
+**v1.9.0 — Release Candidate 44 · build fc1e0fb**
 
 
 A lightweight, self-hosted control deck for the **Ultimate 64** (and, minus the
@@ -42,6 +42,13 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
 - **Full settings access** — every configuration category the firmware exposes,
   editable in place (enums become dropdowns, ranges become number fields),
   with apply / save-to-flash / load-from-flash / factory-reset.
+- **Connection-ready Settings startup** — on first load or Ctrl+F5, firmware
+  settings wait for the normal Ultimate information check, show a neutral
+  waiting/retrying state and load automatically. Transient refused connections
+  are retried silently; only a bounded persistent failure is surfaced, and
+  Diagnostics names the exact Settings operation that failed. Search Index &
+  Cache remains visible near the top of Settings, while the occasional-use
+  Ultimate firmware configuration lives in a collapsed section below it.
 - **Disk images as first-class objects** — browse *inside* a D64/D71/D81
   (from Ultimate storage or a local file) and act on individual files:
   - **Run** — extracts just that PRG and DMA-runs it. No mounting, no
@@ -57,6 +64,13 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
   keys use CIA1 matrix-level press/release events, including held keys, chords,
   cracktros, games and the Ultimate menu. Older firmware and unsupported
   hardware fall back automatically to the established KERNAL keyboard buffer.
+- **Stale manual-operation protection** — Legacy screen-mirror keys and manual
+  Reset/Reboot requests are no longer allowed to sit behind a long Mount & Run
+  and execute against a later cartridge state. Legacy keys are rejected while
+  Mount & Run owns the device and expire after two seconds if still waiting;
+  Reset/Reboot are rejected or coalesced instead of being delivered late.
+  CIA1 matrix input, `release_all`, Jukebox Stop and Mount & Run's own inline
+  reset retain their established paths.
 - **System Health dashboard** — view cached Ultimate REST latency and
   reliability, stream throughput and gap history, browser render/audio health,
   device-queue contention, active-task phases, index throughput, cache hit rates,
@@ -109,10 +123,13 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
 - **Machine controls** — reset, reboot, pause/resume, menu button, power off.
   The menu button opens the on-device menu in the mirror; on matrix-capable
   firmware the Screen keyboard can navigate it remotely.
-- **Optional Retro Replay Fastload automation** — a persistent UI checkbox
-  presses F7 after u64deck-initiated resets/reboots and before mounted software
-  is loaded. Matrix-capable devices use a real F7 matrix tap; the legacy buffer
-  remains the fallback.
+- **Cartridge-aware Retro Replay Fastload handoff** — immediately before Mount
+  & Run, u64deck reads the live firmware Cartridge setting. With no cartridge it
+  follows normal BASIC startup. Retro Replay retains automatic matrix F7 on
+  CIA1-capable devices, while Legacy devices show a persistent Screen-Mirror
+  prompt for the reliable physical C64 F7 key. The firmware identifier
+  `rr38pal` is recognised as Retro Replay. Other cartridges receive a
+  mode-specific manual-startup prompt and no guessed function key.
 - **SQLite-backed storage index** — incremental, searchable indexing with
   automatic migration from legacy JSON caches, pause/resume, rates and ETA.
 - **Local USB index import** — remove a large collection stick from the Ultimate,
@@ -129,7 +146,7 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
   while discovery runs so the Ultimate REST service is not overloaded.
 - **Stream quality options** — low-latency vs all-frames buffering, sharp vs
   soft scaling, 2×/3×/fit sizing; remembered across sessions.
-- **Assembly64 workspace** — use a full-height, responsive two-pane search and release-file view to query the public Assembly64 database. Results include
+- **Assembly64 workspace** — use a full-height, responsive two-pane search and release-file view to query the public Assembly64 database. A confident multi-disk family is downloaded and armed as a Disk Swap queue on the first mount, while ambiguous releases remain single-disk. Results include
   labelled categories, ratings and readable update times; deploy straight to the
   machine by running PRGs/CRTs, mounting disk images, using Mount & Run, or
   browsing inside a downloaded D64 and running one file from it. Speaks the same protocol
@@ -430,7 +447,13 @@ files and uses sibling subtunes only when needed to fill the result set.
 the queue so one multi-subtune composition cannot dominate a station. SIDFlow's
 published graph is fixed at 25 neighbours per seed; when local-HVSC filtering or
 a long session exhausts it, u64deck can fill the remainder with its older local
-48-dimensional feature scan. That fallback is explicitly labelled
+48-dimensional feature scan. To determine which recommendations are actually
+present on the Ultimate, u64deck unions the ordinary indexed `.sid` file list
+with the optional SID metadata catalogue. A partial metadata scan — including a
+single metadata row written after playing one SID — therefore cannot hide the
+rest of an otherwise complete storage index. Zero-result Diagnostics report the
+metadata, file-index, mapped, excluded and final candidate counts. That fallback
+is explicitly labelled
 `u64deck-fallback` in the queue tooltip and Diagnostics and is never presented
 as SIDFlow's weighted result.
 
@@ -506,7 +529,7 @@ The repo includes a PyInstaller spec and a GitHub Actions workflow
 1. Push this folder to a GitHub repo.
 2. The **build-exe** action runs on every push — grab `u64deck.exe` from the
    workflow's artifacts (Actions tab → latest run → *u64deck-windows*).
-3. Tag a release (`git tag v1.9.0-rc.25 && git push --tags`) and the exe is attached
+3. Tag a release (`git tag v1.9.0-rc.44 && git push --tags`) and the exe is attached
    to the GitHub Release automatically.
 
 Double-click the exe: it starts the server, opens the dedicated Edge app, and
@@ -621,9 +644,12 @@ this by default (`cart_safe_run: true`): before a DMA run it blanks the
 Cartridge config item, runs, then writes the original value back. Config
 changes only apply at the next reset, so the launched program keeps
 running with the cart parked — and flash is never written, so even a
-worst-case crash is undone by a power cycle. CRT launches are exempt
-(they replace the cartridge by definition). Trade-off: while a program
-started this way runs, the freezer is inactive until the next reset.
+worst-case crash is undone by a power cycle. CRT launches are exempt because they replace the active cartridge by definition.
+u64deck records that temporary runner state. Before a later Mount & Run it
+performs one full Ultimate reboot, restores the firmware-configured cartridge,
+then reads that setting live before choosing any cartridge-startup action.
+Trade-off: while a program started through the cartridge-safe path runs, the
+freezer is inactive until the next reset.
 
 ### Cartridge boot menus (Retro Replay etc.)
 
@@ -632,20 +658,58 @@ cartridge like **Retro Replay** active, reset lands in the cart's boot menu
 first — and if the typed `LOAD` characters arrive while that menu is up, the
 menu interprets them (that's how you end up staring at the MC monitor).
 
-Mount & Run now waits for the machine before typing. After the normal reset
+Mount & Run waits for the machine before typing. After the normal reset
 settle, u64deck polls the KERNAL readiness flag at zero-page `$CC` and requires
 two consecutive ready readings before sending the `LOAD` line. On CIA1-capable
-Ultimate 64 firmware, RC15 delivers the complete `LOAD"*",8,1` command as one
+Ultimate 64 firmware, the complete `LOAD"*",8,1` command is delivered as one
 ordered matrix-input event batch, followed by matrix `RUN` after the post-load
 readiness gate. This avoids the port-64 eight-byte boundary that could
 intermittently discard the first `LOAD"*",` part during immediate repeated
-launches. Legacy-only C64 Ultimate firmware retains its established one-shot
-KERNAL-buffer LOAD and RUN path unchanged. Each readiness gate can wait for up
-to 2 minutes and records its result and delivery method in Diagnostics. If the
+launches. Legacy-only C64 Ultimate firmware retains the established
+KERNAL-buffer LOAD and RUN delivery. Each readiness gate can wait for up to 2
+minutes and records its result and delivery method in Diagnostics. If the
 machine remains busy, nothing further is typed and the UI reports whether
-`LOAD` or `RUN` was withheld. Firmware without `machine:readmem` retains the
-established fixed-delay readiness behaviour while still using the device's
-supported input transport.
+`LOAD` or `RUN` was withheld.
+
+Hardware testing isolated Retro Replay's intermittent Freeze Menu entry to F7
+injected through the **Legacy KERNAL keyboard buffer**. A physical C64 F7 key is
+reliable, and the CIA1 matrix-input path is unaffected. Legacy cartridge control
+remains best-effort on the tested C64 Ultimate + Retro Replay combination: allow
+approximately 3–5 seconds between Reset/Reboot actions and before starting Mount
+& Run. Other freezer/fastload cartridges have not been comprehensively tested.
+
+Before every Mount & Run, u64deck reads the current firmware
+**C64 and Cartridge Settings → Cartridge** value. That live preflight is the
+authoritative decision; a same-device cache is maintained for the UI and
+Diagnostics and is used only as a short, bounded fallback when an immediate
+firmware read fails. If neither can confirm the state, Mount & Run stops before
+resetting rather than guessing.
+
+The resulting behaviour is deliberately narrow:
+
+- **No configured cartridge:** normal BASIC readiness, LOAD and RUN; no F7 and
+  no cartridge prompt.
+- **Retro Replay + CIA1:** the saved Auto F7 preference uses the existing matrix
+  F7 path.
+- **Retro Replay + Legacy:** no buffer-injected F7 is sent. When Auto F7 is saved
+  as enabled, a persistent **Physical F7 required** card explains the Legacy
+  limitation, asks for physical C64 F7, and u64deck continues when BASIC is ready.
+- **Retro Replay with Auto F7 disabled:** the prompt wording follows the detected
+  input mode. CIA1 offers the physical keyboard or Screen controls; Legacy asks
+  for the physical C64 keyboard without claiming the cartridge is unsupported.
+- **Another configured cartridge:** no guessed F-key is sent. A mode-specific
+  **Cartridge startup requires attention** card says that automatic startup
+  handling is unrecognised and asks the user to reach BASIC manually.
+
+The Mount & Run cards include **Cancel Mount & Run**; firmware without `machine:readmem`
+also provides **Continue** after the user has reached BASIC READY. Remote Screen-Mirror F7 remains suppressed on Legacy input.
+After a standalone Reset or Reboot, Legacy + Retro Replay shows a separate informational
+**Physical F7 required** overlay with **Dismiss**. It does not attempt to detect the physical
+keypress or hold the coordinator. Instead, the browser performs one short BASIC-readiness
+check at a time and requires two consecutive ready readings; each probe releases the device
+coordinator immediately. When Fastload/BASIC is detected, the card briefly reports
+**Fastload detected — ready** and then clears automatically. Firmware without
+`machine:readmem` keeps the Dismiss-only behaviour. Automatic fastload-menu handling is currently supported and hardware-tested only for **Retro Replay**.
 
 During a slow genuine-drive load the Ultimate's embedded HTTP service can be
 unavailable even though the machine and mounted drive are operating normally.
@@ -655,13 +719,18 @@ offline device. Status is retried locally and refreshed immediately when the
 Mount & Run request completes; genuine connection failures outside that window
 continue to use the normal offline handling.
 
-The SCREEN tab has an **Auto F7 Fastload** checkbox. When enabled, u64deck
-presses F7 after Reset or Reboot actions started from its UI, selecting
-**INSTALL FASTLOAD** on the Retro Replay screen. It also applies to Mount & Run
-and Mount & Load so the LOAD command is not sent into the cartridge menu. The
-choice persists across restarts and is disabled by default. It only applies to
-resets/reboots initiated by u64deck; it cannot react to the Ultimate's physical
-reset button or resets triggered by software running on the C64.
+The SCREEN tab has an **Auto F7 Fastload** checkbox.
+The saved preference is retained across device changes, but it becomes effective only when the current
+firmware Cartridge setting is confirmed as Retro Replay. On CIA1-capable devices
+u64deck then uses matrix F7 after its own Reset/Reboot and during Mount & Run or
+Mount & Load startup. On Legacy devices the control is visibly disabled as an
+effective capability and its tooltip explains that physical C64 F7 is required
+because an emulated F7 can open the Freeze Menu. Standalone Reset/Reboot displays
+an informational overlay; Mount & Run displays the active waiting overlay. With no
+configured cartridge, Auto F7 is skipped and Mount & Run proceeds normally.
+Switching back to a CIA1-capable device restores the saved preference. The
+option is disabled by default and cannot react to physical-device or
+software-triggered resets.
 
 The corresponding advanced `config.json` settings are:
 
@@ -671,6 +740,9 @@ The corresponding advanced `config.json` settings are:
   or clears it. Other supported manual values are F1–F8, RETURN and SPACE.
 
 ## Favourites and recent items
+
+SID tune cards provide both **Play** and **＋**. Play starts a one-tune queue; ＋ appends the SID without interrupting current playback.
+
 
 The **FAVOURITES** tab is a lightweight launcher for commonly used content.
 Use the ☆ control in Ultimate storage, Assembly64, the SID browser/search/
@@ -699,6 +771,8 @@ audio remains connected. The audio badge separately shows its connection state
 and, while live, the received chunk rate (normally about 31/s).
 
 ## SID Jukebox
+
+The Currently Playing line uses a larger title, badge and duration treatment for readability.
 
 The SID JUKEBOX tab plays SID collections through the machine's real SID chip:
 point it at an Ultimate storage folder (or the **Open SID Jukebox** button in the
@@ -732,11 +806,18 @@ documented length for the selected subtune. The complete Songlengths database
 is never uploaded to the device. Queue lengths are resolved from the path
 catalogue before lazy tunes are fetched, then confirmed by digest once a tune is
 played. For matched Songlengths entries, u64deck waits a configurable short
-end grace before launching the next tune so audible tails and fades are not cut
-off; `sid_jukebox_end_grace_secs` defaults to 0.5 seconds and may be adjusted in
-`config.json`. The original documented duration is still sent to the Ultimate
-for its native display. Without Songlengths, `sid_default_secs` (default 180)
-applies (0 = loop forever) with the established fallback timing. If your HVSC lives on the device, you don't even need to set it:
+end grace before launching the next tune when streamed fade is disabled. The
+optional **Fade streamed SID ending** control keeps the selected native subtune
+alive for the chosen fade duration, starts a linear browser fade at the
+documented endpoint, then holds browser gain at zero until the backend confirms
+the replacement SID has started. Any buffered tail from the previous tune is
+cleared before full gain is restored, preventing the old SID from briefly
+returning between tracks. While fade is enabled, its duration replaces rather
+than combines with `sid_jukebox_end_grace_secs`. The fade affects audio heard
+through the u64deck browser and browser recordings only. Ultimate HDMI and
+analogue output remain at full volume until the extended native endpoint.
+browser fade defaults to 2.5 seconds and can be disabled in the Jukebox UI. Without Songlengths, `sid_default_secs` (default 180) applies (0 =
+loop forever) with the established fallback timing and no fade. If your HVSC lives on the device, you don't even need to set it:
 on first jukebox use u64deck **auto-detects the HVSC root** (a folder
 with MUSICIANS + DOCUMENTS, e.g. `/Usb0/HVSC` or `/Usb0/C64Music`),
 saves it as `hvsc_path`, wires `songlengths_path` to its
@@ -750,12 +831,23 @@ metadata scan, HVSC's own Songlengths.md5 provides a filename/path index.
 After a metadata scan, SQLite also searches header title, author, release and
 path fields. Multi-word queries AND together ("hubbard sanxion"). ▶ Play on a
 hit creates a one-tune play queue and starts it; use **＋** to append a tune or
-**Play This Folder** when the complete folder is intended.
+**Play This Folder** when the complete folder is intended. Adding an individual
+SID, inserting More like this recommendations or removing a future queue entry
+does not invalidate the active tune's auto-advance timer: a queue is played in
+order no matter how its future entries were added. The small ♪ action on a queue
+row uses that row as the similarity seed, while the larger Now Playing action
+uses the tune currently being heard; both insert their results after the current
+tune. The queue keeps Title and Author visually associated, labels a More like
+this queue with its seed tune, and marks the playing row with a persistent ▶,
+stronger highlight and left accent that are distinct from hover. Playback start
+or auto-advance reveals the current row once without fighting later manual
+scrolling; **◎ Current** jumps back to it on demand.
 
-**Chip and Format filters**: the Chip selector filters 6581, 8580, Either,
-Mixed/Multi-SID and Unknown declarations. Format filters PSID or RSID. A text
-term is optional, so selecting a Chip or Format and searching with a blank text
-box returns all matching indexed tunes. Chip badges use the same meanings in
+**Chip, Format and Year filters**: the Chip selector filters 6581, 8580, Either,
+Mixed/Multi-SID and Unknown declarations. Format filters PSID or RSID. Year is
+an exact four-digit value from 1900 to 2099 matched against a standalone year in
+the SID release metadata. A text term is optional, so any metadata filter can be
+used alone or combined with the others. Chip badges use the same meanings in
 search results, the Play Queue and Now Playing: amber 6581, cyan 8580, violet
 Either, pink Mixed/Multi-SID and grey Unknown. The dropdown selection remains
 the indication of the active filter. These filters use the SID metadata
@@ -842,6 +934,14 @@ D71, D81, or DNP (CMD native, choose track count), with a custom 16-char
 disk label. G64 isn't exposed by the device API — that one still needs the
 U64's own menu.
 
+Assembly64 disk actions use the complete release-file manifest for conservative
+matching. When the selected image belongs to a confidently named family, such
+as terminal `-a` / `-b`, u64deck downloads only those related images, applies
+the existing 64-file / 96 MiB swap-set limits, arms the in-memory queue, and
+then mounts the disk that was actually selected. This works on the first mount
+after a clean start and does not rely on a previously mounted image. Single or
+ambiguous releases remain one-disk sets.
+
 ## Multi-disk software (swap & queue)
 
 Two ways to handle "INSERT DISK 2" software, both ending at the **DISK SWAP**
@@ -857,7 +957,9 @@ release/language tag after the disk number is retained as part of the match.
 The matcher also recognises compound numbered tokens such as
 `EdgeOfDisgrace_0.d64` / `_1a.d64` / `_1b.d64`, bare parenthesised tokens such
 as `WeAreDemo(A).d64` / `(B).d64` and `Game(1).d64` / `(2).d64`, plus
-title-less marker names such as `side1.d64` / `side2.d64` within one folder.
+title-less marker names such as `side1.d64` / `side2.d64` within one folder,
+and terminal hyphen-delimited pairs such as `the-hat-7a825b1-a.d64` /
+`the-hat-7a825b1-b.d64`. Terminal `-a` / `-b` matching is case-insensitive.
 Square-bracket letters such as `Game[a].d64` remain excluded as alternate-dump
 markers. A bare-token family is also vetoed when an unsuffixed sibling exists,
 such as `Game.d64` beside `Game(a).d64`. Glued digits such as `Turrican1.d64`
@@ -871,6 +973,44 @@ names remain a one-disk set; use the manual queue when needed. After each
 mount, u64deck reports what the matcher decided and lists the related images.
 The automatic set is reconstructed from the currently mounted device path after
 an application restart or when **Refresh Drive Status** is used.
+
+### Analyse disk-image naming
+
+**Settings → Search Index & Cache → Analyse Disk-Image Names** examines D64,
+D71, D81 and G64 filenames already held in the SQLite index. It does not rescan
+the Ultimate. Results separate recognised families, high-confidence unrecognised
+patterns, ambiguous names and protected/rejected conventions, with counts and
+representative examples. **Copy Analysis Report** exports the analysis as plain text.
+
+Analysis is optional and read-only. If it is never run, u64deck uses only its
+normal built-in Disk Swap matcher, including the terminal `-a` / `-b` support.
+Opening or rerunning the analyser does not save anything. A high-confidence
+pattern can be approved globally or for one indexed folder only after preview
+and confirmation. u64deck stores approved patterns as constrained fields
+(terminal position, delimiter, marker letters, extensions and scope), never as
+arbitrary regular expressions.
+
+Ambiguous results can be approved individually, by selected displayed examples,
+for **all current ambiguous sets**, or for every ambiguous set in one folder.
+The all-ambiguous action explicitly includes sets not displayed among the
+representative examples and adds a second confirmation for large collections.
+These batch actions create exact-set overrides only; they never promote an
+ambiguous filename into a reusable pattern. Every batch confirmation reports
+the number of sets, files and folders affected. Approved exact sets are shown
+50 at a time so collections with hundreds or thousands of approvals remain
+usable; selected enable, disable and remove actions apply to the current page.
+
+**Remove all local approvals** deletes every user-approved reusable rule and
+exact-set override after two confirmations. It does not alter files, filenames,
+index entries or built-in matching. Approved rules and exact sets otherwise
+persist across index refreshes and rebuilds and become active immediately for
+automatic Disk Swap grouping.
+
+GoodTools-style `[a]` / `[b]`, matching unsuffixed siblings, glued sequel-like
+numbers and mixed/conflicting marker families remain protected from reusable
+automatic approval. An exact-set approval is the deliberate one-off escape hatch
+for unusual media naming. Clearing the storage catalogue leaves these explicit
+local approvals intact so that they can apply again after rebuilding the index.
 
 A compact **Mounted Drives** strip appears at the top of SCREEN and STORAGE,
 showing both drive images and their effective RO/RW/UNLINKED mode. Click it to
@@ -946,6 +1086,17 @@ The **browser → u64deck** hop, however, is ours to secure:
 - **Assembly64 endpoints aren't officially documented**; the tab shows raw
   responses so the templates in `config.json` can be adapted if the service
   changes shape.
+- **Legacy Retro Replay F7 requires the physical C64 keyboard.** Legacy Retro
+  Replay control is best-effort on the tested C64 Ultimate combination. On the tested C64 Ultimate + Retro Replay combination,
+  injected Legacy-buffer F7 can enter the Freeze Menu, so u64deck suppresses
+  remote/automatic F7 and asks for physical F7 instead. Allow approximately
+  **3–5 seconds** between Reset/Reboot actions and before starting Mount & Run.
+  Mount & Run confirms the firmware Cartridge setting, shows the persistent
+  Screen-Mirror prompt only for Retro Replay (including `rr38pal`), and proceeds
+  without a prompt when no cartridge is configured. Standalone Reset/Reboot uses an informational Dismiss overlay
+  that clears automatically after two short BASIC-ready samples when read-memory support is available; Mount & Run actively waits for BASIC readiness. Other freezer/fastload cartridges have not been comprehensively
+  tested. This behaviour was not observed on the CIA1 matrix-input path, where
+  automatic matrix F7 remains available.
 - One image at a time is cached in RAM per browse (last 8 kept).
 - **Dual-interface (Ethernet + Wi-Fi both enabled) is best-effort.** The
   firmware's ~2.5 s wired REST delay makes mixed-interface control

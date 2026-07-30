@@ -11,22 +11,22 @@
 <header>
   <div class="header-status">
     <div class="header-mainline">
-      <div class="brand"><span class="brand-name">**** u64deck ****</span> <span class="brand-version" id="ver"></span></div>
-      <div id="devinfo">connecting…</div>
+      <div class="brand"><span class="brand-name"><span class="brand-stars">****</span> u64deck <span class="brand-stars">****</span></span> <span class="brand-version" id="ver"></span></div>
+      <div id="devinfo">Connecting…</div>
     </div>
     <div class="ready-line">READY.<span class="cursor"></span></div>
   </div>
   <div class="row header-actions">
     <button onclick="openDiscover()">Select Ultimate…</button>
     <button id="helpBtn" onclick="openHelp()">Help</button>
-    <button id="btnAppExit" class="danger tip" data-tip="Stop the local u64deck server and close its dedicated Edge app window. The Ultimate keeps running." onclick="exitU64deck()">Exit u64deck</button>
+    <button id="btnAppExit" class="danger tip" style="display:none" data-tip="Stop the local u64deck server and close its dedicated Edge app window. The Ultimate keeps running." onclick="exitU64deck()">Exit u64deck</button>
   </div>
   <div class="machine">
     <button class="tip" data-tip="Reset the C64 core. The Ultimate device and network services remain running." onclick="machine('reset')">Reset C64</button>
     <button class="tip" data-tip="Restart the complete Ultimate device. Streams and network control disconnect briefly." onclick="machine('reboot')">Reboot Ultimate</button>
     <button onclick="machine('pause')">Pause C64</button>
     <button onclick="machine('resume')">Resume C64</button>
-    <button onclick="machine('menu_button')" title="open the Ultimate menu on the C64 display">Ultimate Menu</button>
+    <button onclick="machine('menu_button')" title="Open the Ultimate menu on the C64 display">Ultimate Menu</button>
     <button class="danger" onclick="if(confirm('Power off the Ultimate 64?'))machine('poweroff')">Power Off Ultimate</button>
   </div>
 </header>
@@ -52,6 +52,17 @@
     <div class="crt"><div class="crt-inner">
       <canvas id="screen" width="384" height="272" tabindex="0"
         aria-label="C64 screen — click to focus, then keys are sent to the machine"></canvas>
+      <div id="legacyF7Overlay" class="screen-operation-overlay" style="display:none" role="status" aria-live="polite">
+        <div class="screen-operation-card">
+          <div id="legacyF7Title" class="screen-operation-title">Physical F7 required</div>
+          <div id="legacyF7Message" class="screen-operation-message">Press F7 on the C64 keyboard to enable Fastload.</div>
+          <div class="screen-operation-actions">
+            <button id="legacyF7Continue" class="mini primary" style="display:none" onclick="continueLegacyMountRun()">Continue</button>
+            <button id="legacyF7Dismiss" class="mini" style="display:none" onclick="dismissStandaloneScreenNotice()">Dismiss</button>
+            <button id="legacyF7Cancel" class="mini danger" onclick="cancelLegacyMountRun()">Cancel Mount &amp; Run</button>
+          </div>
+        </div>
+      </div>
     </div></div>
     <div class="screen-side">
       <div class="panel">
@@ -59,15 +70,16 @@
         <div class="row" style="margin-bottom:8px">
           <button id="btnVideo" class="primary" data-wifi-tip="Start or stop the Ultimate VIC video stream." onclick="toggleVideo()">Start Video</button>
           <button id="btnAudio" data-wifi-tip="Start or stop the Ultimate audio stream." onclick="toggleAudio()">Start Audio</button>
-          <button id="btnFullscreen" data-wifi-tip="double-click the screen also toggles" onclick="toggleFullscreen()" title="double-click the screen also toggles">Full Screen</button>
+          <button id="btnFullscreen" data-wifi-tip="Double-click the screen also toggles" onclick="toggleFullscreen()" title="Double-click the screen also toggles">Full Screen</button>
           <button id="btnRecord" class="tip" data-wifi-tip="Record video, audio, or both." data-tip="Record video, audio, or both. Auto prefers MP4 when the browser supports it and otherwise uses WebM." onclick="toggleRecording()"><span id="recordDot" class="record-dot" aria-hidden="true"></span><span id="recButtonLabel">Record</span></button>
           <span id="recStatus" class="badge" style="display:none">00:00</span>
           <span id="recSummary" class="hint rec-summary">Combined · Standard · Auto</span>
-          <label class="hint" title="After Reset C64, Reboot Ultimate, Mount & Run or Mount & Load, wait for the Retro Replay menu and press F7 to install Fastload">
+          <label id="autoFastloadLabel" class="hint" title="Automatically presses F7 after Reset, Reboot and Mount &amp; Run when Retro Replay is configured and CIA1 matrix input is available. On Legacy KERNAL-buffer devices, automatic F7 is disabled because an emulated F7 can open the Freeze Menu; press physical F7 on the C64 instead. Your saved preference is retained and becomes active again on CIA1-capable devices.">
             <input type="checkbox" id="autoFastload" onchange="autoFastloadChanged()"> Auto F7 Fastload
           </label>
-          <button onclick="screenshot()" title="save the current frame as PNG">📷</button>
-          <span class="meter-group" aria-label="stream rates">
+          <span id="autoFastloadHint" class="badge buffer" style="display:none">Legacy: cartridge checked at launch</span>
+          <button onclick="screenshot()" title="Save the current frame as PNG">📷</button>
+          <span class="meter-group" aria-label="Stream rates">
             <span id="fps" class="badge">0 fps</span>
             <span id="aud" class="badge" title="Ultimate audio stream status">Audio off</span>
             <span id="streamLinkStatus" class="badge">Link unknown</span>
@@ -103,7 +115,7 @@
           </label>
           <label class="hint">Network interface
             <select id="qIface" onchange="ifaceChanged()">
-              <option value="">Auto</option>
+              <option value="">AUTO</option>
             </select>
           </label>
         </div>
@@ -111,27 +123,27 @@
           <summary>Recording settings</summary>
           <div class="row" style="margin-top:8px;gap:6px">
             <label class="hint tip" data-tip="Combined records the canvas and Ultimate audio. Video-only and audio-only omit the other stream.">Mode
-              <select id="recMode"><option value="combined">video + audio</option><option value="video">video only</option><option value="audio">audio only</option></select>
+              <select id="recMode"><option value="combined">Video + Audio</option><option value="video">Video Only</option><option value="audio">Audio Only</option></select>
             </label>
             <label class="hint tip" data-tip="Choose manual stop or automatically stop after the selected time.">Duration
-              <select id="recDuration"><option value="0">manual</option><option value="30">30 sec</option><option value="60">1 min</option><option value="300">5 min</option><option value="600">10 min</option></select>
+              <select id="recDuration"><option value="0">Manual</option><option value="30">30 Seconds</option><option value="60">1 Minute</option><option value="300">5 Minutes</option><option value="600">10 Minutes</option></select>
             </label>
             <label class="hint tip" data-tip="Controls recording bitrate. It does not change the Ultimate stream quality.">Recording quality
-              <select id="recQuality"><option value="compact">compact</option><option value="standard" selected>standard</option><option value="high">high</option></select>
+              <select id="recQuality"><option value="compact">Compact</option><option value="standard" selected>Standard</option><option value="high">High</option></select>
             </label>
             <label class="hint tip" data-tip="Auto prefers MP4/H.264/AAC where supported, then falls back to WebM. Choose a format to force it when available.">Format
-              <select id="recFormat"><option value="auto">auto</option><option value="mp4">MP4</option><option value="webm">WebM</option></select>
+              <select id="recFormat"><option value="auto">AUTO</option><option value="mp4">MP4</option><option value="webm">WebM</option></select>
             </label>
             <label class="hint tip" data-tip="Native records the exact 384×272 C64 frame. 2× records a pixel-doubled 768×544 frame.">Frame
-              <select id="recScale"><option value="native">native 384×272</option><option value="2">pixel-perfect 2×</option></select>
+              <select id="recScale"><option value="native">Native 384×272</option><option value="2">Pixel-Perfect 2×</option></select>
             </label>
           </div>
           <div class="row" style="margin-top:8px;gap:6px">
             <label class="hint" style="flex:1">Filename
               <input id="recFilename" style="width:min(420px,100%)" value="u64deck-{date}-{time}-{mode}" placeholder="u64deck-{date}-{time}-{mode}">
             </label>
-            <label class="hint tip" data-tip="Chrome and Edge can ask where to save. Other browsers use the normal Downloads folder."><input type="checkbox" id="recChooseLocation"> choose location</label>
-            <span id="recDrops" class="hint">drops: video 0 · audio 0</span>
+            <label class="hint tip" data-tip="Chrome and Edge can ask where to save. Other browsers use the normal Downloads folder."><input type="checkbox" id="recChooseLocation"> Choose location</label>
+            <span id="recDrops" class="hint">Drops: video 0 · audio 0</span>
           </div>
           <div id="recCapability" class="hint" style="margin-top:7px">Checking browser recording support…</div>
         </details>
@@ -140,7 +152,7 @@
           <span class="hint">Quick keys</span>
           <button class="mini primary tip" data-tip="Tap the C64 SPACE key. Works in cracktros and matrix-scanning software when CIA1 input is available." onclick="quickC64Key('space')">SPACE</button>
           <button class="mini tip" data-tip="Tap RUN/STOP. Works in matrix-scanning software when CIA1 input is available." onclick="quickC64Key('run_stop')">RUN/STOP</button>
-          <button class="mini tip" data-tip="Tap RESTORE through the firmware input endpoint. RESTORE is unavailable on the legacy keyboard-buffer path." onclick="quickC64Key('restore')">RESTORE</button>
+          <button class="mini tip" data-tip="Tap RESTORE through the firmware input endpoint. RESTORE is unavailable on the Legacy KERNAL-buffer path." onclick="quickC64Key('restore')">RESTORE</button>
           <span id="inputModeBadge" class="badge">Detecting input…</span>
         </div>
         <div class="hint" id="kbhelp" style="margin-top:8px">
@@ -162,7 +174,7 @@
       </div>
       <div class="panel">
         <h2>QUICK LAUNCH</h2>
-        <div id="qlbtns" class="row" style="flex-wrap:wrap;gap:6px"><span class="hint">empty — add files below</span></div>
+        <div id="qlbtns" class="row" style="flex-wrap:wrap;gap:6px"><span class="hint">Empty — add files below</span></div>
         <div class="row" style="margin-top:8px">
           <input type="file" id="qlfile" accept=".crt,.prg,.sid,.mod,.d64,.d71,.d81,.g64" style="flex:1">
           <button class="mini" onclick="qlAdd()">Add to library</button>
@@ -173,7 +185,7 @@
       <div class="panel">
         <h2>SEND TEXT TO C64</h2>
         <div class="row">
-          <input id="typeline" style="flex:1" placeholder='e.g. LOAD"$",8' onkeydown="if(event.key==='Enter')sendLine()">
+          <input id="typeline" style="flex:1" placeholder='E.g. LOAD"$",8' onkeydown="if(event.key==='Enter')sendLine()">
           <button onclick="sendLine()">Send + Return</button>
         </div>
       </div>
@@ -190,32 +202,32 @@
         <div class="hint">Star storage items, Assembly64 releases, SID tunes/folders and Quick Launch files for one-click access.</div>
       </div>
       <div class="row">
-        <select id="itemTypeFilter" onchange="itemsRender()" title="filter favourites and recent items">
-          <option value="">all types</option>
-          <option value="folder">folders</option>
-          <option value="disk">disk images</option>
-          <option value="disk_entry">files inside disks</option>
-          <option value="program">programs / cartridges</option>
+        <select id="itemTypeFilter" onchange="itemsRender()" title="Filter favourites and recent items">
+          <option value="">All types</option>
+          <option value="folder">Folders</option>
+          <option value="disk">Disk images</option>
+          <option value="disk_entry">Files inside disks</option>
+          <option value="program">Programs / cartridges</option>
           <option value="assembly64">Assembly64</option>
           <option value="sid">SID tunes</option>
           <option value="sid_folder">SID folders</option>
           <option value="library">Quick Launch</option>
         </select>
-        <button class="mini" onclick="itemsLoad()">↻ refresh</button>
+        <button class="mini" onclick="itemsLoad()">↻ Refresh</button>
       </div>
     </div>
   </div>
   <div class="fav-grid">
     <div class="panel">
       <h2>★ FAVOURITES <span id="favCount" class="hint"></span></h2>
-      <div id="favList"><span class="hint">loading…</span></div>
+      <div id="favList"><span class="hint">Loading…</span></div>
     </div>
     <div class="panel">
       <div class="row" style="justify-content:space-between">
         <h2 style="margin:0">RECENTLY USED <span id="recentCount" class="hint"></span></h2>
         <button class="mini" onclick="clearRecents()">Clear</button>
       </div>
-      <div id="recentList" style="margin-top:12px"><span class="hint">loading…</span></div>
+      <div id="recentList" style="margin-top:12px"><span class="hint">Loading…</span></div>
     </div>
   </div>
 </section>
@@ -231,43 +243,43 @@
       <div class="panel">
         <h2>BROWSE ULTIMATE STORAGE</h2>
         <div class="row" style="align-items:center;margin-bottom:6px">
-          <button class="mini" id="btnUp" onclick="fsUp()" title="parent directory">⬆ Up</button>
-          <button class="mini" onclick="jukeFolder(FS.path)" title="play all SIDs in this folder">♫ Open SID Jukebox</button>
+          <button class="mini" id="btnUp" onclick="fsUp()" title="Parent directory">⬆ Up</button>
+          <button class="mini" onclick="jukeFolder(FS.path)" title="Play all SIDs in this folder">♫ Open SID Jukebox</button>
           <button class="mini tip" data-tip="Create a formatted D64, D71, D81 or DNP in the current writable storage folder." id="newDiskBtn" onclick="newDiskToggle()">＋ Create Blank Image</button>
           <label class="hint tip" data-tip="Default for existing images opened from Storage, Search, Favourites, Assembly64 or this PC. Unlinked keeps writes temporary; newly created blank images are mounted RW immediately.">Default mount mode
             <select id="mountModeDefault" onchange="mountModeChanged()"><option value="unlinked">Unlinked — temporary writes</option><option value="readonly">Read-only (RO)</option><option value="readwrite">Read/write (RW)</option></select>
           </label>
-          <input id="fsQuery" style="width:150px" placeholder="🔎 search this folder…"
+          <input id="fsQuery" style="width:150px" placeholder="🔎 Search this folder…"
             onkeydown="if(event.key==='Enter')fsSearch()">
-          <select id="fsBudget" title="search time limit" onchange="localStorage.setItem('u64deck.search.budget',this.value)">
+          <select id="fsBudget" title="Search time limit" onchange="localStorage.setItem('u64deck.search.budget',this.value)">
             <option value="30">30s</option>
             <option value="60" selected>60s</option>
             <option value="120">2m</option>
             <option value="300">5m</option>
             <option value="600">10m</option>
             <option value="1800">30m</option>
-            <option value="0">∞ no limit</option>
+            <option value="0">∞ No limit</option>
           </select>
           <button class="mini primary" id="fsGo" onclick="fsSearch()">Search</button>
           <button class="mini" id="idxBtn" onclick="idxToggle()"
-            title="walk this subtree once and store folders plus disk-image directories in SQLite">🗂 Build Index</button>
+            title="Walk this subtree once and store folders plus disk-image directories in SQLite">🗂 Build Index</button>
           <button class="mini" id="idxPauseBtn" onclick="idxPauseToggle()" style="display:none"
-            title="temporarily pause or resume background indexing">⏸ Pause</button>
-          <label class="hint" title="also open every d64/d71/d81 found and search the files inside">
-            <input type="checkbox" id="fsInside" checked> search inside disk images</label>
+            title="Temporarily pause or resume background indexing">⏸ Pause</button>
+          <label class="hint" title="Also open every D64/D71/D81 found and search the files inside">
+            <input type="checkbox" id="fsInside" checked> Search inside disk images</label>
           <div class="crumbs" id="crumbs" style="margin-bottom:0"></div>
         </div>
         <div id="idxStatus" class="hint" style="display:none;margin:4px 0"></div>
         <div id="fsSearchOut" style="display:none;margin:6px 0;padding:6px;border:1px solid var(--line);border-radius:4px">
           <div class="row" style="justify-content:space-between;align-items:center">
             <span id="fsSearchTitle" class="hint"></span>
-            <button class="mini" onclick="$('#fsSearchOut').style.display='none'">✕ close</button>
+            <button class="mini" onclick="$('#fsSearchOut').style.display='none'">✕ Close</button>
           </div>
           <div id="fsSearchList" style="max-height:min(60vh,850px);overflow:auto;margin-top:4px"></div>
         </div>
         <div id="newDiskForm" style="display:none;margin:6px 0;padding:6px;border:1px solid var(--line);border-radius:4px">
           <div class="row" style="flex-wrap:wrap;gap:6px;align-items:center">
-            <input id="ndName" style="flex:1;min-width:130px" placeholder="file name e.g. work"
+            <input id="ndName" style="flex:1;min-width:130px" placeholder="File name e.g. work"
               onkeydown="if(event.key==='Enter')newDiskCreate()">
             <select id="ndKind" onchange="newDiskKind()">
               <option value="d64">D64 (1541)</option>
@@ -276,16 +288,16 @@
               <option value="dnp">DNP (CMD native)</option>
             </select>
             <select id="ndTracks"><option>35</option><option>40</option></select>
-            <input id="ndLabel" style="width:130px" maxlength="16" placeholder="disk label (16)">
+            <input id="ndLabel" style="width:130px" maxlength="16" placeholder="Disk label (16)">
             <button class="mini primary" id="newDiskCreateBtn" onclick="newDiskCreate()">Create &amp; Mount RW</button>
           </div>
           <div class="hint" id="newDiskHint" style="margin-top:3px">Formatted blank image created in the current folder, then mounted read/write on drive A. Existing images still use the selected default safety mode. (G64 is available through the Ultimate menu.)</div>
         </div>
-        <div id="fslist" class="hint">loading…</div>
+        <div id="fslist" class="hint">Loading…</div>
       </div>
       <div class="panel" id="queuePanel">
         <h2>DISK SWAP QUEUE</h2>
-        <div id="queueList" class="hint">empty — ＋Queue disks above (in order: 1, 2, 3…), or pick
+        <div id="queueList" class="hint">Empty — ＋Queue disks above (in order: 1, 2, 3…), or pick
           local images below</div>
         <div class="row" style="margin-top:8px;flex-wrap:wrap">
           <button class="primary" onclick="queueArm(true)">Mount First &amp; Arm Queue</button>
@@ -331,7 +343,7 @@
         <div class="row" style="margin-bottom:10px">
           <span id="inspMeta" class="hint"></span>
           <span style="flex:1"></span>
-          <select id="inspDrive"><option value="a">drive A</option><option value="b">drive B</option></select>
+          <select id="inspDrive"><option value="a">Drive A</option><option value="b">Drive B</option></select>
           <select id="inspMode" onchange="mountModeChanged(this)" class="tip" data-tip="Read-only protects the original; read/write commits changes; unlinked discards temporary writes when removed.">
             <option value="unlinked">Unlinked — temporary writes</option>
             <option value="readonly">Read-only (RO)</option>
@@ -366,7 +378,7 @@
       <div class="hint">Local telemetry and cached Ultimate status. No additional recurring Ultimate requests are made.</div>
     </div>
     <div class="row">
-      <span id="healthUpdated" class="hint">auto-update waiting for first sample</span>
+      <span id="healthUpdated" class="hint">Auto-update waiting for first sample</span>
     </div>
   </div>
 
@@ -377,7 +389,7 @@
 
   <div class="health-grid">
     <div class="panel health-card">
-      <div class="health-card-title"><h2>ULTIMATE &amp; REST</h2><span id="healthUltimateState" class="badge">unknown</span></div>
+      <div class="health-card-title"><h2>ULTIMATE &amp; REST</h2><span id="healthUltimateState" class="badge">Unknown</span></div>
       <div id="healthUltimateName" class="health-primary">Not configured</div>
       <div id="healthUltimateVersions" class="hint">—</div>
       <div class="health-metrics">
@@ -394,7 +406,7 @@
     </div>
 
     <div class="panel health-card">
-      <div class="health-card-title"><h2>STREAMS</h2><span id="healthStreamsState" class="badge">off</span></div>
+      <div class="health-card-title"><h2>STREAMS</h2><span id="healthStreamsState" class="badge">Off</span></div>
       <div id="healthStreamTransport" class="hint">Transport: —</div>
       <div class="health-stream-row">
         <div><b>VIDEO</b></div>
@@ -431,18 +443,18 @@
       <div class="health-metrics">
         <div><span>Phase</span><b id="healthActivityPhase">—</b></div>
         <div><span>Elapsed</span><b id="healthActivityElapsed">—</b></div>
-        <div><span>Queue owner</span><b id="healthActiveOperation">idle</b></div>
+        <div><span>Queue owner</span><b id="healthActiveOperation">Idle</b></div>
         <div><span>Waiters I / S / B</span><b id="healthWaiters">0 / 0 / 0</b></div>
         <div><span>Wait avg / p95 / max</span><b id="healthQueueWaitStats">—</b></div>
         <div><span>Completed I / S / B</span><b id="healthCompletedByPriority">0 / 0 / 0</b></div>
-        <div><span>Cancelled</span><b id="healthCancelled">0</b></div>
+        <div><span>Cancelled / expired</span><b id="healthCancelled">0 / 0</b></div>
         <div><span>Total queue wait</span><b id="healthQueueWait">0 s</b></div>
       </div>
     </div>
 
     <div class="panel health-card">
       <div class="health-card-title"><h2>INDEX &amp; CACHE</h2></div>
-      <div id="healthIndexCurrent" class="health-primary">Indexer idle</div>
+      <div id="healthIndexCurrent" class="health-primary">Indexer Idle</div>
       <div id="healthIndexDetail" class="hint">—</div>
       <div class="health-metrics">
         <div><span>Images / SID metadata</span><b id="healthIndexCounts">—</b></div>
@@ -459,7 +471,7 @@
     </div>
 
     <div class="panel health-card">
-      <div class="health-card-title"><h2>U64DECK &amp; HOST</h2><span id="healthFrozen" class="badge">source</span></div>
+      <div class="health-card-title"><h2>U64DECK &amp; HOST</h2><span id="healthFrozen" class="badge">Source</span></div>
       <div class="health-metrics">
         <div><span>Process CPU / RAM</span><b id="healthProcessLoad">—</b></div>
         <div><span>Threads / handles</span><b id="healthProcessShape">—</b></div>
@@ -470,18 +482,18 @@
         <div><span>Build</span><b id="healthBuild">—</b></div>
         <div><span>Diagnostics W / E</span><b id="healthDiagCounts">0 / 0</b></div>
         <div><span>Active W / E</span><b id="healthDiagActive">0 / 0</b></div>
-        <div><span>Last error</span><b id="healthLastErrorAge">never</b></div>
+        <div><span>Last error</span><b id="healthLastErrorAge">Never</b></div>
       </div>
     </div>
 
     <div class="panel health-card">
-      <div class="health-card-title"><h2>PERSISTENCE &amp; LIFECYCLE</h2><span id="healthPersistenceState" class="badge">ready</span></div>
+      <div class="health-card-title"><h2>PERSISTENCE &amp; LIFECYCLE</h2><span id="healthPersistenceState" class="badge">Ready</span></div>
       <div class="health-metrics">
         <div><span>Config saves</span><b id="healthConfigSaves">0 / 0</b></div>
         <div><span>Last config save</span><b id="healthConfigLast">—</b></div>
         <div><span>Route changes</span><b id="healthRouteChanges">0</b></div>
         <div><span>Last route</span><b id="healthLastRoute">—</b></div>
-        <div><span>Shutdown state</span><b id="healthShutdownState">not requested</b></div>
+        <div><span>Shutdown state</span><b id="healthShutdownState">Not Requested</b></div>
         <div><span>Last shutdown duration</span><b id="healthShutdownTime">—</b></div>
         <div><span>Events retained</span><b id="healthDiagRetained">0</b></div>
         <div><span>Last event</span><b id="healthLastEvent">—</b></div>
@@ -509,7 +521,7 @@
   </details>
 
   <div class="panel health-limit">
-    <b>Ultimate hardware telemetry:</b> the current firmware REST API does not expose CPU load, FPGA utilisation or temperature, so u64deck does not invent those values.
+    <b>Ultimate hardware telemetry:</b> The current firmware REST API does not expose CPU load, FPGA utilisation or temperature, so u64deck does not invent those values.
   </div>
 </section>
 
@@ -525,42 +537,38 @@
           <option value="none">Do not open automatically</option>
         </select>
       </label>
-      <span id="localBrowserStatus" class="hint">loading local launcher settings…</span>
+      <span id="localBrowserStatus" class="hint">Loading local launcher settings…</span>
     </div>
     <div class="hint" style="margin-top:7px">This affects only the browser opened by <code>start.bat</code>. You can still open u64deck manually in Firefox, Chrome, a phone or another device.</div>
-  </div>
-  <div class="panel">
-    <div class="row">
-      <button class="primary" onclick="saveDirty()" id="btnApply" disabled>Apply Changes</button>
-      <button onclick="cfgAction('save_to_flash')">Save to Flash</button>
-      <button onclick="cfgAction('load_from_flash')">Load from Flash</button>
-      <button class="danger" onclick="if(confirm('Reset ALL settings to factory defaults?'))cfgAction('reset_to_default')">Factory Defaults</button>
-      <span class="hint">Changes apply to the running config; “Save to flash” makes them stick.</span>
-    </div>
-  </div>
-  <div class="setgrid">
-    <div class="catlist" id="catlist"></div>
-    <div class="setitems panel" id="setitems"><span class="hint">Pick a category.</span></div>
   </div>
   <div class="panel">
     <h2>SEARCH INDEX &amp; CACHE</h2>
     <div id="cacheStats" class="hint">…</div>
     <div class="row" style="margin-top:6px">
-      <button class="mini" onclick="cacheStatsLoad()">↻ refresh</button>
-      <button class="mini" onclick="cacheParseErrorsToggle()" title="show disk images whose internal directories could not be parsed">Image Parse Details</button>
-      <button class="mini" onclick="cacheClearImages()" title="forget disk-image directories — the next search re-reads them">Clear Image Cache</button>
+      <button class="mini" onclick="cacheStatsLoad()">↻ Refresh</button>
+      <button class="mini" onclick="cacheParseErrorsToggle()" title="Show disk images whose internal directories could not be parsed">Image Parse Details</button>
+      <button class="mini" onclick="cacheClearImages()" title="Forget disk-image directories — the next search re-reads them">Clear Image Cache</button>
       <button class="mini danger tip" data-tip="Removes only u64deck's SQLite catalogue. It never deletes files from the Ultimate." onclick="cacheClearIndex()">Clear Storage Index</button>
       <button class="mini primary tip" data-tip="Download a sanitised ZIP containing version, connectivity, stream and index information for troubleshooting." onclick="downloadDiagnostics()">Export Diagnostics</button>
     </div>
     <div id="parseErrorPanel" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)">
-      <div id="parseErrorList" class="hint">loading…</div>
+      <div id="parseErrorList" class="hint">Loading…</div>
+    </div>
+    <div class="disk-naming-settings" style="border-top:1px solid var(--line);margin-top:12px;padding-top:10px">
+      <h2 style="margin-bottom:6px">DISK IMAGE NAMING ANALYSIS</h2>
+      <div class="row" style="gap:6px;flex-wrap:wrap">
+        <button class="mini primary" id="diskNamingAnalyseBtn" onclick="diskNamingAnalyse()">Analyse Disk-Image Names</button>
+        <button class="mini" id="diskNamingCopyBtn" onclick="diskNamingCopyReport()" disabled>Copy Analysis Report</button>
+      </div>
+      <div class="hint" style="margin-top:6px">Uses only filenames already stored in the SQLite index. Analysis is read-only and optional. Ambiguous sets can be approved individually or in confirmed batches; nothing is saved automatically, and files are never renamed, mounted or modified.</div>
+      <div id="diskNamingPanel" style="display:none;margin-top:10px"></div>
     </div>
     <div class="sidflow-settings" style="border-top:1px solid var(--line);margin-top:12px;padding-top:10px">
       <div class="row" style="align-items:baseline;gap:10px;flex-wrap:wrap">
         <h2 style="margin-bottom:4px">SIDFLOW SIMILARITY DATA</h2>
         <span class="sidflow-credit">Powered by SIDFlow (Chris Gleissner)</span>
       </div>
-      <div id="sidflowStatus" class="hint">checking local similarity data…</div>
+      <div id="sidflowStatus" class="hint">Checking local similarity data…</div>
       <progress id="sidflowProgress" max="100" value="0" style="display:none;width:min(520px,100%);margin-top:7px"></progress>
       <div class="row" style="margin-top:7px;gap:6px;flex-wrap:wrap">
         <button class="mini primary" id="sidflowDownloadBtn" onclick="sidflowDownload()">Download Similarity Data</button>
@@ -572,11 +580,11 @@
       <h2 style="margin-bottom:6px">BUILD INDEX FROM LOCAL USB</h2>
       <div class="row" style="flex-wrap:wrap;gap:6px">
         <select id="localVolume" style="min-width:230px" onchange="localVolumePicked()">
-          <option value="">detecting local drives…</option>
+          <option value="">Detecting local drives…</option>
         </select>
-        <input id="localIndexSource" style="flex:1;min-width:220px" placeholder="local drive or folder, e.g. E:\">
+        <input id="localIndexSource" style="flex:1;min-width:220px" placeholder="Local drive or folder, e.g. E:\">
         <input id="localIndexRoot" style="width:130px" value="/USB0" title="Ultimate path represented by this local drive">
-        <button class="mini" onclick="localVolumesLoad()">↻ drives</button>
+        <button class="mini" onclick="localVolumesLoad()">↻ Drives</button>
         <button class="mini primary" id="localIdxBtn" onclick="localIndexToggle()">Build Index From Local USB</button>
         <button class="mini" id="localIdxPauseBtn" onclick="idxPauseToggle()" style="display:none">⏸ Pause</button>
       </div>
@@ -587,6 +595,21 @@
       <div id="localIdxStatus" class="hint" style="display:none;margin-top:6px"></div>
     </div>
   </div>
+  <details class="panel firmware-settings-details">
+    <summary>Ultimate firmware configuration</summary>
+    <div class="hint firmware-settings-summary">Occasional-use firmware settings. Expand to edit the live Ultimate configuration or save it to flash.</div>
+    <div class="row firmware-settings-actions">
+      <button class="primary" onclick="saveDirty()" id="btnApply" disabled>Apply Changes</button>
+      <button onclick="cfgAction('save_to_flash')">Save to Flash</button>
+      <button onclick="cfgAction('load_from_flash')">Load from Flash</button>
+      <button class="danger" onclick="if(confirm('Reset ALL settings to factory defaults?'))cfgAction('reset_to_default')">Factory Defaults</button>
+      <span class="hint">Changes apply to the running config; “Save to flash” makes them stick.</span>
+    </div>
+    <div class="setgrid firmware-settings-grid">
+      <div class="catlist" id="catlist"><span class="hint">Waiting for the Ultimate connection…</span></div>
+      <div class="setitems panel" id="setitems"><span class="hint">Firmware settings load after the connection is ready.</span></div>
+    </div>
+  </details>
 </section>
 
 <!-- ============ ASSEMBLY64 ============ -->
@@ -647,10 +670,10 @@
         onkeydown="if(event.key==='Enter')jkBrowse($('#jkPath').value)">
       <button onclick="jkBrowse($('#jkPath').value)">📂 Browse</button>
       <button class="primary" onclick="jukeFolder($('#jkPath').value)">♫ Play Folder</button>
-      <button onclick="jkRandom()" title="pick a random indexed SID below the current path, start it immediately, then load its folder">🎲 Random Dive</button>
-      <input id="jkSearch" style="width:170px" placeholder="🔎 search all of HVSC…"
+      <button onclick="jkRandom()" title="Pick a random indexed SID below the current path, start it immediately, then load its folder">🎲 Random Dive</button>
+      <input id="jkSearch" style="width:170px" placeholder="🔎 Search all of HVSC…"
         onkeydown="if(event.key==='Enter')jkSearchGo()">
-      <select id="jkChip" title="filter indexed SID metadata by declared chip model" onchange="jkSearchFilterChanged()">
+      <select id="jkChip" title="Filter indexed SID metadata by declared chip model" onchange="jkSearchFilterChanged()">
         <option value="all">Chip: All</option>
         <option value="6581">Chip: 6581</option>
         <option value="8580">Chip: 8580</option>
@@ -658,11 +681,14 @@
         <option value="mixed">Chip: Mixed / Multi-SID</option>
         <option value="unknown">Chip: Unknown</option>
       </select>
-      <select id="jkFormat" title="filter by SID file format" onchange="jkSearchFilterChanged()">
+      <select id="jkFormat" title="Filter by SID file format" onchange="jkSearchFilterChanged()">
         <option value="all">Format: All</option>
         <option value="PSID">Format: PSID</option>
         <option value="RSID">Format: RSID</option>
       </select>
+      <input id="jkYear" inputmode="numeric" maxlength="4" style="width:92px" placeholder="Year"
+        title="Filter by an exact four-digit year extracted from SID release metadata"
+        oninput="jkSearchFilterChanged()" onkeydown="if(event.key==='Enter')jkSearchGo()">
       <button class="mini" onclick="jkSearchGo()">Search</button>
       <input type="file" id="jkLocal" accept=".sid" multiple style="min-width:180px">
       <button onclick="jukeLocal()">Load Local SIDs</button>
@@ -677,12 +703,12 @@
     <div id="jkBrowser" style="margin-top:8px">
       <div class="row" style="align-items:center;gap:6px;flex-wrap:wrap">
         <button class="mini" onclick="jkBrowseUp()">⬆ Up</button>
-        <button class="mini" onclick="jkHvsc(false)" title="jump to your HVSC collection (auto-detected on first use)">⌂ HVSC</button>
-        <button class="mini" onclick="jkHvsc(true)" title="re-detect the HVSC folder and reload Songlengths after moving or updating the collection">↻ Re-detect</button>
-        <button class="mini" onclick="jkUpdateCheck()" title="compare your collection's release against the latest on hvsc.c64.org">⭳ Updates?</button>
+        <button class="mini" onclick="jkHvsc(false)" title="Jump to your HVSC collection (auto-detected on first use)">⌂ HVSC</button>
+        <button class="mini" onclick="jkHvsc(true)" title="Re-detect the HVSC folder and reload Songlengths after moving or updating the collection">↻ Re-detect</button>
+        <button class="mini" onclick="jkUpdateCheck()" title="Compare your collection's release against the latest on hvsc.c64.org">⭳ Updates?</button>
         <button class="mini" id="jkSidIndexToggle" onclick="jkSidIndexTogglePanel()"
           aria-controls="jkSidIndex" aria-expanded="false"
-          title="open SID metadata indexing controls and status">SID Index</button>
+          title="Open SID metadata indexing controls and status">SID Index</button>
         <span id="jkVer" class="hint"></span>
         <span id="jkBPath" class="hint"></span>
         <span id="jkBCount" class="hint"></span>
@@ -700,14 +726,14 @@
       <div class="row" style="flex-wrap:wrap;gap:6px;align-items:center">
         <input id="jkSidRoot" style="min-width:190px" placeholder="Ultimate HVSC path, e.g. /USB0/HVSC">
         <button class="mini primary" id="jkSidUltimateBtn" onclick="jkSidIndexUltimate()">Refresh From Ultimate</button>
-        <label class="hint"><input type="checkbox" id="jkSidForce"> rescan unchanged files</label>
+        <label class="hint"><input type="checkbox" id="jkSidForce"> Rescan unchanged files</label>
       </div>
       <div class="row" style="flex-wrap:wrap;gap:6px;align-items:center;margin-top:6px">
         <select id="jkSidVolume" style="min-width:220px" onchange="jkSidVolumePicked()">
-          <option value="">detecting local drives…</option>
+          <option value="">Detecting local drives…</option>
         </select>
-        <input id="jkSidSource" style="flex:1;min-width:220px" placeholder="local HVSC folder, e.g. E:\HVSC">
-        <button class="mini" onclick="jkSidVolumesLoad()">↻ drives</button>
+        <input id="jkSidSource" style="flex:1;min-width:220px" placeholder="Local HVSC folder, e.g. E:\HVSC">
+        <button class="mini" onclick="jkSidVolumesLoad()">↻ Drives</button>
         <button class="mini primary" id="jkSidLocalBtn" onclick="jkSidIndexLocal()">Build From Local HVSC</button>
         <button class="mini" id="jkSidPauseBtn" onclick="jkSidIndexPause()" style="display:none">⏸ Pause</button>
       </div>
@@ -716,17 +742,26 @@
     <div class="row" style="margin-top:10px;align-items:center;flex-wrap:wrap;gap:6px">
       <button onclick="jk('prev')">⏮</button>
       <button class="primary" onclick="jkPlayCurrent()">▶</button>
-      <button onclick="jkStop()" title="stop SID playback and reset to the C64 command line">⏹</button>
+      <button onclick="jkStop()" title="Stop SID playback and reset to the C64 command line">⏹</button>
       <button onclick="jk('next')">⏭</button>
       <button id="jkNowStar" class="mini star" style="display:none" onclick="jkToggleNowFavourite()"
-        title="add or remove the currently playing SID from Favourites">☆</button>
+        title="Add or remove the currently playing SID from Favourites">☆</button>
       <button id="jkMoreNow" class="mini" style="display:none" onclick="jkMoreLike()"
-        title="insert similar SIDFlow matches after the current tune">♪ More like this</button>
+        title="Insert similar SIDFlow matches after the current tune">♪ More like this</button>
       <label class="hint"><input type="checkbox" id="jkShuffle" onchange="jkShuffleSet()"> Shuffle</label>
       <label class="hint sidflow-radio"><input type="checkbox" id="jkRadio" onchange="jkRadioSet()"> Radio</label>
-      <button id="jkAudio" onclick="toggleAudio().then(()=>jkAudioSync())" title="stream the machine's audio to this browser">🔊 Listen here</button>
-      <span id="jkNow" class="hint"></span>
+      <button id="jkAudio" onclick="toggleAudio().then(()=>jkAudioSync())" title="Stream the machine's audio to this browser">🔊 Listen here</button>
+      <span id="jkNow" class="jk-now"></span>
       <span id="jkSong" style="display:none"></span>
+    </div>
+    <div class="row" style="margin-top:6px;align-items:center;flex-wrap:wrap;gap:6px">
+      <label class="hint"><input type="checkbox" id="jkFadeEnabled" onchange="jukeFadeChanged()"> Fade streamed SID ending</label>
+      <select id="jkFadeSecs" class="mini" onchange="jukeFadeChanged()" title="Fade duration after the documented Songlengths endpoint">
+        <option value="1.0">1.0 sec</option><option value="1.5">1.5 sec</option>
+        <option value="2.0">2.0 sec</option><option value="2.5">2.5 sec</option>
+        <option value="3.0">3.0 sec</option><option value="5.0">5.0 sec</option>
+      </select>
+      <span id="jkFadeNote" class="hint">Browser/recording only — Ultimate HDMI and analogue audio do not fade.</span>
     </div>
     <div class="row sidflow-juke-credit-row">
       <div class="hint" id="jkSlInfo"></div>
@@ -737,15 +772,16 @@
     <div class="sid-queue-heading">
       <h2 id="jkListTitle">PLAY QUEUE</h2>
       <span id="jkListContext" class="hint"></span>
+      <button class="mini jk-current-button" id="jkLocateCurrentBtn" onclick="jkLocateCurrent(true)" title="Jump to the currently playing track" disabled>◎ Current</button>
     </div>
     <div class="row sid-queue-tools">
-      <input id="plName" style="width:160px" placeholder="play queue name…"
+      <input id="plName" style="width:160px" placeholder="Play queue name…"
         onkeydown="if(event.key==='Enter')plSave()">
-      <button class="mini" id="plSaveBtn" onclick="plSave()" title="save the current play queue (device tunes only)" disabled>💾 Save</button>
-      <select id="plSel" style="min-width:160px" onchange="plControlsSync()"><option value="">— saved play queues —</option></select>
-      <button class="mini primary" id="plLoadBtn" onclick="plLoad()" title="replace the current play queue with the saved one">▶ Load</button>
-      <button class="mini" id="plDeleteBtn" onclick="plDelete()" title="delete the selected saved play queue" disabled>🗑</button>
-      <button class="mini" id="jkClearQueueBtn" onclick="jkClearQueue()" title="clear queued tunes, turn Radio off and let the current SID finish" disabled>Clear Queue</button>
+      <button class="mini" id="plSaveBtn" onclick="plSave()" title="Save the current play queue (device tunes only)" disabled>💾 Save</button>
+      <select id="plSel" style="min-width:160px" onchange="plControlsSync()"><option value="">— Saved play queues —</option></select>
+      <button class="mini primary" id="plLoadBtn" onclick="plLoad()" title="Replace the current play queue with the saved one">▶ Load</button>
+      <button class="mini" id="plDeleteBtn" onclick="plDelete()" title="Delete the selected saved play queue" disabled>🗑</button>
+      <button class="mini" id="jkClearQueueBtn" onclick="jkClearQueue()" title="Clear queued tunes, turn Radio off and let the current SID finish" disabled>Clear Queue</button>
     </div>
     <div id="jkList" class="sid-queue-list" role="table" aria-label="SID play queue"><div class="sid-queue-empty" role="status"><strong>No tunes queued</strong><span>Choose a saved play queue above, add a SID, or play a folder.</span></div></div>
   </div>

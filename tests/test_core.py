@@ -514,7 +514,7 @@ def test_machine_reboot_reconnects_before_prekey(monkeypatch):
         server.CFG["boot_prekey"] = "F7"
         server.CFG["boot_wait"] = 2.8
 
-        def fake_send(*, delay=0.0, retry_window=0.0):
+        def fake_send(*, delay=0.0, retry_window=0.0, cartridge_state=None):
             calls.append(("prekey", (delay, retry_window)))
             return "F7"
 
@@ -1117,9 +1117,10 @@ def test_header_identity_and_device_details_share_an_aligned_status_block():
     assert 'class="brand-version" id="ver"' in html
     assert 'class="ready-line"' in html
     assert ".header-mainline{display:flex;align-items:baseline" in css
-    assert ".brand-version{color:var(--dim);font-size:13px" in css
-    assert "#devinfo{color:var(--dim);font-size:13px" in css
-    assert ".ready-line{color:var(--dim);font-size:14px" in css
+    assert ".brand-name{font-size:16px" in css
+    assert ".brand-version{color:var(--dim);font-size:15px;font-weight:600" in css
+    assert "#devinfo{color:var(--dim);font-size:15px;font-weight:600" in css
+    assert ".ready-line{color:var(--dim);font-size:13px" in css
 
 
 def test_mount_run_busy_status_is_local_and_does_not_touch_device(monkeypatch):
@@ -1561,7 +1562,7 @@ def test_rc21_health_ui_auto_refreshes_without_manual_button_and_avoids_duplicat
     assert 'id="healthActivityState"' not in html
     assert 'id="healthIndexState"' not in html
     assert 'id="healthDiagnosticHistory"' in html
-    assert 'auto-updated ' in js and 'every 2 s' in js
+    assert 'Auto-updated ' in js and 'every 2 s' in js
     assert '.health-outcome' in css
     assert 'width:max-content' in css
     assert 'justify-content:center' in css
@@ -1718,11 +1719,13 @@ def test_rc22_frontend_sequences_info_before_first_drive_request_and_retries_neu
 def test_rc24_songlength_auto_advance_uses_configurable_half_second_grace(monkeypatch):
     previous_lengths = dict(server.SONGLENGTHS_BY_PATH)
     previous_grace = server.CFG.get("sid_jukebox_end_grace_secs")
+    previous_fade = server.CFG.get("sid_jukebox_browser_fade_enabled")
     try:
         server.SONGLENGTHS_BY_PATH.clear()
         server.SONGLENGTHS_BY_PATH["musicians/a/a.sid"] = [120.0]
         monkeypatch.setattr(server, "_configured_hvsc_root", lambda: "/USB0/HVSC")
         server.CFG["sid_jukebox_end_grace_secs"] = 0.5
+        server.CFG["sid_jukebox_browser_fade_enabled"] = False
         item = server._juke_lazy_item("/USB0/HVSC/MUSICIANS/A/A.sid", "A.sid")
         length, grace, delay, source = server._juke_auto_advance_plan(item, 1)
         assert (length, grace, delay, source) == (120.0, 0.5, 120.5, "songlengths")
@@ -1733,6 +1736,10 @@ def test_rc24_songlength_auto_advance_uses_configurable_half_second_grace(monkey
             server.CFG.pop("sid_jukebox_end_grace_secs", None)
         else:
             server.CFG["sid_jukebox_end_grace_secs"] = previous_grace
+        if previous_fade is None:
+            server.CFG.pop("sid_jukebox_browser_fade_enabled", None)
+        else:
+            server.CFG["sid_jukebox_browser_fade_enabled"] = previous_fade
 
 
 def test_rc24_juke_play_arms_the_planned_deadline_and_reports_it(monkeypatch):
@@ -1761,6 +1768,7 @@ def test_rc24_juke_play_arms_the_planned_deadline_and_reports_it(monkeypatch):
             "folder": "", "loading": False, "source": "test",
             "generation": 0, "stop_after_current": False,
         })
+        server.CFG["sid_jukebox_browser_fade_enabled"] = False
         monkeypatch.setattr(server, "_cart_configured", lambda: "")
         monkeypatch.setattr(server, "_post_sid_upload", lambda *args, **kwargs: {})
         monkeypatch.setattr(server, "_juke_auto_advance_plan",
@@ -1817,14 +1825,14 @@ def test_rc24_unknown_length_retains_existing_fallback_allowance(monkeypatch):
             server.CFG["sid_default_secs"] = previous_default
 
 
-def test_rc24_documentation_describes_end_grace_without_changing_native_duration():
+def test_rc24_documentation_retains_end_grace_configuration():
     root = Path(server.__file__).parent
     readme = (root / "README.md").read_text(encoding="utf-8")
     help_js = (Path(server.ASSETS) / "static" / "help_content.js").read_text(encoding="utf-8")
     example = json.loads((root / "config.example.json").read_text(encoding="utf-8"))
     assert example["sid_jukebox_end_grace_secs"] == 0.5
     assert "sid_jukebox_end_grace_secs" in readme
-    assert "original documented duration is still sent to the Ultimate" in readme
+    assert "browser fade defaults to 2.5 seconds" in readme
     assert "sid_jukebox_end_grace_secs" in help_js
 
 
@@ -1872,7 +1880,7 @@ def test_frontend_is_split_without_a_build_tool():
 def test_release_metadata_is_centralised():
     import release
     assert server.VERSION == release.VERSION == "1.9.0"
-    assert release.RELEASE_LABEL == "Release Candidate 25"
+    assert release.RELEASE_LABEL == "Release Candidate 44"
     assert server.BUILD == release.build_id(server.ASSETS, Path(server.__file__).parent)
 
 
@@ -2642,7 +2650,7 @@ def test_sid_index_help_readme_and_accessible_toggle_are_current():
     assert 'setAttribute("aria-expanded"' in js
     for text in (
         "SID Index · 61,157",
-        "blank search with only Chip or Format selected",
+        "any metadata filter can be used by itself",
         "amber 6581",
         "cyan 8580",
         "rescan unchanged files",
@@ -2650,7 +2658,7 @@ def test_sid_index_help_readme_and_accessible_toggle_are_current():
         assert text in help_js
     for text in (
         "clearly labelled **SID Index** button",
-        "box returns all matching indexed tunes",
+        "used alone or combined with the others",
         "amber 6581",
         "cyan 8580",
         "Leave **rescan unchanged files** off",
@@ -2835,7 +2843,7 @@ def test_release_help_and_now_playing_star_are_present():
     assert "jkToggleNowFavourite" in js
     assert ".u64deck-index.sqlite3" in help_js
     assert "star beside the playback controls" in help_js
-    assert "v1.9.0 — Release Candidate 25" in readme
+    assert "v1.9.0 — Release Candidate 44" in readme
     assert ".u64deck-index.sqlite3" in readme
     assert "Install every release into a **new, empty folder**" in readme
     assert "Do not copy `*-wal`" in readme
@@ -2907,7 +2915,10 @@ def test_boot_prekey_uses_matrix_f7_when_capable(monkeypatch):
         monkeypatch.setattr(server, "_input_status", lambda *a, **k: {"available": True})
         monkeypatch.setattr(server, "_matrix_send", lambda events, **kwargs: sent.append(events) or {})
         monkeypatch.setattr(server.time, "sleep", lambda _delay: None)
-        assert server._send_boot_prekey(delay=0) == "F7"
+        assert server._send_boot_prekey(
+            delay=0,
+            cartridge_state={"classification": "retro_replay", "label": "Retro Replay"},
+        ) == "F7"
         assert sent == [[{"kind": "keyboard", "inputs": ["f7"], "transition": "tap"}]]
     finally:
         server.CFG.clear(); server.CFG.update(previous)
@@ -3868,7 +3879,7 @@ def test_beta103_individual_sid_play_and_queue_controls_are_explicit():
     html = (static / "index.html").read_text(encoding="utf-8")
     js = (static / "app.js").read_text(encoding="utf-8")
     assert 'onclick="jkClearQueue()"' in html
-    assert 'title="clear queued tunes, turn Radio off and let the current SID finish"' in html
+    assert 'title="Clear queued tunes, turn Radio off and let the current SID finish"' in html
     assert 'async function jkClearQueue()' in js
     assert '"/api/juke/clear"' in js
     assert 'if(!removeCount&&!s.radio)' in js
@@ -3879,8 +3890,8 @@ def test_beta103_individual_sid_play_and_queue_controls_are_explicit():
     )[0]
     assert '"/api/juke/play_path"' in play_from
     assert '"/api/juke/folder"' not in play_from
-    assert 'title="play only this tune now"' in js
-    assert 'title="add only this tune to the current play queue' in js
+    assert 'title="Play only this tune now"' in js
+    assert 'title="Add only this tune to the current play queue' in js
 
 
 def test_juke_clear_disarms_radio_and_preserves_current_playback():
@@ -4357,7 +4368,12 @@ def _mount_boot_harness(monkeypatch, gate_results):
     monkeypatch.setattr(server, "_matrix_release_all", lambda **kwargs: None)
     monkeypatch.setattr(server, "_matrix_send",
                         lambda *args, **kwargs: matrix_events.append((args, kwargs)))
-    monkeypatch.setattr(server, "_boot_settle", lambda: None)
+    monkeypatch.setattr(server, "_boot_settle", lambda **kwargs: None)
+    monkeypatch.setattr(server, "_temporary_crt_reboot_before_mount_run", lambda: False)
+    monkeypatch.setattr(server, "_cartridge_preflight", lambda **kwargs: {
+        "known": True, "classification": "none", "label": "None",
+        "source": "test", "age_seconds": 0.0,
+    })
     monkeypatch.setattr(server, "_remember_mount", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "_bus_id_for", lambda drive: 8)
     monkeypatch.setattr(server, "_basic_ready_gate",
@@ -5177,7 +5193,12 @@ def test_rc4_mount_and_run_reboots_after_sid_before_mount(monkeypatch):
         monkeypatch.setattr(server, "_matrix_release_all", lambda **kwargs: None)
         monkeypatch.setattr(server, "_juke_disarm_machine_takeover", lambda reason: 1)
         monkeypatch.setattr(server, "_remember_mount", lambda *args, **kwargs: events.append(("remember",)))
-        monkeypatch.setattr(server, "_boot_settle", lambda: events.append(("settle",)))
+        monkeypatch.setattr(server, "_boot_settle", lambda **kwargs: events.append(("settle",)))
+        monkeypatch.setattr(server, "_temporary_crt_reboot_before_mount_run", lambda: False)
+        monkeypatch.setattr(server, "_cartridge_preflight", lambda **kwargs: {
+            "known": True, "classification": "none", "label": "None",
+            "source": "test", "age_seconds": 0.0,
+        })
         monkeypatch.setattr(server, "_bus_id_for", lambda drive: 8)
         monkeypatch.setattr(server, "_basic_ready_gate", lambda stage, **kwargs: "unsupported")
         monkeypatch.setattr(server.time, "sleep", lambda seconds: events.append(("sleep", seconds)))
@@ -5320,8 +5341,18 @@ def test_rc4_mount_and_run_while_sid_is_playing_reboots_before_mount(monkeypatch
             "stop_after_current": False,
         })
         monkeypatch.setattr(server, "_matrix_release_all", lambda **kwargs: None)
+        monkeypatch.setattr(server, "_temporary_crt_reboot_before_mount_run", lambda: False)
+        monkeypatch.setattr(server, "_cartridge_preflight", lambda **kwargs: {
+            "known": True, "classification": "none", "label": "None",
+            "source": "test", "age_seconds": 0.0,
+        })
         monkeypatch.setattr(server, "_remember_mount", lambda *args, **kwargs: None)
-        monkeypatch.setattr(server, "_boot_settle", lambda: events.append(("settle",)))
+        monkeypatch.setattr(server, "_boot_settle", lambda **kwargs: events.append(("settle",)))
+        monkeypatch.setattr(server, "_temporary_crt_reboot_before_mount_run", lambda: False)
+        monkeypatch.setattr(server, "_cartridge_preflight", lambda **kwargs: {
+            "known": True, "classification": "none", "label": "None",
+            "source": "test", "age_seconds": 0.0,
+        })
         monkeypatch.setattr(server, "_bus_id_for", lambda drive: 8)
         monkeypatch.setattr(server, "_basic_ready_gate", lambda stage, **kwargs: "unsupported")
         monkeypatch.setattr(server.time, "sleep", lambda seconds: events.append(("sleep", seconds)))
@@ -6729,18 +6760,21 @@ def test_rc19_diagnostics_contains_health_snapshot(monkeypatch):
     assert summary["health"]["limitations"]["fpga_utilisation_available"] is False
 
 
-# --- v1.9.0 Release Candidate 25 public packaging contract ---
+# --- v1.9.0 Release Candidate 32 packaging and inherited RC30 contract ---
 
-def test_rc25_public_documentation_identity_and_sidflow_contract():
+def test_rc32_documentation_identity_and_inherited_sidflow_contract():
     root = Path(server.ROOT)
     readme = (root / "README.md").read_text(encoding="utf-8")
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
     help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
     build = server.BUILD
-    assert f"v1.9.0 — Release Candidate 25 · build {build}" in readme
-    assert f"**Public build:** `{build}`" in changelog
-    assert "git tag v1.9.0-rc.25 && git push --tags" in readme
-    assert "v1.9.0-rc.24" not in readme
+    assert f"v1.9.0 — Release Candidate 44 · build {build}" in readme
+    assert f"**Public release-candidate build:** `{build}`" in changelog
+    assert "git tag v1.9.0-rc.44 && git push --tags" in readme
+    assert "Analyse Disk-Image Names" in readme
+    assert "terminal hyphen-delimited" in readme
+    assert "SQLite schema v5" in changelog
+    assert "v1.9.0-rc.25" not in readme
     normalized_readme = " ".join(readme.split())
     for text in (
         "194,351,886 bytes",
@@ -6767,7 +6801,7 @@ def test_rc25_public_documentation_identity_and_sidflow_contract():
     assert "about 48 seconds" in help_js
 
 
-def test_rc25_public_docs_cover_playlist_selection_before_playback_entry_paths():
+def test_rc26_docs_retain_playlist_selection_before_playback_entry_paths():
     root = Path(server.ROOT)
     readme = (root / "README.md").read_text(encoding="utf-8")
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -6777,3 +6811,2410 @@ def test_rc25_public_docs_cover_playlist_selection_before_playback_entry_paths()
         assert text in readme
     assert "Saved play queues before playback" in help_js
     assert "post-Clear Queue state" in changelog
+
+# --- v1.9.0 Release Candidate 26: stale manual-operation containment ---
+
+
+def test_rc26_coordinator_expires_only_opted_in_waiters():
+    from device_coordinator import DeviceOperationCoordinator, OperationExpired
+
+    coordinator = DeviceOperationCoordinator()
+    active = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        with coordinator.operation("interactive", "long device action"):
+            active.set()
+            assert release.wait(2.0)
+
+    thread = threading.Thread(target=holder, daemon=True)
+    thread.start()
+    assert active.wait(1.0)
+    try:
+        with pytest.raises(OperationExpired, match="expired while waiting"):
+            with coordinator.operation(
+                "interactive",
+                "manual Legacy key",
+                max_wait_seconds=0.04,
+            ):
+                pytest.fail("expired operation must never acquire the device")
+    finally:
+        release.set()
+        thread.join(1.0)
+
+    snap = coordinator.snapshot()
+    assert snap.expired == 1
+    expired = [row for row in coordinator.recent_operations(10)
+               if row["outcome"] == "expired"]
+    assert expired and expired[-1]["reason"] == "manual Legacy key"
+    # Existing unlimited callers remain unchanged.
+    with coordinator.operation("interactive", "ordinary operation"):
+        pass
+
+
+def test_rc26_legacy_keys_are_rejected_immediately_during_mount_run(monkeypatch):
+    calls = []
+
+    class FailCmd:
+        def type_petscii(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            pytest.fail("Legacy bytes must not be queued during Mount & Run")
+
+    request = type("Request", (), {
+        "headers": {"X-U64deck-Key-Origin": "screen-mirror"}
+    })()
+    monkeypatch.setattr(server, "cmd", FailCmd())
+    monkeypatch.setattr(server, "_mount_run_busy_payload", lambda: {"u64deck_busy": True})
+
+    with pytest.raises(HTTPException) as exc:
+        server.keys(request, {"petscii": [136]})
+    assert exc.value.status_code == 409
+    assert "not queued" in exc.value.detail
+    assert calls == []
+
+
+def test_rc26_legacy_keys_expire_without_delivery_behind_other_work(monkeypatch):
+    coordinator = server.DeviceOperationCoordinator()
+    command = ultimate.CommandSocket("192.0.2.64", coordinator=coordinator)
+    sends = []
+    monkeypatch.setattr(command, "_send", lambda command_id, payload=b"":
+                        sends.append((command_id, bytes(payload))))
+    monkeypatch.setattr(server, "DEVICE_OP", coordinator)
+    monkeypatch.setattr(server, "cmd", command)
+    monkeypatch.setattr(server, "_MANUAL_INPUT_MAX_WAIT", 0.04)
+    monkeypatch.setattr(server, "_mount_run_busy_payload", lambda: None)
+
+    active = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        with coordinator.operation("interactive", "playing SID"):
+            active.set()
+            assert release.wait(2.0)
+
+    thread = threading.Thread(target=holder, daemon=True)
+    thread.start()
+    assert active.wait(1.0)
+    request = type("Request", (), {
+        "headers": {"X-U64deck-Key-Origin": "screen-mirror"}
+    })()
+    try:
+        with pytest.raises(HTTPException) as exc:
+            server.keys(request, {"petscii": [133]})
+        assert exc.value.status_code == 409
+        assert "nothing was sent" in exc.value.detail
+        assert sends == []
+    finally:
+        release.set()
+        thread.join(1.0)
+
+    expired = [row for row in coordinator.recent_operations(10)
+               if row["outcome"] == "expired"]
+    assert expired
+    assert expired[-1]["reason"] == "keyboard input [screen-mirror]"
+
+
+def test_rc26_manual_reset_is_not_queued_during_mount_run(monkeypatch):
+    calls = []
+
+    class FailRest:
+        def put(self, path, **kwargs):
+            calls.append(path)
+            pytest.fail("manual Reset must not reach the Ultimate during Mount & Run")
+
+    monkeypatch.setattr(server, "rest", FailRest())
+    monkeypatch.setattr(server, "_mount_run_busy_payload", lambda: {"u64deck_busy": True})
+    monkeypatch.setattr(server, "_MANUAL_MACHINE_PENDING", "")
+
+    with pytest.raises(HTTPException) as exc:
+        server.machine("reset")
+    assert exc.value.status_code == 409
+    assert "Reset was not queued" in exc.value.detail
+    assert calls == []
+
+
+def test_rc26_manual_reset_expires_and_pending_claim_is_released(monkeypatch):
+    coordinator = server.DeviceOperationCoordinator()
+    puts = []
+
+    class FakeRest:
+        def put(self, path, **kwargs):
+            puts.append(path)
+            return {"errors": []}
+
+    monkeypatch.setattr(server, "DEVICE_OP", coordinator)
+    monkeypatch.setattr(server, "rest", FakeRest())
+    monkeypatch.setattr(server, "_MANUAL_MACHINE_MAX_WAIT", 0.04)
+    monkeypatch.setattr(server, "_mount_run_busy_payload", lambda: None)
+    monkeypatch.setattr(server, "_MANUAL_MACHINE_PENDING", "")
+
+    active = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        with coordinator.operation("interactive", "playing SID"):
+            active.set()
+            assert release.wait(2.0)
+
+    thread = threading.Thread(target=holder, daemon=True)
+    thread.start()
+    assert active.wait(1.0)
+    try:
+        with pytest.raises(HTTPException) as exc:
+            server.machine("reset")
+        assert exc.value.status_code == 409
+        assert "nothing was sent" in exc.value.detail
+        assert puts == []
+        assert server._MANUAL_MACHINE_PENDING == ""
+    finally:
+        release.set()
+        thread.join(1.0)
+
+
+def test_rc26_duplicate_reset_reboot_requests_are_coalesced(monkeypatch):
+    monkeypatch.setattr(server, "_mount_run_busy_payload", lambda: None)
+    monkeypatch.setattr(server, "_MANUAL_MACHINE_PENDING", "reset")
+    with pytest.raises(HTTPException) as exc:
+        server.machine("reboot")
+    assert exc.value.status_code == 409
+    assert "Reset is already pending" in exc.value.detail
+
+
+def test_rc26_cia1_input_and_release_all_do_not_use_manual_legacy_deadline(monkeypatch):
+    calls = []
+
+    def fake_matrix(events, **kwargs):
+        calls.append((list(events), dict(kwargs)))
+        return {"held": []}
+
+    monkeypatch.setattr(server, "_matrix_send", fake_matrix)
+    monkeypatch.setattr(server, "_input_status", lambda *args, **kwargs: {
+        "available": True,
+    })
+    monkeypatch.setattr(server, "_mount_run_busy_payload", lambda: {
+        "u64deck_busy": True,
+    })
+
+    result = server.input_events({
+        "events": [{"kind": "keyboard", "inputs": ["f7"], "transition": "tap"}]
+    })
+    released = server.input_release_all()
+    assert result["mode"] == "matrix" and result["sent"] == 1
+    assert released["released"] is True and released["mode"] == "matrix"
+    assert calls[0][0][0]["inputs"] == ["f7"]
+    assert calls[1][0] == [{"kind": "release_all"}]
+
+
+def test_rc26_browser_marks_legacy_origin_and_blocks_stale_manual_controls_only():
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    assert '"X-U64deck-Key-Origin":"screen-mirror"' in js
+    assert '"X-U64deck-Key-Origin":"type-line"' in js
+    assert "Mount & Run is in progress — Legacy keys were not queued" in js
+    assert 'MOUNT_RUN_BUSY&&(a==="reset"||a==="reboot")' in js
+    # CIA1 key events continue to use their existing endpoint and queue.
+    assert 'api("/api/input/events"' in js
+
+
+# --- v1.9.0 Release Candidate 27: Settings readiness and final documentation ---
+
+def test_rc27_settings_backend_names_exact_failed_operation(monkeypatch):
+    class BrokenRest:
+        def get_json(self, path):
+            raise RuntimeError("[WinError 10061] actively refused")
+
+    monkeypatch.setattr(server, "rest", BrokenRest())
+    before = len(server.DIAG_EVENTS)
+    with pytest.raises(HTTPException) as exc:
+        server.configs()
+    assert exc.value.status_code == 502
+    assert "Settings category list read failed" in exc.value.detail
+    events = list(server.DIAG_EVENTS)[before:]
+    assert events
+    assert events[-1]["message"].startswith("Settings category list read failed")
+    assert events[-1]["extra"]["operation"] == "category list read"
+
+
+def test_rc27_settings_category_diagnostic_names_category_and_detail(monkeypatch):
+    class BrokenRest:
+        def get_json(self, path):
+            raise ultimate.UltimateError("device unavailable")
+
+    monkeypatch.setattr(server, "rest", BrokenRest())
+    with pytest.raises(HTTPException) as exc:
+        server.config_category("Audio Mixer", detail=True)
+    assert "Settings category 'Audio Mixer' detail read failed" in exc.value.detail
+
+
+def test_rc27_frontend_gates_settings_until_info_and_retries_neutrally():
+    js = (Path(server.ROOT) / "static" / "app.js").read_text(encoding="utf-8")
+    html = (Path(server.ROOT) / "static" / "index.html").read_text(encoding="utf-8")
+    for text in (
+        "if(!LAST_DEVICE_INFO)",
+        "Ultimate connection not ready — retrying",
+        "settingsRetry",
+        "SET.maxRetries",
+        "Retry settings",
+        "settingsTransientError",
+        "if(document.querySelector(\"#tab-settings.active\")&&!SET.loaded)settingsRetry(0)",
+    ):
+        assert text in js
+    assert "Waiting for the Ultimate connection" in html
+    assert "Firmware settings load after the connection is ready" in html
+
+
+def test_rc27_settings_mutations_are_not_automatically_replayed():
+    js = (Path(server.ROOT) / "static" / "app.js").read_text(encoding="utf-8")
+    # Retry logic is confined to read-only category loading. Existing writes
+    # still call api() once and report their result directly.
+    save = js[js.index("async function saveDirty"):js.index("async function cfgAction") ]
+    action = js[js.index("async function cfgAction"):js.index("/* ---------- assembly64 ----------") ]
+    assert "settingsRetry" not in save
+    assert "settingsRetry" not in action
+    assert 'method:"POST"' in save
+    assert 'put("/api/configs_action/"+a)' in action
+
+
+def test_rc27_docs_record_legacy_retro_replay_scope_and_workaround():
+    root = Path(server.ROOT)
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    for text in (
+        "Legacy Retro Replay F7 requires the physical C64 keyboard",
+        "no buffer-injected F7 is sent",
+        "Automatic fastload-menu handling is currently supported and hardware-tested only for **Retro Replay**",
+        "CIA1 matrix-input path is unaffected",
+    ):
+        assert text in readme
+    assert "Physical F7 required" in help_js
+    assert "u64deck suppresses remote Legacy F7" in help_js
+    assert "No Mount & Run sequence, SID Stop path, CIA1 input" in changelog
+
+
+def test_rc27_docs_describe_settings_hard_refresh_fix():
+    root = Path(server.ROOT)
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "Connection-ready Settings startup" in readme
+    assert "Ctrl+F5" in readme
+    assert "hard browser refresh" in help_js
+    assert "bounded persistent failure" in help_js
+    assert "Ctrl+F5 refresh" in changelog
+
+# --- v1.9.0 Release Candidate 28: indexed disk-name analysis and approvals ---
+
+def _rc28_put_disk_names(store, parent, names):
+    store.put_directory(parent, [
+        {"name": name, "dir": False, "size": 174848, "mtime": "20260729070000"}
+        for name in names
+    ])
+
+
+def test_rc28_builtin_terminal_hyphen_ab_grouping_and_unsuffixed_veto():
+    names = ["the-hat-7a825b1-a.d64", "the-hat-7a825b1-b.d64"]
+    assert server._swap_group_candidates(names[0], names) == names
+    assert server._swap_group_candidates(
+        "Game-a.d64", ["Game.d64", "Game-a.d64", "Game-b.d64"]
+    ) == ["Game-a.d64"]
+    assert server._swap_group_candidates(
+        "Game-a.d64", ["Game-a.d64"]
+    ) == ["Game-a.d64"]
+    assert server._swap_group_candidates(
+        "Game-a.d64", ["Game-a.d64", "Game-c.d64"]
+    ) == ["Game-a.d64"]
+
+
+def test_rc28_index_schema_persists_approved_rules_across_clear(tmp_path):
+    store = IndexStore(tmp_path / "idx.sqlite3")
+    try:
+        rule = store.add_disk_group_rule({
+            "pattern_key": "terminal-letter:_:a,b:.d64",
+            "label": "terminal _a/b",
+            "kind": "terminal-letter",
+            "delimiter": "_",
+            "tokens": ["a", "b"],
+            "extensions": [".d64"],
+            "scope": "/",
+            "examples": [],
+            "last_match_count": 2,
+        })
+        override = store.add_disk_group_override(
+            "/USB0/Games", ["Boot.d64", "Data.d64"], "manual exact set"
+        )
+        assert store.metadata_get("schema_version") == "5"
+        before = store.stats()
+        assert before["disk_group_rules"] == 1
+        assert before["disk_group_overrides"] == 1
+        store.clear_all()
+        assert store.disk_group_rules()[0]["id"] == rule["id"]
+        assert store.disk_group_overrides()[0]["id"] == override["id"]
+    finally:
+        store.close()
+
+
+def test_rc28_disk_naming_analysis_classifies_realistic_patterns(tmp_path, monkeypatch):
+    store = IndexStore(tmp_path / "idx.sqlite3")
+    try:
+        _rc28_put_disk_names(store, "/USB0/Games", [
+            "the-hat-7a825b1-a.d64",
+            "the-hat-7a825b1-b.d64",
+            "Other_a.d64",
+            "Other_b.d64",
+            "Game[a].d64",
+            "Game[b].d64",
+            "Turrican1.d64",
+            "Turrican2.d64",
+        ])
+        monkeypatch.setattr(server, "_index_store", lambda: store)
+        report = server.fs_disk_naming_analysis()
+        assert report["summary"] == {
+            "indexed_disk_images": 8,
+            "directories": 1,
+            "recognised_sets": 1,
+            "recognised_files": 2,
+            "candidate_sets": 1,
+            "candidate_files": 2,
+            "ambiguous_sets": 1,
+            "rejected_sets": 1,
+        }
+        assert report["recognised"][0]["pattern"] == "terminal -a/-b"
+        candidate = report["candidates"][0]
+        assert candidate["delimiter"] == "_"
+        assert candidate["tokens"] == ["a", "b"]
+        assert candidate["examples"][0]["names"] == ["Other_a.d64", "Other_b.d64"]
+        assert report["ambiguous"][0]["pattern"] == "glued trailing numbers"
+        assert report["rejected"][0]["pattern"] == "GoodTools [a]/[b] alternatives"
+        assert "u64deck disk-image naming analysis" in report["report_text"]
+    finally:
+        store.close()
+
+
+def test_rc28_unsuffixed_sibling_is_rejected_not_approvable(tmp_path, monkeypatch):
+    store = IndexStore(tmp_path / "idx.sqlite3")
+    try:
+        _rc28_put_disk_names(store, "/USB0/Games", [
+            "Other.d64", "Other_a.d64", "Other_b.d64",
+        ])
+        monkeypatch.setattr(server, "_index_store", lambda: store)
+        report = server.fs_disk_naming_analysis()
+        assert report["candidates"] == []
+        assert report["rejected"][0]["pattern"] == "unsuffixed sibling veto"
+    finally:
+        store.close()
+
+
+def test_rc28_candidate_rule_requires_confirmation_api_and_applies_immediately(tmp_path, monkeypatch):
+    store = IndexStore(tmp_path / "idx.sqlite3")
+    try:
+        names = ["Other_a.d64", "Other_b.d64"]
+        _rc28_put_disk_names(store, "/USB0/Games", names)
+        monkeypatch.setattr(server, "_index_store", lambda: store)
+        candidate = server.fs_disk_naming_analysis()["candidates"][0]
+        result = server.fs_disk_naming_rule_approve({
+            "pattern_key": candidate["pattern_key"],
+            "scope": "/",
+        })
+        saved = result["approved"]
+        assert saved["kind"] == "terminal-letter"
+        assert saved["delimiter"] == "_"
+        assert saved["last_match_count"] == 1
+        assert server._swap_group_candidates(
+            names[0], names, "/USB0/Games"
+        ) == names
+
+        disabled = server.fs_disk_naming_rule_update(saved["id"], {"enabled": False})
+        assert disabled["rule"]["enabled"] is False
+        assert server._swap_group_candidates(
+            names[0], names, "/USB0/Games"
+        ) == [names[0]]
+
+        enabled = server.fs_disk_naming_rule_update(saved["id"], {"enabled": True})
+        assert enabled["rule"]["enabled"] is True
+        assert server.fs_disk_naming_rule_delete(saved["id"])["removed"] == saved["id"]
+        assert store.disk_group_rules() == []
+    finally:
+        store.close()
+
+
+def test_rc28_rule_api_does_not_accept_arbitrary_patterns(tmp_path, monkeypatch):
+    store = IndexStore(tmp_path / "idx.sqlite3")
+    try:
+        _rc28_put_disk_names(store, "/USB0/Games", ["Other_a.d64", "Other_b.d64"])
+        monkeypatch.setattr(server, "_index_store", lambda: store)
+        with pytest.raises(HTTPException) as exc:
+            server.fs_disk_naming_rule_approve({
+                "pattern_key": "regex:.*:anything",
+                "scope": "/",
+            })
+        assert exc.value.status_code == 409
+        assert store.disk_group_rules() == []
+    finally:
+        store.close()
+
+
+def test_rc28_folder_scoped_rule_does_not_leak_to_other_folders(tmp_path, monkeypatch):
+    store = IndexStore(tmp_path / "idx.sqlite3")
+    try:
+        names = ["Other_a.d64", "Other_b.d64"]
+        _rc28_put_disk_names(store, "/USB0/Games", names)
+        _rc28_put_disk_names(store, "/USB0/Demos", names)
+        monkeypatch.setattr(server, "_index_store", lambda: store)
+        candidate = server.fs_disk_naming_analysis()["candidates"][0]
+        server.fs_disk_naming_rule_approve({
+            "pattern_key": candidate["pattern_key"],
+            "scope": "/USB0/Games",
+        })
+        assert server._swap_group_candidates(names[0], names, "/USB0/Games") == names
+        assert server._swap_group_candidates(names[0], names, "/USB0/Demos") == [names[0]]
+    finally:
+        store.close()
+
+
+def test_rc28_exact_set_override_preserves_order_and_is_reversible(tmp_path, monkeypatch):
+    store = IndexStore(tmp_path / "idx.sqlite3")
+    try:
+        names = ["Boot.d64", "Data.d64", "Extras.d64"]
+        _rc28_put_disk_names(store, "/USB0/Custom", names)
+        monkeypatch.setattr(server, "_index_store", lambda: store)
+        approved = server.fs_disk_naming_override_approve({
+            "parent": "/USB0/Custom",
+            "names": ["Data.d64", "Boot.d64"],
+            "label": "boot after data",
+        })["approved"]
+        assert approved["names"] == ["Data.d64", "Boot.d64"]
+        assert server._swap_group_candidates(
+            "Boot.d64", names, "/USB0/Custom"
+        ) == ["Data.d64", "Boot.d64"]
+        server.fs_disk_naming_override_update(approved["id"], {"enabled": False})
+        assert server._swap_group_candidates(
+            "Boot.d64", names, "/USB0/Custom"
+        ) == ["Boot.d64"]
+        assert server.fs_disk_naming_override_delete(approved["id"])["removed"] == approved["id"]
+    finally:
+        store.close()
+
+
+def test_rc28_disk_naming_frontend_is_explicit_and_non_automatic():
+    root = Path(server.ROOT)
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    for text in (
+        "DISK IMAGE NAMING ANALYSIS",
+        "Uses only filenames already stored in the SQLite index",
+        "Analysis is read-only",
+        "Analyse Disk-Image Names",
+        "Copy Analysis Report",
+    ):
+        assert text in html
+    for text in (
+        "diskNamingApproveRule",
+        "diskNamingApproveRuleForFolder",
+        "diskNamingApproveExactByIndex",
+        "Approve this reusable disk-grouping pattern?",
+        "No files will be renamed or modified",
+        "/api/fs/index/disk-naming",
+    ):
+        assert text in js
+
+
+def test_rc28_candidate_aggregates_observed_disk_extensions(tmp_path, monkeypatch):
+    store = IndexStore(tmp_path / "idx.sqlite3")
+    try:
+        _rc28_put_disk_names(store, "/USB0/D64", ["Pair_a.d64", "Pair_b.d64"])
+        _rc28_put_disk_names(store, "/USB0/G64", ["Pair_a.g64", "Pair_b.g64"])
+        monkeypatch.setattr(server, "_index_store", lambda: store)
+        report = server.fs_disk_naming_analysis()
+        assert len(report["candidates"]) == 1
+        candidate = report["candidates"][0]
+        assert candidate["extensions"] == [".d64", ".g64"]
+        assert candidate["sets"] == 2
+        assert candidate["files"] == 4
+    finally:
+        store.close()
+
+
+def test_rc28_analysis_reports_mixed_marker_families(tmp_path, monkeypatch):
+    store = IndexStore(tmp_path / "idx.sqlite3")
+    try:
+        _rc28_put_disk_names(store, "/USB0/Mixed", [
+            "Game-Disk1.d64", "Game-Side2.d64",
+        ])
+        monkeypatch.setattr(server, "_index_store", lambda: store)
+        report = server.fs_disk_naming_analysis()
+        mixed = next(row for row in report["rejected"]
+                     if row["pattern"] == "mixed marker families")
+        assert mixed["sets"] == 1
+        assert mixed["examples"][0]["names"] == [
+            "Game-Disk1.d64", "Game-Side2.d64",
+        ]
+    finally:
+        store.close()
+
+
+def test_rc28_frontend_allows_explicit_exact_override_for_ambiguous_and_rejected_sets():
+    js = (Path(server.ROOT) / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'map={candidate:"candidates",ambiguous:"ambiguous",rejected:"rejected"}' in js
+    assert "This set is ambiguous" in js
+    assert "This set was rejected by a safety rule" in js
+    assert "Exact approval overrides that protection only for these filenames" in js
+    assert "document.execCommand(\"copy\")" in js
+
+
+def test_rc28_schema_upgrade_from_v4_preserves_existing_index_rows(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "legacy-v4.sqlite3"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript("""
+            CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE directories (path TEXT PRIMARY KEY, scanned_at REAL NOT NULL);
+            CREATE TABLE fs_entries (
+                parent TEXT NOT NULL,
+                path TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                name_lower TEXT NOT NULL,
+                is_dir INTEGER NOT NULL,
+                size INTEGER NOT NULL DEFAULT 0,
+                mtime TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(parent) REFERENCES directories(path) ON DELETE CASCADE
+            );
+            INSERT INTO metadata VALUES('schema_version','4');
+            INSERT INTO directories VALUES('/USB0/Games', 1.0);
+            INSERT INTO fs_entries VALUES(
+                '/USB0/Games','/USB0/Games/Existing.d64','Existing.d64',
+                'existing.d64',0,174848,'20260729070000'
+            );
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = IndexStore(path)
+    try:
+        assert store.metadata_get("schema_version") == "5"
+        assert store.get_directory("/USB0/Games")[0]["name"] == "Existing.d64"
+        assert store.disk_group_rules() == []
+        assert store.disk_group_overrides() == []
+    finally:
+        store.close()
+
+
+# --- v1.9.0 Release Candidate 29: ambiguous batch approvals and reset controls ---
+
+def test_rc29_batch_approves_selected_ambiguous_sets_as_exact_overrides(tmp_path, monkeypatch):
+    store = IndexStore(tmp_path / "idx.sqlite3")
+    try:
+        _rc28_put_disk_names(store, "/USB0/A", ["Pack1.d64", "Pack2.d64"])
+        _rc28_put_disk_names(store, "/USB0/B", ["Film A.d64", "Film B.d64"])
+        monkeypatch.setattr(server, "_index_store", lambda: store)
+        report = server.fs_disk_naming_analysis()
+        set_ids = [example["set_id"] for bucket in report["ambiguous"]
+                   for example in bucket["examples"]]
+        result = server.fs_disk_naming_override_batch_approve({"set_ids": set_ids})
+        assert result["summary"] == {"sets": 2, "files": 4, "folders": 2}
+        assert len(store.disk_group_overrides()) == 2
+        assert server._swap_group_candidates(
+            "Pack1.d64", ["Pack1.d64", "Pack2.d64"], "/USB0/A"
+        ) == ["Pack1.d64", "Pack2.d64"]
+        assert server._swap_group_candidates(
+            "Film A.d64", ["Film A.d64", "Film B.d64"], "/USB0/B"
+        ) == ["Film A.d64", "Film B.d64"]
+    finally:
+        store.close()
+
+
+def test_rc29_folder_batch_approves_every_ambiguous_set_in_that_folder_only(tmp_path, monkeypatch):
+    store = IndexStore(tmp_path / "idx.sqlite3")
+    try:
+        _rc28_put_disk_names(store, "/USB0/Many", [
+            "Alpha1.d64", "Alpha2.d64", "Beta1.d64", "Beta2.d64",
+        ])
+        _rc28_put_disk_names(store, "/USB0/Other", ["Gamma1.d64", "Gamma2.d64"])
+        monkeypatch.setattr(server, "_index_store", lambda: store)
+        report = server.fs_disk_naming_analysis()
+        stats = next(item for item in report["ambiguous_folders"]
+                     if item["parent"] == "/USB0/Many")
+        assert stats == {"parent": "/USB0/Many", "sets": 2, "files": 4}
+        result = server.fs_disk_naming_override_batch_approve({"parent": "/USB0/Many"})
+        assert result["summary"] == {"sets": 2, "files": 4, "folders": 1}
+        assert {row["parent"] for row in store.disk_group_overrides()} == {"/USB0/Many"}
+        assert server._swap_group_candidates(
+            "Gamma1.d64", ["Gamma1.d64", "Gamma2.d64"], "/USB0/Other"
+        ) == ["Gamma1.d64"]
+    finally:
+        store.close()
+
+
+def test_rc29_batch_endpoint_rejects_protected_sets(tmp_path, monkeypatch):
+    store = IndexStore(tmp_path / "idx.sqlite3")
+    try:
+        _rc28_put_disk_names(store, "/USB0/Games", ["Game[a].d64", "Game[b].d64"])
+        monkeypatch.setattr(server, "_index_store", lambda: store)
+        protected_id = server.fs_disk_naming_analysis()["rejected"][0]["examples"][0]["set_id"]
+        with pytest.raises(HTTPException) as exc:
+            server.fs_disk_naming_override_batch_approve({"set_ids": [protected_id]})
+        assert exc.value.status_code == 409
+        assert store.disk_group_overrides() == []
+    finally:
+        store.close()
+
+
+def test_rc29_bulk_exact_set_management_is_atomic(tmp_path, monkeypatch):
+    store = IndexStore(tmp_path / "idx.sqlite3")
+    try:
+        first = store.add_disk_group_override("/USB0/A", ["A1.d64", "A2.d64"])
+        second = store.add_disk_group_override("/USB0/B", ["B1.d64", "B2.d64"])
+        monkeypatch.setattr(server, "_index_store", lambda: store)
+        disabled = server.fs_disk_naming_override_batch_manage({
+            "action": "disable", "ids": [first["id"], second["id"]],
+        })
+        assert disabled["result"]["count"] == 2
+        assert all(not row["enabled"] for row in store.disk_group_overrides())
+        server.fs_disk_naming_override_batch_manage({
+            "action": "enable", "ids": [first["id"], second["id"]],
+        })
+        assert all(row["enabled"] for row in store.disk_group_overrides())
+        server.fs_disk_naming_override_batch_manage({
+            "action": "remove", "ids": [first["id"], second["id"]],
+        })
+        assert store.disk_group_overrides() == []
+    finally:
+        store.close()
+
+
+def test_rc29_remove_all_local_approvals_preserves_builtin_grouping(tmp_path, monkeypatch):
+    store = IndexStore(tmp_path / "idx.sqlite3")
+    try:
+        store.add_disk_group_rule({
+            "pattern_key": "terminal-letter:_:a,b:.d64",
+            "label": "terminal _a/b", "kind": "terminal-letter", "delimiter": "_",
+            "tokens": ["a", "b"], "extensions": [".d64"], "scope": "/",
+            "examples": [], "last_match_count": 1,
+        })
+        store.add_disk_group_override("/USB0/Custom", ["Boot.d64", "Data.d64"])
+        monkeypatch.setattr(server, "_index_store", lambda: store)
+        result = server.fs_disk_naming_remove_all_approvals()
+        assert result["removed"] == {"rules": 1, "overrides": 1, "total": 2}
+        assert store.disk_group_rules() == []
+        assert store.disk_group_overrides() == []
+        names = ["the-hat-7a825b1-a.d64", "the-hat-7a825b1-b.d64"]
+        assert server._swap_group_candidates(names[0], names, "/USB0/Games") == names
+    finally:
+        store.close()
+
+
+def test_rc29_remove_all_local_approvals_rolls_back_if_second_delete_fails(tmp_path):
+    import sqlite3
+
+    store = IndexStore(tmp_path / "idx.sqlite3")
+    try:
+        store.add_disk_group_rule({
+            "pattern_key": "terminal-letter:_:a,b:.d64",
+            "label": "terminal _a/b", "kind": "terminal-letter", "delimiter": "_",
+            "tokens": ["a", "b"], "extensions": [".d64"], "scope": "/",
+            "examples": [], "last_match_count": 1,
+        })
+        store.add_disk_group_override("/USB0/Custom", ["Boot.d64", "Data.d64"])
+        with store._lock, store._conn:
+            store._conn.execute("""
+                CREATE TRIGGER fail_override_delete BEFORE DELETE ON disk_group_overrides
+                BEGIN SELECT RAISE(ABORT, 'forced rollback'); END
+            """)
+        with pytest.raises(sqlite3.IntegrityError):
+            store.remove_all_disk_group_approvals()
+        assert len(store.disk_group_rules()) == 1
+        assert len(store.disk_group_overrides()) == 1
+    finally:
+        store.close()
+
+
+def test_rc29_frontend_exposes_safe_ambiguous_batch_and_reset_controls():
+    root = Path(server.ROOT)
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    for text in (
+        "Approve selected examples", "Approve all ambiguous", "Approve folder",
+        "Approve all covers every current ambiguous set",
+        "Remove all local approvals", "Final confirmation",
+        "/api/fs/index/disk-naming/overrides/batch",
+        "/api/fs/index/disk-naming/overrides/manage",
+        "/api/fs/index/disk-naming/approvals",
+    ):
+        assert text in js
+    assert "Analysis is optional" in readme
+    assert "exact-set overrides only" in readme
+    assert "Remove all local approvals" in help_js
+
+
+# --- v1.9.0 Release Candidate 30: streamed SID fade ---
+
+def test_rc30_fade_defaults_and_bounds():
+    previous = dict(server.CFG)
+    try:
+        assert server.DEFAULT_CONFIG["sid_jukebox_browser_fade_enabled"] is True
+        assert server.DEFAULT_CONFIG["sid_jukebox_browser_fade_secs"] == 2.5
+        server.CFG["sid_jukebox_browser_fade_enabled"] = True
+        server.CFG["sid_jukebox_browser_fade_secs"] = 2.5
+        assert server._juke_browser_fade_seconds() == 2.5
+        server.CFG["sid_jukebox_browser_fade_secs"] = 99
+        assert server._juke_browser_fade_seconds() == 10.0
+        server.CFG["sid_jukebox_browser_fade_secs"] = 0.1
+        assert server._juke_browser_fade_seconds() == 0.5
+        server.CFG["sid_jukebox_browser_fade_enabled"] = False
+        assert server._juke_browser_fade_seconds() == 0.0
+    finally:
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc30_songlength_plan_uses_complete_fade_and_unknown_tunes_do_not(monkeypatch):
+    previous = dict(server.CFG)
+    try:
+        server.CFG["sid_jukebox_browser_fade_enabled"] = True
+        server.CFG["sid_jukebox_browser_fade_secs"] = 2.5
+        server.CFG["sid_jukebox_end_grace_secs"] = 5.0
+        monkeypatch.setattr(server, "_juke_length", lambda item, song: 120.0)
+        # Fade replaces the separate grace instead of combining with it.
+        assert server._juke_auto_advance_plan({}, 1) == (120.0, 2.5, 122.5, "songlengths")
+        monkeypatch.setattr(server, "_juke_length", lambda item, song: None)
+        server.CFG["sid_default_secs"] = 180
+        assert server._juke_auto_advance_plan({}, 1) == (180.0, 1.0, 181.0, "fallback")
+    finally:
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc30_ssl_extension_changes_only_selected_subtune(monkeypatch):
+    previous = dict(server.SONGLENGTHS)
+    try:
+        server.SONGLENGTHS.clear(); server.SONGLENGTHS["abc"] = [60.0, 90.0, 120.0]
+        monkeypatch.setattr(server, "_parse_sid", lambda data: {"md5": "abc", "songs": 3})
+        payload = server._sid_ssl_payload(b"sid", songnr=2, extension_secs=2.5)
+        assert payload == bytes([0x01, 0x00, 0x01, 0x33, 0x02, 0x00])
+    finally:
+        server.SONGLENGTHS.clear(); server.SONGLENGTHS.update(previous)
+
+
+def test_rc30_fade_settings_endpoint_validates_and_persists(monkeypatch):
+    previous = dict(server.CFG); saved = []
+    try:
+        monkeypatch.setattr(server, "save_config", lambda: saved.append(True))
+        monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+        result = server.juke_fade_set({"enabled": True, "duration_secs": 3.0})
+        assert result["enabled"] is True and result["duration_secs"] == 3.0
+        assert result["applies_from_next_sid"] is True and saved == [True]
+        with pytest.raises(server.HTTPException, match="between 0.5 and 10"):
+            server.juke_fade_set({"enabled": True, "duration_secs": 20})
+        with pytest.raises(server.HTTPException, match="enabled must"):
+            server.juke_fade_set({"enabled": "yes", "duration_secs": 2.5})
+    finally:
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc30_active_fade_state_is_reconstructable(monkeypatch):
+    previous_juke = dict(server.JUKE); previous_cfg = dict(server.CFG)
+    try:
+        server.CFG["sid_jukebox_browser_fade_enabled"] = True
+        server.CFG["sid_jukebox_browser_fade_secs"] = 2.5
+        server.JUKE.clear(); server.JUKE.update({
+            "items": [], "index": -1, "playing": True, "shuffle": False,
+            "radio": False, "song": 1, "timer": None, "folder": "", "loading": False,
+            "source": "test", "generation": 7, "stop_after_current": False,
+            "playback_started_monotonic": 100.0, "playback_length_secs": 120.0,
+            "playback_auto_advance_secs": 122.5, "playback_duration_source": "songlengths",
+            "playback_fade_secs": 2.5, "playback_id": 7,
+        })
+        monkeypatch.setattr(server.time, "monotonic", lambda: 121.0)
+        state = server._juke_state()["active_browser_fade"]
+        assert state["enabled"] is True and state["playback_id"] == 7
+        assert state["starts_in_secs"] == 99.0
+        assert state["remaining_secs"] == 101.5
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous_juke)
+        server.CFG.clear(); server.CFG.update(previous_cfg)
+
+
+def test_rc30_frontend_uses_shared_gain_and_calls_out_hardware_limitation():
+    root = Path(server.ROOT); js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
+    assert "AUDIO_OUTPUT_GAIN" in js and "linearRampToValueAtTime(0" in js
+    assert "src.connect(ensureAudioOutputGain())" in js
+    assert "audioRecordDestinationSet(REC.audioDest)" in js
+    assert 'id="jkFadeEnabled"' in html and 'id="jkFadeSecs"' in html
+    assert "Ultimate HDMI and analogue audio do not fade" in html
+    assert "Ultimate HDMI and analogue output remain at full volume" in help_js
+
+
+def test_rc30_documentation_and_example_describe_browser_only_fade():
+    root = Path(server.ROOT); readme = (root / "README.md").read_text(encoding="utf-8")
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    example = json.loads((root / "config.example.json").read_text(encoding="utf-8"))
+    assert example["sid_jukebox_browser_fade_enabled"] is True
+    assert example["sid_jukebox_browser_fade_secs"] == 2.5
+    normalized = " ".join(readme.split())
+    assert "Fade streamed SID ending" in normalized
+    assert "browser recordings only" in normalized
+    assert "Release Candidate 30" in changelog
+
+
+def test_rc30_play_timing_reports_fade_and_native_extension(monkeypatch):
+    previous_juke = dict(server.JUKE); previous_cfg = dict(server.CFG); captured = {}
+    item = {"label":"Fade.sid","path":"/HVSC/Fade.sid","data":b"sid",
+            "meta":{"name":"Fade","start_song":1,"songs":1}}
+    class FakeTimer:
+        def __init__(self, interval, callback, args=()): captured.update(interval=interval,args=args)
+        def start(self): captured["started"] = True
+        def cancel(self): pass
+    try:
+        server.CFG["sid_jukebox_browser_fade_enabled"] = True
+        server.CFG["sid_jukebox_browser_fade_secs"] = 2.5
+        server.JUKE.clear(); server.JUKE.update({"items":[item],"index":-1,"playing":False,
+            "shuffle":False,"radio":False,"song":0,"timer":None,"folder":"","loading":False,
+            "source":"test","generation":0,"stop_after_current":False})
+        monkeypatch.setattr(server, "_cart_configured", lambda: "")
+        monkeypatch.setattr(server, "_juke_auto_advance_plan", lambda item,song:(120.0,2.5,122.5,"songlengths"))
+        monkeypatch.setattr(server, "_post_sid_upload", lambda *a, **kw: captured.update(upload=kw) or {})
+        monkeypatch.setattr(server._threading, "Timer", FakeTimer)
+        monkeypatch.setattr(server, "_diag_event", lambda *a, **kw: None)
+        out = server._juke_play(0)
+        assert captured["upload"]["songlength_extension_secs"] == 2.5
+        assert captured["interval"] == 122.5 and captured["started"] is True
+        assert out["play_timing"]["browser_fade_secs"] == 2.5
+        assert out["play_timing"]["native_length_extension_secs"] == 2.5
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous_juke)
+        server.CFG.clear(); server.CFG.update(previous_cfg)
+
+
+# --- v1.9.0 Release Candidate 32: silent fade handoff and favourite queue action ---
+
+def test_rc31_juke_state_exposes_playback_generation_for_browser_handoff():
+    previous = dict(server.JUKE)
+    try:
+        server.JUKE["playback_id"] = 42
+        state = server._juke_state()
+        assert state["playback_id"] == 42
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+def test_rc31_frontend_holds_zero_until_replacement_generation_and_clears_tail():
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    assert "jukeFadeHoldSilence" in js
+    assert "jukeFadeAwaitReplacement" in js
+    assert 'const current=String(s?.playback_id||s?.active_browser_fade?.playback_id||"")' in js
+    assert "flushBrowserAudio();JUKE_FADE_HELD=false;jkRender(s)" in js
+    assert "jukeFadeGainImmediate(1)},d*1000+50" not in js
+    assert "JUKE_FADE_RESTORE_TIMER" not in js
+    assert "jukeFadePrepareReplacement" in js
+    assert "AUDIO_JUKE_STOP_MUTED||JUKE_FADE_HELD" in js
+
+
+def test_rc31_favourite_sid_cards_offer_non_interrupting_queue_action():
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'item.type==="sid"&&item.action==="sid_play"' in js
+    assert "queueSavedSid(JSON.parse" in js
+    assert "Add to the SID play queue without interrupting playback" in js
+    assert 'return jkAdd(p.folder||"/",p.name)' in js
+
+
+def test_rc31_docs_explain_fade_handoff_and_favourite_queue_action():
+    root = Path(server.ROOT)
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    normalized = " ".join(readme.split())
+    assert "holds browser gain at zero" in normalized
+    assert "＋ appends the SID" in normalized
+    assert "browser remains silent until a new playback generation is confirmed" in help_js
+    assert "Release Candidate 32" in changelog
+
+
+# --- v1.9.0 Release Candidate 32: stable queue mutation, year search and Now Playing polish ---
+
+class _Rc32Timer:
+    def cancel(self): pass
+
+
+def _rc32_juke_state(items, index=0, generation=9, queue_revision=3):
+    return {"items": items, "index": index, "playing": True, "shuffle": False,
+            "radio": False, "song": 1, "timer": _Rc32Timer(), "folder": "/HVSC",
+            "loading": False, "source": "test", "generation": generation,
+            "queue_revision": queue_revision, "stop_after_current": False,
+            "playback_started_monotonic": 0.0, "playback_length_secs": 0.0,
+            "playback_auto_advance_secs": 0.0, "playback_duration_source": "",
+            "playback_fade_secs": 0.0, "playback_id": generation}
+
+
+def test_rc32_add_path_mutates_queue_without_invalidating_playback(monkeypatch):
+    previous = dict(server.JUKE)
+    try:
+        current = {"label":"Current.sid", "path":"/HVSC/Current.sid", "data":b"sid",
+                   "meta":{"name":"Current", "songs":1, "start_song":1}}
+        server.JUKE.clear(); server.JUKE.update(_rc32_juke_state([current]))
+        monkeypatch.setattr(server, "_sid_metadata_get", lambda store, path: {})
+        monkeypatch.setattr(server, "_index_store", lambda: object())
+        out = server.juke_add_path({"path":"/HVSC/Next.sid"})
+        assert server.JUKE["generation"] == 9
+        assert server.JUKE["queue_revision"] == 4
+        assert len(server.JUKE["items"]) == 2 and out["added"] == "Next.sid"
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+def test_rc32_sidflow_insert_keeps_current_generation(monkeypatch):
+    previous = dict(server.JUKE)
+    try:
+        current = {"label":"Current.sid", "path":"/HVSC/Current.sid", "data":b"sid",
+                   "meta":{"name":"Current", "songs":1, "start_song":1}}
+        recommended = {"label":"Match.sid", "path":"/HVSC/Match.sid", "data":None,
+                       "meta":{"name":"Match", "songs":1, "start_song":1}}
+        server.JUKE.clear(); server.JUKE.update(_rc32_juke_state([current]))
+        monkeypatch.setattr(server, "_sidflow_recommendations",
+                            lambda *a, **k: ([recommended], {"track_id":"seed#1"}))
+        monkeypatch.setattr(server, "_diag_event", lambda *a, **k: None)
+        out = server._sidflow_append("/HVSC/Current.sid", 1, insert_after=0)
+        assert server.JUKE["generation"] == 9
+        assert server.JUKE["queue_revision"] == 4
+        assert out["added"] == 1 and server.JUKE["items"][1]["label"] == "Match.sid"
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+def test_rc32_removing_future_entry_keeps_timer_generation_but_current_removal_invalidates():
+    previous = dict(server.JUKE)
+    try:
+        items = [{"label":f"{n}.sid", "path":f"/HVSC/{n}.sid", "data":b"sid",
+                  "meta":{"name":n, "songs":1, "start_song":1}} for n in ("A","B","C")]
+        server.JUKE.clear(); server.JUKE.update(_rc32_juke_state(items, index=0))
+        server.juke_remove({"index":2})
+        assert server.JUKE["generation"] == 9 and server.JUKE["queue_revision"] == 4
+        server.juke_remove({"index":0})
+        assert server.JUKE["generation"] == 10 and server.JUKE["queue_revision"] == 5
+        assert server.JUKE["playing"] is False
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+def test_rc32_release_year_extraction_and_metadata_filter(tmp_path: Path):
+    from index_store import _release_year
+    assert _release_year("1987") == "1987"
+    assert _release_year("(C) 1988 Ocean") == "1988"
+    assert _release_year("version 11987") == ""
+    store = IndexStore(tmp_path / "idx.sqlite3")
+    try:
+        base = {"size":1,"mtime":"","format":"PSID","version":2,"songs":1,
+                "start_song":1,"title":"","author":"","chip":"6581","clock":"PAL",
+                "sids":1,"md5":"","source":"test"}
+        store.put_sid_metadata("/HVSC/A.sid", 1, "", {**base,"name":"A","released":"1987"})
+        store.put_sid_metadata("/HVSC/B.sid", 1, "", {**base,"name":"B","released":"(C) 1988"})
+        store.put_sid_metadata("/HVSC/C.sid", 1, "", {**base,"name":"C","released":"11987"})
+        result = store.sid_metadata_search("/HVSC", year="1987")
+        assert result["total"] == 1 and result["results"][0]["name"] == "A.sid"
+    finally:
+        store.close()
+
+
+def test_rc32_search_endpoint_validates_and_combines_year(monkeypatch):
+    class Store:
+        def sid_metadata_count(self, root): return 3
+        def sid_metadata_search(self, root, q, **kwargs):
+            assert kwargs["year"] == "1987" and kwargs["chip"] == "6581"
+            return {"total":0,"results":[]}
+    monkeypatch.setattr(server, "_index_store", lambda: Store())
+    monkeypatch.setattr(server, "_configured_hvsc_root", lambda: "/HVSC")
+    out = server.juke_search(q="", limit=100, chip="6581", sid_format="all", year="1987")
+    assert out["year"] == "1987" and out["total"] == 0
+    with pytest.raises(server.HTTPException, match="four-digit"):
+        server.juke_search(q="", limit=100, chip="all", sid_format="all", year="87")
+
+
+def test_rc32_frontend_has_larger_now_playing_year_filter_and_clear_row_tooltip():
+    root = Path(server.ROOT)
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    css = (root / "static" / "app.css").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
+    assert 'id="jkNow" class="jk-now"' in html
+    assert ".jk-now{color:var(--txt);font-size:15px" in css
+    assert 'id="jkYear"' in html and "Chip/Format/Year filter" in js
+    assert "new URLSearchParams({q,chip,format,year})" in js
+    assert "Find tunes similar to this queue entry" in js
+    assert "standalone year" in help_js
+
+
+def test_rc32_docs_describe_queue_contract_and_identity():
+    root = Path(server.ROOT)
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "Release Candidate 44" in readme
+    assert "Release Candidate 44" in changelog
+    assert "does not invalidate" in readme
+
+
+def test_rc32_auto_advance_remains_live_after_appending_future_sid(monkeypatch):
+    previous = dict(server.JUKE); calls = []
+    try:
+        current = {"label":"Current.sid", "path":"/HVSC/Current.sid", "data":b"sid",
+                   "meta":{"name":"Current", "songs":1, "start_song":1}}
+        server.JUKE.clear(); server.JUKE.update(_rc32_juke_state([current]))
+        monkeypatch.setattr(server, "_sid_metadata_get", lambda store, path: {})
+        monkeypatch.setattr(server, "_index_store", lambda: object())
+        server.juke_add_path({"path":"/HVSC/Next.sid"})
+        monkeypatch.setattr(server, "_juke_play",
+                            lambda index, **kwargs: calls.append((index, kwargs)))
+        server._juke_auto_next(9)
+        assert calls == [(1, {"expected_generation": 9})]
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+# --- v1.9.0 Release Candidate 33: complete SIDFlow local-presence catalogue ---
+
+def test_rc33_sid_presence_catalogue_unions_partial_metadata_with_file_index(tmp_path: Path):
+    store = IndexStore(tmp_path / "idx.sqlite3")
+    try:
+        store.put_directory("/USB0/HVSC", [
+            {"name": "A.sid", "dir": False, "size": 10, "mtime": "1"},
+            {"name": "B.sid", "dir": False, "size": 11, "mtime": "2"},
+        ])
+        store.put_sid_metadata(
+            "/USB0/HVSC/A.sid", 10, "1",
+            {"name": "A.sid", "format": "PSID", "version": 2,
+             "songs": 1, "start_song": 1, "title": "A", "author": "",
+             "released": "", "chip": "6581", "clock": "PAL", "sids": 1,
+             "md5": "", "source": "played SID"},
+            source="played SID",
+        )
+        catalogue = store.sid_presence_catalogue("/USB0/HVSC")
+        assert catalogue["metadata_count"] == 1
+        assert catalogue["file_count"] == 2
+        assert set(catalogue["metadata_paths"]) == {"/USB0/HVSC/A.sid"}
+        assert set(catalogue["file_paths"]) == {
+            "/USB0/HVSC/A.sid", "/USB0/HVSC/B.sid"
+        }
+    finally:
+        store.close()
+
+
+def test_rc33_sidflow_uses_file_index_when_metadata_catalogue_is_partial(monkeypatch):
+    class FakeStore:
+        def status(self): return {"available": True, "tracks": 3}
+        def lookup(self, rel, song):
+            return {"track_id": f"{rel}#{song}", "sid_path": rel,
+                    "song_index": song}
+        def rank(self, seed, *, limit, present_paths, exclude_track_ids,
+                 exclude_sid_paths=(), same_file_policy="prefer_other"):
+            assert "musicians/b/b.sid" in present_paths
+            assert "musicians/c/c.sid" in present_paths
+            return [{"track_id": "MUSICIANS/B/B.sid#1",
+                     "sid_path": "MUSICIANS/B/B.sid", "song_index": 1,
+                     "similarity": .99,
+                     "recommendation_source": "sidflow-neighbors"}]
+
+    class PartialIndex:
+        def sid_presence_catalogue(self, root):
+            return {
+                "metadata_paths": ["/USB0/HVSC/MUSICIANS/A/A.sid"],
+                "file_paths": [
+                    "/USB0/HVSC/MUSICIANS/A/A.sid",
+                    "/USB0/HVSC/MUSICIANS/B/B.sid",
+                    "/USB0/HVSC/MUSICIANS/C/C.sid",
+                ],
+            }
+        def sid_metadata_for_paths(self, paths): return {}
+
+    previous_juke = dict(server.JUKE)
+    previous_played = set(server.JUKE_PLAYED)
+    previous_recent = list(server.JUKE_RECENT_TRACKS)
+    events = []
+    monkeypatch.setattr(server, "SIDFLOW_STORE", FakeStore())
+    monkeypatch.setattr(server, "_configured_hvsc_root", lambda: "/USB0/HVSC")
+    monkeypatch.setattr(server, "_index_store", lambda: PartialIndex())
+    monkeypatch.setattr(server, "_diag_event", lambda level, message: events.append((level, message)))
+    try:
+        server.JUKE_PLAYED.clear(); server.JUKE_RECENT_TRACKS.clear()
+        server.JUKE.clear(); server.JUKE.update({
+            "items": [server._juke_lazy_item(
+                "/USB0/HVSC/MUSICIANS/A/A.sid", "A.sid")],
+            "index": 0, "playing": True, "shuffle": False, "radio": False,
+            "song": 1, "timer": None, "folder": "", "loading": False,
+            "source": "", "generation": 1, "queue_revision": 0,
+        })
+        items, seed = server._sidflow_recommendations(
+            "/USB0/HVSC/MUSICIANS/A/A.sid", 1
+        )
+        assert seed["track_id"] == "MUSICIANS/A/A.sid#1"
+        assert [item["path"] for item in items] == [
+            "/USB0/HVSC/MUSICIANS/B/B.sid"
+        ]
+        assert any("metadata_paths=1" in message and
+                   "file_index_paths=3" in message and
+                   "mapped_paths=3" in message
+                   for _level, message in events)
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous_juke)
+        server.JUKE_PLAYED.clear(); server.JUKE_PLAYED.update(previous_played)
+        server.JUKE_RECENT_TRACKS.clear(); server.JUKE_RECENT_TRACKS.extend(previous_recent)
+
+
+def test_rc33_sidflow_zero_result_records_mapping_counts(monkeypatch):
+    class FakeStore:
+        def status(self): return {"available": True, "tracks": 2}
+        def lookup(self, rel, song):
+            return {"track_id": f"{rel}#{song}", "sid_path": rel,
+                    "song_index": song}
+        def rank(self, *args, **kwargs): return []
+
+    class Index:
+        def sid_presence_catalogue(self, root):
+            return {"metadata_paths": ["/HVSC/A.sid"],
+                    "file_paths": ["/HVSC/A.sid", "/HVSC/B.sid"]}
+        def sid_metadata_for_paths(self, paths): return {}
+
+    previous = dict(server.JUKE)
+    events = []
+    monkeypatch.setattr(server, "SIDFLOW_STORE", FakeStore())
+    monkeypatch.setattr(server, "_configured_hvsc_root", lambda: "/HVSC")
+    monkeypatch.setattr(server, "_index_store", lambda: Index())
+    monkeypatch.setattr(server, "_diag_event", lambda level, message: events.append((level, message)))
+    try:
+        server.JUKE.clear(); server.JUKE.update({"items": [], "index": -1,
+            "playing": False, "shuffle": False, "radio": False, "song": 0,
+            "timer": None, "folder": "", "loading": False, "source": "",
+            "generation": 0, "queue_revision": 0})
+        items, _seed = server._sidflow_recommendations("/HVSC/A.sid", 1)
+        assert items == []
+        assert any(level == "warning" and "ranked=0 final=0" in message and
+                   "metadata_paths=1" in message and "file_index_paths=2" in message
+                   for level, message in events)
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+
+def test_rc35_header_labels_and_star_alignment():
+    root = Path(__file__).resolve().parents[1]
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    css = (root / "static" / "app.css").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    assert '<span class="brand-stars">****</span> u64deck <span class="brand-stars">****</span>' in html
+    assert ".brand-stars{display:inline-block;transform:translateY(1px)}" in css
+    assert "· FW ${esc(i.firmware_version||\"?\")}" in js
+    assert "· Core ${esc(i.core_version)}" in js
+    assert '· Input: ${matrix?"CIA1":"Legacy KERNAL buffer"}' in js
+
+
+def test_rc35_settings_index_precedes_collapsed_firmware_configuration():
+    root = Path(__file__).resolve().parents[1]
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    assert html.index("SEARCH INDEX &amp; CACHE") < html.index("Ultimate firmware configuration")
+    assert '<details class="panel firmware-settings-details">' in html
+    assert '<summary>Ultimate firmware configuration</summary>' in html
+    assert '<details class="panel firmware-settings-details" open>' not in html
+    assert html.count('id="catlist"') == 1
+    assert html.count('id="setitems"') == 1
+    assert html.count('id="btnApply"') == 1
+
+
+def test_rc35_recording_labels_and_songlengths_presentation():
+    root = Path(__file__).resolve().parents[1]
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    css = (root / "static" / "app.css").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    labels = [
+        "Video + Audio", "Video Only", "Audio Only", "Manual", "30 Seconds",
+        "1 Minute", "5 Minutes", "10 Minutes", "Compact", "Standard", "High",
+        "AUTO", "MP4", "WebM", "Native 384×272", "Pixel-Perfect 2×",
+    ]
+    for label in labels:
+        assert label in html
+    assert "Number(s.songlengths_loaded).toLocaleString()" in js
+    assert "#jkSlInfo{font-size:13px}" in css
+    assert ".sidflow-juke-credit-row .sidflow-credit{font-size:12px}" in css
+
+
+def test_rc35_queue_layout_and_context_are_non_redundant():
+    root = Path(__file__).resolve().parents[1]
+    css = (root / "static" / "app.css").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    server_text = (root / "server.py").read_text(encoding="utf-8")
+    assert "minmax(240px,440px) minmax(210px,360px)" in css
+    assert ".jkq-title,.jkq-author{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}" in css
+    assert "if(s.recommendation_seed_label)return `More like ${s.recommendation_seed_label}`" in js
+    assert '"recommendation_seed_label": JUKE.get("recommendation_seed_label", "")' in server_text
+    assert 'JUKE["recommendation_seed_label"] = str(' in server_text
+    assert 's.folder||"",s.source||""' in js
+
+
+def test_rc35_playing_row_is_distinct_and_locatable_without_poll_scroll():
+    root = Path(__file__).resolve().parents[1]
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    css = (root / "static" / "app.css").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
+    assert 'id="jkLocateCurrentBtn"' in html
+    assert 'onclick="jkLocateCurrent(true)"' in html
+    assert '<span class="jkq-current-marker" aria-hidden="true">▶</span>' in js
+    assert 'row.classList.toggle("playing",current)' in js
+    assert 'row.setAttribute("aria-current","true")' in js
+    assert '.jkq-row.playing{background:' in css
+    assert '.jkq-row[role="row"]:hover{background:' in css
+    assert 'activeRowKey&&activeRowKey!==JK.activeRowKey' in js
+    assert 'requestAnimationFrame(()=>jkLocateCurrent(true))' in js
+    assert 'JK.activeRowKey=activeRowKey' in js
+    assert '<b>◎ Current</b>' in help_js
+
+
+def test_rc35_more_like_context_records_the_manual_seed_without_changing_generation(monkeypatch):
+    previous = dict(server.JUKE)
+    events = []
+    alpha = server._juke_lazy_item("/USB0/HVSC/A.sid", "A.sid", {
+        "name": "Alpha Tune", "author": "Composer", "songs": 1,
+        "start_song": 1,
+    })
+    recommendation = server._juke_lazy_item("/USB0/HVSC/B.sid", "B.sid", {
+        "name": "Beta Tune", "author": "Other", "songs": 1,
+        "start_song": 1,
+    })
+    recommendation["song"] = 1
+    recommendation["recommendation_source"] = "sidflow-neighbors"
+    monkeypatch.setattr(server, "_sidflow_recommendations",
+                        lambda *args, **kwargs: ([recommendation], {"track_id": "A.sid#1"}))
+    monkeypatch.setattr(server, "_diag_event", lambda level, message: events.append((level, message)))
+    monkeypatch.setattr(server, "_juke_state", lambda: {
+        "generation": server.JUKE["generation"],
+        "queue_revision": server.JUKE["queue_revision"],
+        "recommendation_seed_label": server.JUKE.get("recommendation_seed_label", ""),
+    })
+    try:
+        server.JUKE.clear(); server.JUKE.update({
+            "items": [alpha], "index": 0, "playing": True, "shuffle": False,
+            "radio": False, "song": 1, "timer": None, "folder": "Custom picks",
+            "loading": False, "source": "", "recommendation_seed_label": "",
+            "generation": 41, "queue_revision": 7, "stop_after_current": False,
+        })
+        result = server._sidflow_append("/USB0/HVSC/A.sid", 1, insert_after=0)
+        assert server.JUKE["recommendation_seed_label"] == "Alpha Tune"
+        assert result["generation"] == 41
+        assert result["queue_revision"] == 8
+        assert [item["path"] for item in server.JUKE["items"]] == [
+            "/USB0/HVSC/A.sid", "/USB0/HVSC/B.sid",
+        ]
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+def test_rc36_queue_reveal_uses_scroll_container_coordinates():
+    root = Path(__file__).resolve().parents[1]
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'listRect=list.getBoundingClientRect(),rowRect=row.getBoundingClientRect()' in js
+    assert 'const rowTop=list.scrollTop+(rowRect.top-listRect.top)' in js
+    assert 'list.scrollHeight-list.clientHeight' in js
+    assert 'row.offsetTop-headHeight' not in js
+
+
+def test_rc36_health_hierarchy_and_status_case_are_consistent():
+    root = Path(__file__).resolve().parents[1]
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    css = (root / "static" / "app.css").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    assert '.health-card-title h2{margin:0;font-size:15px' in css
+    assert '.health-primary{font-size:13px' in css
+    assert '.health-metrics span{color:var(--dim);font-size:12px' in css
+    assert 'function healthStatusLabel(value)' in js
+    assert 'Auto-updated ' in js
+    assert '"Indexer Idle"' in js
+    assert 'healthStatusLabel(shutdown.state||"not requested")' in js
+    assert 'Auto-update waiting for first sample' in html
+    assert '>Source</span>' in html and '>Ready</span>' in html
+
+# --- v1.9.0 Release Candidate 37: Assembly64 first-mount swap context and scalable naming approvals ---
+
+def test_rc37_assembly64_manifest_match_is_conservative_and_ordered():
+    manifest = [
+        {"item": "12", "filename": "the-hat-7a825b1-b.d64"},
+        {"item": "99", "filename": "unrelated.d64"},
+        {"item": "11", "filename": "the-hat-7a825b1-a.d64"},
+        {"item": "13", "filename": "notes.txt"},
+    ]
+    related = server._asm_related_manifest(
+        "the-hat-7a825b1-b.d64", "12", manifest
+    )
+    assert [(row["item"], row["filename"]) for row in related] == [
+        ("11", "the-hat-7a825b1-a.d64"),
+        ("12", "the-hat-7a825b1-b.d64"),
+    ]
+
+
+def test_rc37_assembly64_first_mount_run_downloads_pair_and_arms_selected_disk(monkeypatch):
+    previous = copy.deepcopy(server.SWAP)
+    fetched, mounted = [], []
+
+    async def fake_fetch(_release_id, _category, item):
+        fetched.append(item)
+        return ("disk-" + item).encode("ascii")
+
+    async def inline_threadpool(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    def fake_mount_and_boot(drive, mode, **kwargs):
+        mounted.append((drive, mode, kwargs["name"], kwargs["data"]))
+        return {"typed": 'LOAD"*",8,1 + RUN'}
+
+    monkeypatch.setattr(server, "_asm_fetch_binary", fake_fetch)
+    monkeypatch.setattr(server, "run_in_threadpool", inline_threadpool)
+    monkeypatch.setattr(server, "_mount_and_boot", fake_mount_and_boot)
+    try:
+        server.SWAP.clear(); server.SWAP.update({
+            "items": [], "index": -1, "drive": "a", "mode": "unlinked",
+            "source": "none", "decision": {},
+        })
+        result = asyncio.run(server.asm64_deploy({
+            "id": "release-1", "category": 0, "item": 12,
+            "filename": "the-hat-7a825b1-b.d64", "action": "mount_run",
+            "manifest": [
+                {"item": 11, "filename": "the-hat-7a825b1-a.d64"},
+                {"item": 12, "filename": "the-hat-7a825b1-b.d64"},
+                {"item": 90, "filename": "another-release-a.d64"},
+                {"item": 91, "filename": "another-release-b.d64"},
+            ],
+        }))
+        assert fetched == ["11", "12"]
+        assert mounted == [("a", "unlinked", "the-hat-7a825b1-b.d64", b"disk-12")]
+        assert [row["label"] for row in server.SWAP["items"]] == [
+            "the-hat-7a825b1-a.d64", "the-hat-7a825b1-b.d64",
+        ]
+        assert server.SWAP["index"] == 1
+        assert server.SWAP["source"] == "assembly64"
+        assert result["swap_decision"]["kind"] == "related"
+        assert result["swap_decision"]["count"] == 2
+    finally:
+        server.SWAP.clear(); server.SWAP.update(previous)
+
+
+def test_rc37_assembly64_old_client_without_manifest_remains_single_disk(monkeypatch):
+    previous = copy.deepcopy(server.SWAP)
+    fetched = []
+
+    async def fake_fetch(_release_id, _category, item):
+        fetched.append(item)
+        return b"disk"
+
+    async def inline_threadpool(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_asm_fetch_binary", fake_fetch)
+    monkeypatch.setattr(server, "run_in_threadpool", inline_threadpool)
+    monkeypatch.setattr(server, "_mount_and_boot", lambda *args, **kwargs: {"typed": "ok"})
+    try:
+        result = asyncio.run(server.asm64_deploy({
+            "id": "release-2", "category": 0, "item": 21,
+            "filename": "solo-a.d64", "action": "mount_run",
+        }))
+        assert fetched == ["21"]
+        assert result["swap_decision"]["kind"] == "single"
+        assert [row["label"] for row in server.SWAP["items"]] == ["solo-a.d64"]
+    finally:
+        server.SWAP.clear(); server.SWAP.update(previous)
+
+
+def test_rc37_approve_all_ambiguous_saves_every_current_set(tmp_path, monkeypatch):
+    store = IndexStore(tmp_path / "idx.sqlite3")
+    try:
+        _rc28_put_disk_names(store, "/USB0/Many", [
+            "Alpha1.d64", "Alpha2.d64",
+            "Beta1.d64", "Beta2.d64",
+            "Gamma1.d64", "Gamma2.d64",
+        ])
+        monkeypatch.setattr(server, "_index_store", lambda: store)
+        before = server.fs_disk_naming_analysis()
+        assert before["summary"]["ambiguous_sets"] == 3
+        result = server.fs_disk_naming_override_batch_approve({"all_ambiguous": True})
+        assert result["summary"] == {"sets": 3, "files": 6, "folders": 1}
+        assert len(store.disk_group_overrides()) == 3
+    finally:
+        store.close()
+
+
+def test_rc37_frontend_casing_manifest_and_large_approval_controls():
+    root = Path(server.ROOT)
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    assert '<div id="devinfo">Connecting…</div>' in html
+    assert "· Reconnecting…" in js
+    assert "Copy Analysis Report" in html
+    assert "Approve selected examples" in js
+    assert "Approve all ambiguous" in js
+    assert "all_ambiguous:true" in js
+    assert "Selection applies to the current page" in js
+    assert "pageSize=50" in js
+    assert "overrideOpen=true" in js
+    assert "manifest=(ASM.files||[])" in js
+    assert "Approve all shown" not in js
+    assert '"manual", "upload", "assembly64"' in (root / "server.py").read_text(encoding="utf-8")
+
+
+# --- v1.9.0 Release Candidate 38: network-interface display casing ---
+
+def test_rc38_network_interface_auto_label_is_uppercase_display_only():
+    root = Path(server.ROOT)
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    assert '<option value="">AUTO</option>' in html
+    assert '`<option value="">AUTO${r.auto?' in js
+    assert '"AUTO: "+r.auto' in js
+    assert '<option value="">Auto</option>' not in html
+    assert '`<option value="">Auto${r.auto?' not in js
+
+# --- v1.9.0 Release Candidate 39: Legacy physical-F7 handoff ---
+
+def test_rc39_boot_options_preserve_saved_auto_f7_but_disable_it_on_legacy(monkeypatch):
+    previous = dict(server.CFG)
+    try:
+        server.CFG["boot_prekey"] = "F7"
+        monkeypatch.setattr(server, "_cartridge_cache_snapshot",
+                            lambda client=None: {"known": True, "classification": "retro_replay", "label": "Retro Replay"})
+        monkeypatch.setattr(server, "_cached_input_status",
+                            lambda client=None: {"available": False, "pending": False})
+        payload = server._boot_options_payload()
+        assert payload["auto_fastload"] is True
+        assert payload["effective_auto_fastload"] is False
+        assert payload["physical_f7_required"] is True
+
+        monkeypatch.setattr(server, "_cached_input_status",
+                            lambda client=None: {"available": True, "pending": False})
+        payload = server._boot_options_payload()
+        assert payload["auto_fastload"] is True
+        assert payload["effective_auto_fastload"] is True
+        assert payload["physical_f7_required"] is False
+    finally:
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc39_send_boot_prekey_suppresses_only_legacy_f7(monkeypatch):
+    previous = dict(server.CFG)
+    diagnostics = []
+    matrix = []
+    legacy = []
+    try:
+        server.CFG["boot_prekey"] = "F7"
+        monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(server, "_diag_event",
+                            lambda level, message, **kwargs: diagnostics.append((level, message)))
+        monkeypatch.setattr(server, "_legacy_type",
+                            lambda data, **kwargs: legacy.append((bytes(data), kwargs)))
+        monkeypatch.setattr(server, "_matrix_send",
+                            lambda events, **kwargs: matrix.append((events, kwargs)))
+
+        monkeypatch.setattr(server, "_input_status",
+                            lambda *args, **kwargs: {"available": False})
+        cart = {"known": True, "classification": "retro_replay", "label": "Retro Replay"}
+        assert server._send_boot_prekey(cartridge_state=cart) is None
+        assert legacy == [] and matrix == []
+        assert any("physical F7 required" in message for _level, message in diagnostics)
+
+        monkeypatch.setattr(server, "_input_status",
+                            lambda *args, **kwargs: {"available": True})
+        assert server._send_boot_prekey(cartridge_state=cart) == "F7"
+        assert legacy == []
+        assert matrix == [([
+            {"kind": "keyboard", "inputs": ["f7"], "transition": "tap"}
+        ], {"force_probe": False})]
+    finally:
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc39_legacy_mount_run_prompts_for_physical_f7_without_injecting_it(monkeypatch):
+    previous_cfg = dict(server.CFG)
+    typed = []
+    prompt_events = []
+    fake_cancel = type("Event", (), {
+        "wait": lambda self, seconds=0: False,
+        "is_set": lambda self: False,
+    })()
+    fake_continue = type("Event", (), {
+        "wait": lambda self, seconds=0: False,
+        "is_set": lambda self: False,
+    })()
+
+    class FakeRest:
+        host = "192.0.2.64"
+        def mount_path(self, *args, **kwargs): pass
+        def mount_attachment(self, *args, **kwargs): pass
+        def put(self, *args, **kwargs): pass
+
+    try:
+        server.CFG["boot_prekey"] = "F7"
+        monkeypatch.setattr(server, "rest", FakeRest())
+        monkeypatch.setattr(server, "_cached_input_status",
+                            lambda client=None: {"available": False, "pending": False})
+        monkeypatch.setattr(server, "_input_status",
+                            lambda *args, **kwargs: {"available": False})
+        monkeypatch.setattr(server, "_matrix_release_all", lambda **kwargs: False)
+        monkeypatch.setattr(server, "_juke_disarm_machine_takeover", lambda reason: None)
+        monkeypatch.setattr(server, "_temporary_crt_reboot_before_mount_run", lambda: False)
+        monkeypatch.setattr(server, "_sid_runner_reboot_before_mount_run", lambda: False)
+        monkeypatch.setattr(server, "_cartridge_preflight", lambda **kwargs: {
+            "known": True, "classification": "retro_replay", "label": "Retro Replay",
+            "source": "test", "age_seconds": 0.0,
+        })
+        monkeypatch.setattr(server, "_remember_mount", lambda *args, **kwargs: None)
+        monkeypatch.setattr(server, "_bus_id_for", lambda drive: 8)
+        monkeypatch.setattr(server, "_mount_run_prompt_begin",
+                            lambda plan=None: (7, fake_cancel, fake_continue))
+        monkeypatch.setattr(server, "_mount_run_prompt_update",
+                            lambda generation, **kwargs: prompt_events.append(("update", generation, kwargs)))
+        monkeypatch.setattr(server, "_mount_run_prompt_finish",
+                            lambda generation: prompt_events.append(("finish", generation)))
+        gates = iter(["ready", "ready"])
+        def fake_gate(stage, **kwargs):
+            if stage == "boot":
+                assert kwargs.get("cancel_event") is fake_cancel
+            return next(gates)
+        monkeypatch.setattr(server, "_basic_ready_gate", fake_gate)
+        monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(server, "_legacy_type",
+                            lambda data, **kwargs: typed.append((bytes(data), kwargs.get("origin"))))
+
+        out = server._mount_and_boot("a", "unlinked", device_path="/Usb0/demo.d64")
+
+        assert out == {"errors": [], "typed": 'LOAD"*",8,1 + RUN'}
+        assert typed == [
+            (b'LOAD"*",8,1\r', "mount-run-load"),
+            (b"RUN\r", "mount-run-run"),
+        ]
+        assert all(data != bytes([136]) for data, _origin in typed)
+        assert any(event[0] == "update" and event[2]["phase"] == "detected"
+                   for event in prompt_events)
+        assert ("finish", 7) in prompt_events
+    finally:
+        server.CFG.clear(); server.CFG.update(previous_cfg)
+
+
+def test_rc39_mount_run_cancel_sets_event_without_device_access(monkeypatch):
+    event = threading.Event()
+    with server._MOUNT_RUN_PROMPT_LOCK:
+        server._MOUNT_RUN_PROMPT.clear()
+        server._MOUNT_RUN_PROMPT.update({
+            "active": True,
+            "generation": 99,
+            "phase": "physical_f7",
+            "cancel_available": True,
+            "cancel_event": event,
+            "continue_event": threading.Event(),
+        })
+    try:
+        result = server.mount_run_cancel()
+        assert result == {"cancelled": True}
+        assert event.is_set()
+        snapshot = server._mount_run_prompt_snapshot()
+        assert snapshot["phase"] == "cancelling"
+        assert snapshot["cancel_available"] is False
+    finally:
+        with server._MOUNT_RUN_PROMPT_LOCK:
+            server._MOUNT_RUN_PROMPT.clear()
+
+
+def test_rc39_basic_ready_gate_can_be_cancelled_before_read(monkeypatch):
+    event = threading.Event(); event.set()
+    reads = []
+    monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+    result = server._basic_ready_gate(
+        "boot", reader=lambda: reads.append(True) or 0,
+        sleeper=lambda seconds: None, cancel_event=event,
+    )
+    assert result == "cancelled"
+    assert reads == []
+
+
+def test_rc39_frontend_has_persistent_legacy_f7_overlay_and_disables_auto_f7():
+    root = Path(server.ROOT)
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    css = (root / "static" / "app.css").read_text(encoding="utf-8")
+    for text in (
+        'id="legacyF7Overlay"',
+        "Physical F7 required",
+        "Cancel Mount &amp; Run",
+        'id="autoFastloadHint"',
+        "Legacy: cartridge checked at launch",
+    ):
+        assert text in html
+    for text in (
+        "renderMountRunPrompt",
+        "/api/mount/run/cancel",
+        "/api/mount/run/continue",
+        "EFFECTIVE_AUTO_FASTLOAD",
+        "MOUNT_RUN_REQUEST_TIMEOUT_MS=300000",
+        "Physical F7 is required on Legacy KERNAL-buffer input",
+        "code===136",
+    ):
+        assert text in js
+    assert ".screen-operation-overlay" in css
+    assert ".screen-operation-overlay.detected" in css
+
+
+def test_rc39_help_and_readme_describe_physical_f7_compromise():
+    root = Path(server.ROOT)
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
+    for text in (
+        "Physical F7 required",
+        "The saved preference is retained across device changes",
+        "Remote Screen-Mirror F7 remains suppressed",
+        "CIA1 matrix-input path is unaffected",
+    ):
+        assert text in readme
+    for text in (
+        "u64deck suppresses remote Legacy F7",
+        "Cancel Mount &amp; Run",
+        "saved preference is retained",
+        "no automatic F7 is injected",
+    ):
+        assert text in help_js
+
+
+# --- v1.9.0 Release Candidate 40: cartridge-aware boot preflight ---
+
+def test_rc40_cartridge_classification_is_conservative():
+    assert server._classify_cartridge("") == "none"
+    assert server._classify_cartridge("Disabled") == "none"
+    assert server._classify_cartridge("/Flash/Retro Replay.crt") == "retro_replay"
+    assert server._classify_cartridge("retro_replay_v3.8.crt") == "retro_replay"
+    assert server._classify_cartridge("Action Replay.crt") == "other"
+
+
+def test_rc40_boot_plan_only_automates_confirmed_retro_replay():
+    previous = dict(server.CFG)
+    try:
+        server.CFG["boot_prekey"] = "F7"
+        none = {"classification": "none", "label": "None"}
+        retro = {"classification": "retro_replay", "label": "Retro Replay"}
+        other = {"classification": "other", "label": "Action Replay"}
+
+        plan = server._cartridge_boot_plan({"available": True}, none)
+        assert plan["automatic_prekey"] is False
+        assert plan["prompt_kind"] == ""
+
+        plan = server._cartridge_boot_plan({"available": True}, retro)
+        assert plan["automatic_prekey"] is True
+        assert plan["prompt_kind"] == ""
+
+        plan = server._cartridge_boot_plan({"available": False}, retro)
+        assert plan["automatic_prekey"] is False
+        assert plan["prompt_kind"] == "physical_f7"
+        assert "Retro Replay" in plan["prompt_message"]
+
+        plan = server._cartridge_boot_plan({"available": False}, other)
+        assert plan["automatic_prekey"] is False
+        assert plan["prompt_kind"] == "cartridge_attention"
+        assert "not recognised for automatic startup handling" in plan["prompt_message"]
+    finally:
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc40_non_f7_advanced_prekeys_remain_explicit_and_unchanged():
+    previous = dict(server.CFG)
+    try:
+        server.CFG["boot_prekey"] = "F3"
+        plan = server._cartridge_boot_plan(
+            {"available": False},
+            {"classification": "other", "label": "Custom cartridge"},
+        )
+        assert plan["configured_prekey"] == "F3"
+        assert plan["automatic_prekey"] is True
+        assert plan["prompt_kind"] == ""
+    finally:
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc40_no_cartridge_mount_run_has_no_f7_or_overlay(monkeypatch):
+    previous_cfg = dict(server.CFG)
+    typed = []
+    settles = []
+
+    class FakeRest:
+        host = "192.0.2.40"
+        def mount_path(self, *args, **kwargs): pass
+        def mount_attachment(self, *args, **kwargs): pass
+        def put(self, *args, **kwargs): pass
+
+    try:
+        server.CFG["boot_prekey"] = "F7"
+        monkeypatch.setattr(server, "rest", FakeRest())
+        monkeypatch.setattr(server, "_cached_input_status",
+                            lambda client=None: {"available": False, "pending": False})
+        monkeypatch.setattr(server, "_input_status",
+                            lambda *args, **kwargs: {"available": False})
+        monkeypatch.setattr(server, "_matrix_release_all", lambda **kwargs: False)
+        monkeypatch.setattr(server, "_juke_disarm_machine_takeover", lambda reason: None)
+        monkeypatch.setattr(server, "_temporary_crt_reboot_before_mount_run", lambda: False)
+        monkeypatch.setattr(server, "_sid_runner_reboot_before_mount_run", lambda: False)
+        monkeypatch.setattr(server, "_cartridge_preflight", lambda **kwargs: {
+            "known": True, "classification": "none", "label": "None",
+            "source": "live firmware read", "age_seconds": 0.0,
+        })
+        monkeypatch.setattr(server, "_remember_mount", lambda *args, **kwargs: None)
+        monkeypatch.setattr(server, "_bus_id_for", lambda drive: 8)
+        monkeypatch.setattr(server, "_mount_run_prompt_begin",
+                            lambda plan=None: pytest.fail("no cartridge must not show an overlay"))
+        monkeypatch.setattr(server, "_boot_settle",
+                            lambda **kwargs: settles.append(kwargs))
+        gates = iter(["ready", "ready"])
+        monkeypatch.setattr(server, "_basic_ready_gate",
+                            lambda stage, **kwargs: next(gates))
+        monkeypatch.setattr(server, "_legacy_type",
+                            lambda data, **kwargs: typed.append((bytes(data), kwargs.get("origin"))))
+
+        out = server._mount_and_boot("a", "unlinked", device_path="/Usb0/plain.d64")
+
+        assert out == {"errors": [], "typed": 'LOAD"*",8,1 + RUN'}
+        assert settles == [{"allow_prekey": False, "cartridge_state": {
+            "known": True, "classification": "none", "label": "None",
+            "source": "live firmware read", "age_seconds": 0.0,
+        }}]
+        assert typed == [
+            (b'LOAD"*",8,1\r', "mount-run-load"),
+            (b"RUN\r", "mount-run-run"),
+        ]
+    finally:
+        server.CFG.clear(); server.CFG.update(previous_cfg)
+
+
+def test_rc40_live_cartridge_preflight_updates_same_device_cache(monkeypatch):
+    previous = dict(server.CFG)
+    try:
+        server.CFG["active_device_identity"] = "device-40"
+        monkeypatch.setattr(server, "_read_cartridge_live",
+                            lambda client=None: "/Flash/RetroReplay.crt")
+        state = server._cartridge_preflight(require_confirmation=True)
+        assert state["classification"] == "retro_replay"
+        assert state["source"] == "live firmware read"
+        cached = server._cartridge_cache_snapshot()
+        assert cached["classification"] == "retro_replay"
+        assert cached["device_key"] == "identity:device-40"
+    finally:
+        with server._CART_STATE_LOCK:
+            server._CART_CONFIG_CACHE.clear()
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc40_mount_preflight_uses_only_recent_same_device_cache(monkeypatch):
+    previous = dict(server.CFG)
+    diagnostics = []
+    try:
+        server.CFG["active_device_identity"] = "device-40-cache"
+        server._cartridge_cache_set(
+            "/Flash/RetroReplay.crt", source="test cache",
+            device_key="identity:device-40-cache",
+        )
+        monkeypatch.setattr(server, "_read_cartridge_live",
+                            lambda client=None: (_ for _ in ()).throw(RuntimeError("offline")))
+        monkeypatch.setattr(server, "_diag_event",
+                            lambda level, message, **kwargs: diagnostics.append((level, message, kwargs)))
+        state = server._cartridge_preflight(require_confirmation=True)
+        assert state["classification"] == "retro_replay"
+        assert state["source"] == "recent same-device cache"
+        assert any("using recent same-device cache" in row[1] for row in diagnostics)
+
+        with server._CART_STATE_LOCK:
+            server._CART_CONFIG_CACHE["identity:device-40-cache"]["updated_at"] = (
+                time.time() - server._CART_CACHE_FALLBACK_SECONDS - 1
+            )
+        with pytest.raises(server.UltimateError, match="could not be confirmed"):
+            server._cartridge_preflight(require_confirmation=True)
+    finally:
+        with server._CART_STATE_LOCK:
+            server._CART_CONFIG_CACHE.clear()
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc40_direct_crt_marker_is_set_only_after_success(monkeypatch):
+    previous = dict(server.CFG)
+    try:
+        server.CFG["active_device_identity"] = "device-40-crt"
+        monkeypatch.setattr(server, "_run_direct_takeover",
+                            lambda fn, reason="": fn())
+        result = server._run_temporary_crt(lambda: {"errors": []}, "test CRT", "game.crt")
+        assert result == {"errors": []}
+        marker = server._temporary_crt_snapshot()
+        assert marker["active"] is True
+        assert marker["label"] == "game.crt"
+
+        server._temporary_crt_clear(reason="test")
+        with pytest.raises(RuntimeError):
+            server._run_temporary_crt(
+                lambda: (_ for _ in ()).throw(RuntimeError("runner failed")),
+                "test CRT", "bad.crt",
+            )
+        assert server._temporary_crt_snapshot()["active"] is False
+    finally:
+        with server._CART_STATE_LOCK:
+            server._TEMPORARY_CRT_ACTIVE.clear()
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc40_temporary_crt_is_cleared_by_one_full_reboot(monkeypatch):
+    previous = dict(server.CFG)
+    calls = []
+
+    class FakeRest:
+        host = "192.0.2.40"
+        def put(self, path, **kwargs):
+            calls.append((path, kwargs)); return {"errors": []}
+
+    class FakeCmd:
+        def close(self): calls.append(("cmd.close", {}))
+
+    try:
+        server.CFG["active_device_identity"] = "device-40-reboot"
+        monkeypatch.setattr(server, "rest", FakeRest())
+        monkeypatch.setattr(server, "cmd", FakeCmd())
+        server._temporary_crt_mark("temporary.crt")
+        monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(server, "_wait_for_ultimate_after_reboot",
+                            lambda client: {"product": "C64 Ultimate"})
+        monkeypatch.setattr(server, "_sid_runner_clear_reboot_required",
+                            lambda client=None: calls.append(("sid.clear", {})))
+        monkeypatch.setattr(server, "_cartridge_cache_invalidate",
+                            lambda client=None: calls.append(("cart.invalidate", {})))
+
+        assert server._temporary_crt_reboot_before_mount_run() is True
+        assert calls[0][0] == "/v1/machine:reboot"
+        assert server._temporary_crt_snapshot()["active"] is False
+        assert server._temporary_crt_reboot_before_mount_run() is False
+    finally:
+        with server._CART_STATE_LOCK:
+            server._TEMPORARY_CRT_ACTIVE.clear()
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc40_ui_and_help_describe_cartridge_aware_scope():
+    root = Path(server.ROOT)
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
+    for text in (
+        "Retro Replay not configured",
+        "Legacy: physical F7 for Retro Replay",
+        "Cartridge startup requires attention",
+        "BOOT_CARTRIDGE",
+    ):
+        assert text in js
+    for text in (
+        "limited to the hardware-tested <b>Retro Replay</b> flow",
+        "With no configured cartridge",
+        "temporary runner state",
+        "Other configured cartridges are not rejected",
+    ):
+        assert text in help_js
+
+# --- v1.9.0 Release Candidate 41: mode-specific Retro Replay guidance ---
+
+def test_rc41_recognises_firmware_retro_replay_identifiers_conservatively():
+    assert server._classify_cartridge("rr38pal") == "retro_replay"
+    assert server._classify_cartridge("rr38ntsc") == "retro_replay"
+    assert server._classify_cartridge("/Flash/rr38pal.crt") == "retro_replay"
+    assert server._classify_cartridge("rr-custom") == "other"
+    assert server._classify_cartridge("Action Replay.crt") == "other"
+
+
+def test_rc41_retro_replay_prompt_wording_follows_detected_input_mode():
+    previous = dict(server.CFG)
+    try:
+        retro = {"classification": "retro_replay", "label": "Retro Replay"}
+        server.CFG["boot_prekey"] = "F7"
+        legacy = server._cartridge_boot_plan({"available": False}, retro)
+        assert legacy["prompt_kind"] == "physical_f7"
+        assert "Legacy KERNAL-buffer input" in legacy["prompt_message"]
+        assert "Freeze Menu" in legacy["prompt_message"]
+        assert "physical C64 keyboard" in legacy["prompt_message"]
+
+        cia1 = server._cartridge_boot_plan({"available": True}, retro)
+        assert cia1["automatic_prekey"] is True
+        assert cia1["prompt_kind"] == ""
+
+        server.CFG["boot_prekey"] = ""
+        legacy_manual = server._cartridge_boot_plan({"available": False}, retro)
+        cia1_manual = server._cartridge_boot_plan({"available": True}, retro)
+        assert legacy_manual["prompt_title"] == "Physical F7 required"
+        assert "Legacy KERNAL-buffer input" in legacy_manual["prompt_message"]
+        assert cia1_manual["prompt_title"] == "Retro Replay startup"
+        assert "Screen controls" in cia1_manual["prompt_message"]
+        assert "Legacy" not in cia1_manual["prompt_message"]
+        assert "Freeze Menu" not in cia1_manual["prompt_message"]
+    finally:
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc41_other_cartridge_wording_is_mode_specific_not_unsupported():
+    previous = dict(server.CFG)
+    try:
+        server.CFG["boot_prekey"] = "F7"
+        other = {"classification": "other", "label": "Custom Cart"}
+        legacy = server._cartridge_boot_plan({"available": False}, other)
+        cia1 = server._cartridge_boot_plan({"available": True}, other)
+        assert "not recognised for automatic startup handling" in legacy["prompt_message"]
+        assert "Legacy KERNAL-buffer input" in legacy["prompt_message"]
+        assert "physical C64 keyboard" in legacy["prompt_message"]
+        assert "not recognised for automatic startup handling" in cia1["prompt_message"]
+        assert "Screen controls" in cia1["prompt_message"]
+        assert "Legacy" not in cia1["prompt_message"]
+        assert "not supported" not in legacy["prompt_message"]
+        assert "not supported" not in cia1["prompt_message"]
+    finally:
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc41_standalone_reset_reboot_notice_is_informational_and_legacy_only():
+    previous = dict(server.CFG)
+    try:
+        server.CFG["boot_prekey"] = "F7"
+        retro = {"classification": "retro_replay", "label": "Retro Replay"}
+        legacy = {"available": False, "pending": False}
+        matrix = {"available": True, "pending": False}
+        notice = server._standalone_cartridge_notice(
+            "reset", status=legacy, cartridge=retro, temporary_active=False
+        )
+        assert notice["kind"] == "standalone_f7"
+        assert notice["dismiss_label"] == "Dismiss"
+        assert "Legacy KERNAL-buffer input" in notice["message"]
+        assert server._standalone_cartridge_notice(
+            "reset", status=legacy, cartridge=retro, temporary_active=True
+        ) is None
+        assert server._standalone_cartridge_notice(
+            "reboot", status=matrix, cartridge=retro
+        ) is None
+        server.CFG["boot_prekey"] = ""
+        assert server._standalone_cartridge_notice(
+            "reboot", status=legacy, cartridge=retro
+        ) is None
+    finally:
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc41_frontend_has_dismissible_nonblocking_notice_and_mode_tooltips():
+    root = Path(server.ROOT)
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    for text in (
+        'id="legacyF7Dismiss"',
+        "dismissStandaloneScreenNotice()",
+        "Automatically presses F7 after Reset, Reboot and Mount &amp; Run",
+        "automatic F7 is disabled because an emulated F7 can open the Freeze Menu",
+    ):
+        assert text in html
+    for text in (
+        "STANDALONE_SCREEN_NOTICE",
+        "showStandaloneScreenNotice",
+        "clearStandaloneScreenNotice",
+        "informational:true",
+        "u64deck_screen_notice",
+        "Your saved Auto F7 preference is retained for CIA1-capable devices",
+        "Disable this option to handle the Retro Replay startup menu manually",
+    ):
+        assert text in js
+
+
+def test_rc41_docs_distinguish_standalone_and_mount_run_overlays():
+    root = Path(server.ROOT)
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    for text in (
+        "`rr38pal`",
+        "Standalone Reset/Reboot uses an informational Dismiss overlay",
+        "Mount & Run actively waits for BASIC readiness",
+        "two short BASIC-ready samples",
+    ):
+        assert text in readme
+    for text in (
+        "Standalone <b>Reset</b> and <b>Reboot</b>",
+        "two consecutive ready readings",
+        "mode-specific wording",
+        "<code>rr38pal</code>",
+    ):
+        assert text in help_js
+    assert "Release Candidate 44" in changelog
+    assert "mode-specific cartridge-startup wording" not in changelog  # wording is concise, not a placeholder
+
+
+def test_rc41_machine_reset_returns_nonblocking_legacy_retro_replay_notice(monkeypatch):
+    previous_cfg = dict(server.CFG)
+    previous_rest = server.rest
+
+    class FakeRest:
+        host = "192.0.2.41"
+        def put(self, path, **kwargs):
+            assert path == "/v1/machine:reset"
+            return {"ok": True}
+
+    try:
+        server.CFG["boot_prekey"] = "F7"
+        server.CFG["active_device_identity"] = "rc41-device"
+        server.rest = FakeRest()
+        cartridge = {
+            "known": True,
+            "classification": "retro_replay",
+            "label": "Retro Replay",
+            "source": "test",
+            "age_seconds": 0.0,
+        }
+        monkeypatch.setattr(server, "_mount_run_busy_payload", lambda: None)
+        monkeypatch.setattr(server, "_juke_disarm_machine_takeover", lambda reason: None)
+        monkeypatch.setattr(server, "_matrix_release_all", lambda **kwargs: None)
+        monkeypatch.setattr(server, "_cartridge_preflight", lambda **kwargs: cartridge)
+        monkeypatch.setattr(server, "_send_boot_prekey", lambda **kwargs: None)
+        monkeypatch.setattr(server, "_cached_input_status",
+                            lambda client=None: {"available": False, "pending": False})
+        monkeypatch.setattr(server, "_temporary_crt_snapshot",
+                            lambda client=None: {"active": False})
+        result = server.machine("reset")
+        assert result["ok"] is True
+        assert result["u64deck_cartridge"]["classification"] == "retro_replay"
+        notice = result["u64deck_screen_notice"]
+        assert notice["kind"] == "standalone_f7"
+        assert notice["dismiss_label"] == "Dismiss"
+        assert "Legacy KERNAL-buffer input" in notice["message"]
+    finally:
+        server.rest = previous_rest
+        server.CFG.clear(); server.CFG.update(previous_cfg)
+
+
+# --- v1.9.0 Release Candidate 42: self-clearing standalone F7 guidance ---
+
+def test_rc42_standalone_notice_enables_basic_readiness_monitor():
+    previous = dict(server.CFG)
+    try:
+        server.CFG["boot_prekey"] = "F7"
+        notice = server._standalone_cartridge_notice(
+            "reset",
+            status={"available": False, "pending": False},
+            cartridge={"classification": "retro_replay", "label": "Retro Replay"},
+        )
+        assert notice["monitor_basic_ready"] is True
+        assert notice["dismiss_label"] == "Dismiss"
+    finally:
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc42_standalone_basic_ready_endpoint_takes_one_status_sample(monkeypatch):
+    previous = dict(server.CFG)
+    captured = []
+
+    @contextmanager
+    def operation(*args, **kwargs):
+        captured.append((args, kwargs))
+        yield
+
+    try:
+        server.CFG["u64_host"] = "192.0.2.42"
+        monkeypatch.setattr(server.DEVICE_OP, "operation", operation)
+        samples = []
+        monkeypatch.setattr(
+            server, "_read_basic_ready_flag",
+            lambda: samples.append("read") or 0,
+        )
+        result = server.standalone_basic_ready_status()
+        assert result == {
+            "busy": False, "supported": True, "ready": True, "value": 0
+        }
+        assert samples == ["read"]
+        args, kwargs = captured[0]
+        assert args == ("status", "checking standalone BASIC readiness")
+        assert kwargs["max_wait_seconds"] == pytest.approx(0.25)
+    finally:
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc42_standalone_basic_ready_endpoint_reports_busy_and_unsupported(monkeypatch):
+    previous = dict(server.CFG)
+
+    @contextmanager
+    def expired(*_args, **_kwargs):
+        raise server.OperationExpired("busy")
+        yield
+
+    @contextmanager
+    def available(*_args, **_kwargs):
+        yield
+
+    try:
+        server.CFG["u64_host"] = "192.0.2.42"
+        monkeypatch.setattr(server.DEVICE_OP, "operation", expired)
+        assert server.standalone_basic_ready_status() == {
+            "busy": True, "supported": True, "ready": False
+        }
+        monkeypatch.setattr(server.DEVICE_OP, "operation", available)
+        monkeypatch.setattr(server, "_read_basic_ready_flag", lambda: None)
+        assert server.standalone_basic_ready_status() == {
+            "busy": False, "supported": False, "ready": False, "value": None
+        }
+    finally:
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc42_frontend_debounces_ready_and_selects_legacy_tooltip_robustly():
+    root = Path(server.ROOT)
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    for text in (
+        '/api/machine/basic-ready',
+        'STANDALONE_READY_CONSECUTIVE>=2',
+        'Fastload detected — ready',
+        'notice.monitor_basic_ready===true',
+        'isLegacyInput()',
+        'prompt.phase!=="detected"',
+    ):
+        assert text in js
+    assert 'INPUT_STATUS.available===false;' not in js
+
+
+def test_rc42_docs_describe_self_clearing_status_probe_without_key_detection():
+    root = Path(server.ROOT)
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    for text in (
+        "does not attempt to detect the physical",
+        "two consecutive ready readings",
+        "Fastload detected — ready",
+        "keeps the Dismiss-only behaviour",
+    ):
+        assert text in readme
+    for text in (
+        "does not try to detect the physical keypress",
+        "releases the coordinator after every sample",
+        "Fastload detected — ready",
+        "Dismiss-only behaviour",
+    ):
+        assert text in help_js
+    assert "Release Candidate 44" in changelog
+
+
+# --- v1.9.0 Release Candidate 43: shared input-mode classification ---
+
+def test_rc43_frontend_uses_shared_input_mode_classifier_for_real_response_shapes(tmp_path: Path):
+    import json
+    import subprocess
+
+    root = Path(server.ROOT)
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    start = js.index("function inputModeKind")
+    end = js.index("let MOUNT_RUN_PROMPT_KEY", start)
+    helpers = js[start:end]
+    assert "const legacy=isLegacyInput();" in js
+    assert "INPUT_STATUS.pending===false&&INPUT_STATUS.available!==true" not in js
+    assert "INPUT_STATUS.pending===false&&!INPUT_STATUS.available" not in js
+
+    cases = [
+        ({"available": False, "pending": False, "mode": "buffer"}, "legacy"),
+        ({"available": 0, "mode": "buffer"}, "legacy"),
+        ({"available": False, "mode": "buffer"}, "legacy"),
+        ({"available": True, "mode": "matrix"}, "matrix"),
+        ({"available": None, "pending": True, "mode": "unknown"}, "pending"),
+    ]
+    script = helpers + "\n" + "console.log(JSON.stringify(" + json.dumps([
+        {"status": status, "expected": expected} for status, expected in cases
+    ]) + ".map(item => ({actual: inputModeKind(item.status), expected: item.expected}))));"
+    result = subprocess.run(
+        ["node", "-e", script], capture_output=True, text=True, check=True
+    )
+    observed = json.loads(result.stdout)
+    assert all(item["actual"] == item["expected"] for item in observed)
+
+
+def test_rc43_release_notes_describe_frontend_only_tooltip_fix():
+    root = Path(server.ROOT)
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "Release Candidate 44" in changelog
+    assert "one shared input-mode classifier" in changelog
+    assert "frontend-only input-mode consistency correction" in changelog
+
+
+# --- v1.9.0 Release Candidate 44: sentence-case UI copy audit ---
+
+def test_rc44_static_tooltips_use_sentence_case_and_preserve_technical_names():
+    root = Path(server.ROOT)
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+
+    attributes = re.findall(
+        r'(?:title|data-tip|data-wifi-tip|aria-label)="([^"]+)"', html
+    )
+    assert attributes
+    for value in attributes:
+        first_alpha = next((ch for ch in value if ch.isalpha()), "")
+        assert not first_alpha or first_alpha.isupper(), value
+
+    assert "Audio WebSocket chunks received per second" in js
+    assert "audio WebSocket chunks received per second" not in js
+    for expected in (
+        "Open the Ultimate menu on the C64 display",
+        "Save the current frame as PNG",
+        "Filter favourites and recent items",
+        "Show disk images whose internal directories could not be parsed",
+        "Compare your collection's release against the latest on hvsc.c64.org",
+        "Find tunes similar to this queue entry and insert them after the current tune",
+    ):
+        assert expected in html or expected in js
+
+
+def test_rc44_helper_and_status_copy_is_presentation_only_and_documented():
+    root = Path(server.ROOT)
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+
+    for expected in (
+        "Choose location",
+        "Drops: video 0 · audio 0",
+        "Empty — add files below",
+        "Loading…",
+        "Search inside disk images",
+        "Detecting local drives…",
+        "Saved play queues",
+    ):
+        assert expected in html
+    for expected in (
+        "Drops: video ${vd} · audio ${ad}",
+        "Building sanitised diagnostics…",
+        "Recording ${cfg.mode.replace",
+        "Default mount mode:",
+        "Disk naming analysis report copied",
+        "Local SID metadata scan started",
+    ):
+        assert expected in js
+    assert "Release Candidate 44" in changelog
+    assert "presentation-only sentence-case audit" in changelog
+    assert "No input, Mount & Run, Retro Replay" in changelog
+
+
+# --- v1.9.0 RC44 public promotion: frozen build identity and canonical carries ---
+
+def test_rc44_public_frozen_build_stamp_contract(tmp_path: Path):
+    import release
+    stamp = tmp_path / release.BUILD_STAMP_NAME
+    stamp.write_text(server.BUILD + "\n", encoding="ascii")
+    assert release.build_id(tmp_path, tmp_path, frozen=True) == server.BUILD
+    stamp.write_text("not-a-build\n", encoding="ascii")
+    with pytest.raises(RuntimeError, match="invalid"):
+        release.build_id(tmp_path, tmp_path, frozen=True)
+    stamp.unlink()
+    with pytest.raises(RuntimeError, match="missing"):
+        release.build_id(tmp_path, tmp_path, frozen=True)
+
+
+def test_rc44_public_spec_and_workflow_assert_frozen_identity():
+    root = Path(server.ROOT)
+    spec = (root / "u64deck.spec").read_text(encoding="utf-8")
+    workflow = (root / ".github" / "workflows" / "build-exe.yml").read_text(encoding="utf-8")
+    assert "BUILD_STAMP_NAME" in spec
+    assert "source_build_id" in spec
+    assert '(str(stamp_path), ".")' in spec
+    assert 'icon="u64deck.ico"' in spec
+    assert "U64DECK_EXPECTED_BUILD" in workflow
+    assert "frozen API identity OK" in workflow
+    assert "frozen banner identity OK" in workflow
+    assert "unconfirmed local Exit rejection OK: HTTP 403" in workflow
+    assert "RT_ICON resource is missing" in workflow
+    assert "RT_GROUP_ICON resource is missing" in workflow
+    assert "$p.ExitCode -ne 0" in workflow
+
+
+def test_rc44_public_gitattributes_and_legacy_carry_are_present():
+    root = Path(server.ROOT)
+    attrs = (root / ".gitattributes").read_text(encoding="utf-8")
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
+    for rule in ("*.py", "*.js", "*.html", "*.css"):
+        assert rule in attrs and "eol=lf" in attrs
+    for text in (
+        "approximately 3–5 seconds",
+        "Other freezer/fastload cartridges have not been comprehensively tested",
+        "CIA1 matrix-input path",
+    ):
+        assert text in readme
+        assert text.replace("&", "&amp;") in help_js or text in help_js
+
+
+def test_rc44_public_exit_accepts_ipv4_mapped_loopback():
+    assert server._client_is_loopback("::ffff:127.0.0.1") is True
+    assert server._client_is_loopback("::ffff:192.168.1.10") is False
+
+
+def test_rc44_corrected_exit_ignores_spoofed_forwarded_for_and_disables_proxy_headers(monkeypatch):
+    from types import SimpleNamespace
+    import inspect
+
+    scheduled = []
+    monkeypatch.setattr(server, "_schedule_app_exit", lambda delay=0.20: scheduled.append(delay))
+    server._APP_EXIT_REQUESTED.clear()
+    try:
+        request = SimpleNamespace(
+            client=SimpleNamespace(host="127.0.0.1"),
+            headers={
+                server._LOCAL_EXIT_HEADER: "1",
+                "X-Forwarded-For": "198.51.100.25",
+            },
+        )
+        assert server.app_exit(request)["stopping"] is True
+        assert scheduled == [0.20]
+        source = inspect.getsource(server.main)
+        assert "proxy_headers=False" in source
+    finally:
+        server._APP_EXIT_REQUESTED.clear()
+
+
+def test_rc44_corrected_concurrent_exit_requests_schedule_once(monkeypatch):
+    from types import SimpleNamespace
+
+    class SlowEvent:
+        def __init__(self):
+            self.value = False
+        def is_set(self):
+            value = self.value
+            time.sleep(0.03)
+            return value
+        def set(self):
+            self.value = True
+        def clear(self):
+            self.value = False
+
+    request = SimpleNamespace(
+        client=SimpleNamespace(host="127.0.0.1"),
+        headers={server._LOCAL_EXIT_HEADER: "1"},
+    )
+    scheduled = []
+    original_event = server._APP_EXIT_REQUESTED
+    server._APP_EXIT_REQUESTED = SlowEvent()
+    monkeypatch.setattr(server, "_schedule_app_exit", lambda delay=0.20: scheduled.append(delay))
+    try:
+        start = threading.Barrier(3)
+        errors = []
+        def call_exit():
+            try:
+                start.wait(timeout=1.0)
+                server.app_exit(request)
+            except BaseException as exc:
+                errors.append(exc)
+        threads = [threading.Thread(target=call_exit) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        start.wait(timeout=1.0)
+        for thread in threads:
+            thread.join(timeout=2.0)
+        assert not errors
+        assert all(not thread.is_alive() for thread in threads)
+        assert scheduled == [0.20]
+    finally:
+        server._APP_EXIT_REQUESTED = original_event
+        server._APP_EXIT_REQUESTED.clear()
+
+
+def test_rc44_corrected_exit_button_is_hidden_until_local_config_confirms():
+    root = Path(server.ROOT)
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    assert re.search(r'id="btnAppExit"[^>]*style="display:none"', html)
+    assert 'exitBtn.style.display=c.local_exit_available!==false?"":"none"' in js

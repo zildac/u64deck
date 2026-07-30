@@ -1,9 +1,11 @@
 "use strict";
 /* ---------- helpers ---------- */
 const $=s=>document.querySelector(s);
+const DISKNAMING={report:null,busy:false,overridePage:0,overrideOpen:false};
 function toast(msg,cls){const d=document.createElement("div");d.className="toast "+(cls||"");
   d.textContent=msg;$("#toasts").append(d);setTimeout(()=>d.remove(),5000)}
 let DEVICE_REQUEST_TIMEOUT_MS=15000;
+const MOUNT_RUN_REQUEST_TIMEOUT_MS=300000;
 let LINK_STATUS={ip:"",link_type:"unknown",label:"Unknown",addresses:[],ethernet_ip:"",wifi_ip:"",control_ip:"",control_link_type:"unknown",rest_via_alternate:false,rest_route_label:"",streaming_available:true,rest_timeout:8};
 let UI_INTERACTIVE_DEPTH=0,INFO_IN_FLIGHT=false,DRIVES_IN_FLIGHT=false,INPUT_PROBE_TIMER=null;
 function uiInteractiveStart(){UI_INTERACTIVE_DEPTH++}
@@ -108,7 +110,7 @@ function stableObject(value){
 function itemKey(item){return [item.type,item.action,JSON.stringify(stableObject(item.payload||{}))].join("|")}
 function favMatch(item){const key=itemKey(item);return ITEMS.favorites.find(x=>itemKey(x)===key)||null}
 function itemArg(item){return jsq(JSON.stringify(item))}
-function starButton(item,title="toggle favourite"){
+function starButton(item,title="Toggle favourite"){
   const on=!!favMatch(item),key=esc(itemKey(item));
   return `<button class="mini star ${on?"on":""}" data-item-key="${key}" onclick="event.stopPropagation();toggleFavorite(JSON.parse('${itemArg(item)}'))" title="${title}">${on?"★":"☆"}</button>`;
 }
@@ -130,7 +132,7 @@ async function toggleFavorite(item){
     await itemsLoad();
     // Update stars in place: never rebuild a long search result or jump its scroll position.
     refreshStarButtons();
-    toast(existing?"removed from favourites":"added to favourites ✓","ok");
+    toast(existing?"Removed from favourites":"Added to favourites ✓","ok");
   }catch(e){toast(e.message,"err")}
 }
 async function rememberRecent(item){
@@ -141,20 +143,22 @@ async function rememberRecent(item){
   }catch(e){}
 }
 const ITEM_ICONS={folder:"📁",disk:"💾",disk_entry:"▤",program:"▶",assembly64:"A64",sid:"♪",sid_folder:"♫",library:"⚡"};
-function itemTypeLabel(type){return ({folder:"folder",disk:"disk image",disk_entry:"file in disk",program:"program",assembly64:"Assembly64",sid:"SID tune",sid_folder:"SID folder",library:"Quick Launch"})[type]||type}
+function itemTypeLabel(type){return ({folder:"Folder",disk:"Disk image",disk_entry:"File in disk",program:"Program",assembly64:"Assembly64",sid:"SID tune",sid_folder:"SID folder",library:"Quick Launch"})[type]||type}
 function itemActionLabel(action){return ({fs_browse:"Open Folder",disk_run:`Mount & Run · ${mountModeShort()}`,disk_entry_run:"Mount & Load",disk_entry_dma:"Run Instantly",disk_entry_open:"Open Image",program_run:"Run",assembly_open:"Release Files",sid_play:"Play",sid_folder:"Play Folder",library_run:"Launch"})[action]||"Open"}
 function itemCard(item,favouriteList=false){
   const encoded=itemArg(item);
   const star=favouriteList
-    ?`<button class="mini star on" onclick="event.stopPropagation();toggleFavorite(JSON.parse('${encoded}'))" title="remove from favourites">★</button>`
-    :starButton(item,"add/remove favourite");
+    ?`<button class="mini star on" onclick="event.stopPropagation();toggleFavorite(JSON.parse('${encoded}'))" title="Remove from favourites">★</button>`
+    :starButton(item,"Add/remove favourite");
+  const sidQueue=(item.type==="sid"&&item.action==="sid_play")
+    ?`<button class="mini" onclick="event.stopPropagation();queueSavedSid(JSON.parse('${encoded}'))" title="Add to the SID play queue without interrupting playback">＋</button>`:"";
   return `<div class="item-card">
     <div class="item-icon">${ITEM_ICONS[item.type]||"•"}</div>
     <div class="item-main" title="${esc(item.detail||item.label)}">
       <div class="item-label"><b>${esc(item.label)}</b> <span class="hint">${esc(itemTypeLabel(item.type))}</span></div>
       <div class="item-detail hint">${esc(item.detail||"")}</div>
     </div>
-    <button class="mini primary" onclick="runSavedItem(JSON.parse('${encoded}'))">${itemActionLabel(item.action)}</button>${star}</div>`;
+    ${sidQueue}<button class="mini primary" onclick="runSavedItem(JSON.parse('${encoded}'))">${itemActionLabel(item.action)}</button>${star}</div>`;
 }
 function itemsRender(){
   if(!$("#favList"))return;
@@ -168,6 +172,11 @@ function itemsRender(){
 async function clearRecents(){
   if(!ITEMS.recents.length||!confirm("Clear the recently used list?"))return;
   try{await api("/api/user_items/recent",{method:"DELETE"});ITEMS.recents=[];itemsRender()}catch(e){toast(e.message,"err")}
+}
+async function queueSavedSid(item){
+  const p=item?.payload||{};
+  if(!p.name){toast("This saved SID no longer has a queueable filename","err");return}
+  return jkAdd(p.folder||"/",p.name);
 }
 async function runSavedItem(item){
   await rememberRecent(item);
@@ -225,7 +234,7 @@ async function downloadDiagnostics(){
       try{handle=await showSaveFilePicker({suggestedName:diagnosticsSuggestedName(),types:[{description:"ZIP archive",accept:{"application/zip":[".zip"]}}]})}
       catch(e){if(e.name==="AbortError")return;throw e}
     }
-    toast("building sanitised diagnostics…","ok");
+    toast("Building sanitised diagnostics…","ok");
     const payload={browser:{userAgent:navigator.userAgent,language:navigator.language,platform:navigator.platform,
       hardwareConcurrency:navigator.hardwareConcurrency||"",mediaRecorder:typeof MediaRecorder!=="undefined",
       showSaveFilePicker:typeof showSaveFilePicker!=="undefined",location:location.origin,recording:recSettings(),
@@ -244,7 +253,7 @@ async function downloadDiagnostics(){
       const url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=name;
       document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);
     }
-    toast("diagnostics exported ✓","ok");
+    toast("Diagnostics exported ✓","ok");
   }catch(e){
     if(writable){try{if(typeof writable.abort==="function")await writable.abort();else await writable.close()}catch(closeError){}}
     toast(e.message,"err");
@@ -265,8 +274,8 @@ function healthDuration(value){
   return [d?d+"d":"",h?h+"h":"",m?m+"m":"",(!d&&!h||s)?s+"s":""].filter(Boolean).join(" ");
 }
 function healthAge(value){
-  if(value==null||!Number.isFinite(Number(value)))return"never";
-  const n=Number(value);return n<1?"now":healthDuration(n)+" ago";
+  if(value==null||!Number.isFinite(Number(value)))return"Never";
+  const n=Number(value);return n<1?"Now":healthDuration(n)+" ago";
 }
 function healthRate(value){
   const n=Number(value);if(!Number.isFinite(n))return"—";
@@ -275,7 +284,14 @@ function healthRate(value){
   return Math.round(n)+" bit/s";
 }
 function healthText(id,value){const el=$(id);if(el)el.textContent=value==null?"—":String(value)}
-function healthBadge(id,text,on=false,bad=false,warn=false){const el=$(id);if(!el)return;el.textContent=text;el.className="badge"+(on?" on":"")+(bad?" bad":"")+(warn?" warn":"")}
+function healthStatusLabel(value){
+  const acronyms=new Set(["EXE","CPU","RAM","REST","FPGA","I/O","WS"]);
+  return String(value??"").replaceAll("_"," ").trim().split(/\s+/).filter(Boolean).map(word=>{
+    const upper=word.toUpperCase();if(acronyms.has(upper))return upper;
+    return word.charAt(0).toUpperCase()+word.slice(1).toLowerCase();
+  }).join(" ");
+}
+function healthBadge(id,text,on=false,bad=false,warn=false){const el=$(id);if(!el)return;el.textContent=healthStatusLabel(text);el.className="badge"+(on?" on":"")+(bad?" bad":"")+(warn?" warn":"")}
 function healthBrowserPayload(){return {
   video_render_fps:HEALTH_BROWSER.videoRenderFps,video_frames_total:HEALTH_BROWSER.videoFramesTotal,
   video_ws_connects:HEALTH_BROWSER.videoWsConnects,video_ws_disconnects:HEALTH_BROWSER.videoWsDisconnects,
@@ -299,7 +315,7 @@ function healthRender(h){
 
   const summary=h.summary||{state:"neutral",label:"WAITING",reasons:[]},summaryEl=$("#healthSummary");
   if(summaryEl)summaryEl.className="health-summary state-"+(summary.state||"neutral");
-  healthText("#healthSummaryBadge",summary.label||"WAITING");
+  healthText("#healthSummaryBadge",healthStatusLabel(summary.label||"WAITING"));
   healthText("#healthSummaryTitle",summary.state==="healthy"?"Everything looks healthy":summary.state==="degraded"?"Some telemetry deserves attention":summary.state==="attention"?"Action may be required":"Waiting for telemetry");
   healthText("#healthSummaryReasons",(summary.reasons||[]).join(" · ")||"—");
 
@@ -341,23 +357,23 @@ function healthRender(h){
   healthText("#healthAudioAge",`${streams.audio?.packet_age_seconds==null?"—":healthAge(streams.audio.packet_age_seconds)} / ${streams.audio?.peak_packet_age_seconds==null?"—":healthDuration(streams.audio.peak_packet_age_seconds)}`);
   healthText("#healthAudioQueue",`${browser.audio_queue_ms==null?"—":Number(browser.audio_queue_ms).toFixed(0)+" ms"} / ${healthNumber(browser.audio_underruns||0)} underrun`+(Number(browser.audio_underruns||0)===1?"":"s"));
   healthText("#healthAudioReconnects",`${healthNumber(browser.audio_reconnects||0)} / ${healthNumber(browser.audio_ws_disconnects??streams.audio?.websocket?.disconnects??0)}`);
-  healthText("#healthAudioContext",browser.audio_context_state||"—");
+  healthText("#healthAudioContext",browser.audio_context_state?healthStatusLabel(browser.audio_context_state):"—");
 
   const active=!!q.active_priority,waiters=(q.waiting_interactive||0)+(q.waiting_status||0)+(q.waiting_background||0),task=activity.name||"";
   healthText("#healthActivityName",task||"Idle");
   healthText("#healthActivityDetail",task?(activity.detail||"Operation in progress."):"No operation in progress.");
   healthText("#healthActivityPhase",activity.phase||"—");
   healthText("#healthActivityElapsed",activity.elapsed_seconds==null?"—":healthDuration(activity.elapsed_seconds));
-  healthText("#healthActiveOperation",active?`${q.active_reason||q.active_priority}${q.active_seconds?` · ${Number(q.active_seconds).toFixed(1)}s`:""}`:"idle");
+  healthText("#healthActiveOperation",active?`${q.active_reason||q.active_priority}${q.active_seconds?` · ${Number(q.active_seconds).toFixed(1)}s`:""}`:"Idle");
   healthText("#healthWaiters",`${q.waiting_interactive||0} / ${q.waiting_status||0} / ${q.waiting_background||0}`);
   healthText("#healthQueueWaitStats",`${Number(q.average_wait_seconds||0).toFixed(3)} / ${Number(q.p95_wait_seconds||0).toFixed(3)} / ${Number(q.longest_wait_seconds||0).toFixed(3)} s`);
   const by=q.completed_by_priority||{};healthText("#healthCompletedByPriority",`${by.interactive||0} / ${by.status||0} / ${by.background||0}`);
-  healthText("#healthCancelled",healthNumber(q.cancelled||0));
+  healthText("#healthCancelled",`${healthNumber(q.cancelled||0)} / ${healthNumber(q.expired||0)}`);
   healthText("#healthQueueWait",Number(q.total_wait_seconds||0).toFixed(2)+" s");
 
   const indexRunning=!!job.running,indexBad=!!job.error||Number(job.scan_errors||0)>0;
-  healthText("#healthIndexCurrent",indexRunning?(job.mode==="local"?"Local volume index":"Ultimate storage index"):"Indexer idle");
-  healthText("#healthIndexDetail",indexRunning?(job.current||job.root||"scanning"):(job.error||"No indexing operation is active."));
+  healthText("#healthIndexCurrent",indexRunning?(job.mode==="local"?"Local Volume Index":"Ultimate Storage Index"):"Indexer Idle");
+  healthText("#healthIndexDetail",indexRunning?(job.current||job.root||"Scanning"):(job.error||"No indexing operation is active."));
   healthText("#healthIndexCounts",`${healthNumber(idx.images)} / ${healthNumber(idx.sid_metadata)}`);
   healthText("#healthIndexDatabase",`${healthBytes(idx.disk_bytes)} / ${healthNumber(idx.parse_failures)}`);
   healthText("#healthIndexRates",`${Number(job.files_per_sec||0).toFixed(2)} / ${Number(job.dirs_per_sec||0).toFixed(2)}`);
@@ -367,7 +383,7 @@ function healthRender(h){
   healthText("#healthImageCacheHits",cache.image_hit_rate_percent==null?`${healthNumber(cache.image_hits||0)} hit / ${healthNumber(cache.image_misses||0)} miss`:`${Number(cache.image_hit_rate_percent).toFixed(1)}% · ${healthNumber(cache.image_evictions||0)} evicted`);
   healthText("#healthSidCacheHits",cache.sid_hit_rate_percent==null?`${healthNumber(cache.sid_materialise_hits||0)} hit / ${healthNumber(cache.sid_materialise_misses||0)} fetch`:`${Number(cache.sid_hit_rate_percent).toFixed(1)}% · ${healthNumber(cache.sid_materialise_misses||0)} fetch`);
   const sf=idx.sidflow||{};
-  healthText("#healthSidflowModel",sf.available?`${sf.release||sf.supported_release||"—"} · ${sf.hvsc_version||"HVSC ?"} · ${sf.similarity_metric||"—"} · ${sf.vector_dimensions||"—"}D`:(sf.needs_update?"update required":"not installed"));
+  healthText("#healthSidflowModel",sf.available?`${sf.release||sf.supported_release||"—"} · ${sf.hvsc_version||"HVSC ?"} · ${sf.similarity_metric||"—"} · ${sf.vector_dimensions||"—"}D`:(sf.needs_update?"Update Required":"Not Installed"));
   healthText("#healthSidflowCounts",sf.available?`${healthNumber(sf.tracks||0)} / ${healthNumber(sf.neighbors||0)}`:"—");
 
   healthBadge("#healthFrozen",h.u64deck?.frozen?"EXE":"source",true,false);
@@ -389,28 +405,28 @@ function healthRender(h){
   healthText("#healthConfigLast",lastConfig.time?`${healthClock(lastConfig.time)} · ${healthMs(lastConfig.elapsed_ms,2)}`:"—");
   healthText("#healthRouteChanges",healthNumber(routes.length));
   healthText("#healthLastRoute",lastRoute?`${lastRoute.selected_host||"—"} → ${lastRoute.control_host||"—"}`:"—");
-  healthText("#healthShutdownState",String(shutdown.state||"not requested").replaceAll("_"," "));
+  healthText("#healthShutdownState",healthStatusLabel(shutdown.state||"not requested"));
   healthText("#healthShutdownTime",shutdown.total_ms==null?"—":healthMs(shutdown.total_ms,2));
   healthText("#healthDiagRetained",healthNumber(diag.retained||0));
-  healthText("#healthLastEvent",diag.last?`${diag.last.level}: ${diag.last.message}`:"—");
+  healthText("#healthLastEvent",diag.last?`${healthStatusLabel(diag.last.level)}: ${diag.last.message}`:"—");
 
   const diagnosticEvents=diag.events||[];healthText("#healthDiagnosticHistoryCount",diagnosticEvents.length);
-  healthHistory("#healthDiagnosticHistory",[...diagnosticEvents].reverse(),row=>{const level=row.level==="error"?"bad":"warn",symbol=row.level==="error"?"×":"!",state=row.recovered?"recovered":"active";return `<div class="health-history-row"><span class="health-history-time">${healthClock(row.time_epoch)}</span><span class="health-outcome ${level}" title="${healthEscape(row.level)}">${symbol}</span><b>${healthEscape(row.message)}</b><span class="health-event-state ${state}">${row.recovered?"recovered / historical":"recent / unresolved"} · ${healthAge(row.age_seconds)}</span></div>`});
+  healthHistory("#healthDiagnosticHistory",[...diagnosticEvents].reverse(),row=>{const level=row.level==="error"?"bad":"warn",symbol=row.level==="error"?"×":"!",state=row.recovered?"recovered":"active";return `<div class="health-history-row"><span class="health-history-time">${healthClock(row.time_epoch)}</span><span class="health-outcome ${level}" title="${healthEscape(healthStatusLabel(row.level))}">${symbol}</span><b>${healthEscape(row.message)}</b><span class="health-event-state ${state}">${row.recovered?"Recovered / Historical":"Recent / Unresolved"} · ${healthAge(row.age_seconds)}</span></div>`});
 
   const ops=q.recent_operations||[];healthText("#healthOpHistoryCount",ops.length);
-  healthHistory("#healthOperationHistory",[...ops].reverse(),row=>{const state=row.outcome==="ok"?"ok":row.outcome==="cancelled"?"warn":"bad",symbol=row.outcome==="ok"?"✓":row.outcome==="cancelled"?"!":"×";return `<div class="health-history-row"><span class="health-history-time">${healthClock(row.finished_at)}</span><span class="health-outcome ${state}" title="${healthEscape(row.outcome)}">${symbol}</span><b>${healthEscape(row.reason)}</b><span>${healthEscape(row.priority)} · wait ${Number(row.wait_seconds||0).toFixed(3)}s · run ${Number(row.duration_seconds||0).toFixed(3)}s</span></div>`});
+  healthHistory("#healthOperationHistory",[...ops].reverse(),row=>{const intentional=row.outcome==="cancelled"||row.outcome==="expired",state=row.outcome==="ok"?"ok":intentional?"warn":"bad",symbol=row.outcome==="ok"?"✓":intentional?"!":"×";return `<div class="health-history-row"><span class="health-history-time">${healthClock(row.finished_at)}</span><span class="health-outcome ${state}" title="${healthEscape(healthStatusLabel(row.outcome))}">${symbol}</span><b>${healthEscape(row.reason)}</b><span>${healthEscape(healthStatusLabel(row.priority))} · Wait ${Number(row.wait_seconds||0).toFixed(3)}s · Run ${Number(row.duration_seconds||0).toFixed(3)}s</span></div>`});
   const streamHistory=streams.history||[];healthText("#healthStreamHistoryCount",streamHistory.length);
-  healthHistory("#healthStreamHistory",[...streamHistory].reverse(),row=>`<div class="health-history-row"><span class="health-history-time">${healthClock(row.time)}</span><span class="badge ${row.ok===false?"bad":row.action?.includes("close")?"warn":"on"}">${healthEscape(row.stream)}</span><b>${healthEscape(row.action)}</b><span>${healthEscape(row.via||row.transport||row.destination||"")}</span></div>`);
+  healthHistory("#healthStreamHistory",[...streamHistory].reverse(),row=>`<div class="health-history-row"><span class="health-history-time">${healthClock(row.time)}</span><span class="badge ${row.ok===false?"bad":row.action?.includes("close")?"warn":"on"}">${healthEscape(healthStatusLabel(row.stream))}</span><b>${healthEscape(healthStatusLabel(row.action))}</b><span>${healthEscape(row.via||row.transport||row.destination||"")}</span></div>`);
   const life=[...(h.activity?.history||[]).map(row=>({...row,_kind:"activity",time:row.finished_at||row.started_at})),...(config.history||[]).map(row=>({...row,_kind:"config"})),...routes.map(row=>({...row,_kind:"route"}))].sort((a,b)=>(b.time||0)-(a.time||0)).slice(0,30);
   healthText("#healthLifecycleHistoryCount",life.length);
-  healthHistory("#healthLifecycleHistory",life,row=>{let title="",detail="",state="on";if(row._kind==="route"){title="Route";detail=`${row.selected_host||"—"} → ${row.control_host||"—"} · ${row.reason||""}`}else if(row._kind==="config"){title="Config save";detail=`${row.success?"success":"failed"} · ${healthMs(row.elapsed_ms,2)}`;state=row.success?"on":"bad"}else{title=row.name||"Activity";detail=`${row.phase||""} · ${row.outcome||"complete"} · ${Number(row.elapsed_seconds||0).toFixed(2)}s`;state=row.outcome==="error"?"bad":"on"}return `<div class="health-history-row"><span class="health-history-time">${healthClock(row.time)}</span><span class="badge ${state}">${healthEscape(row._kind)}</span><b>${healthEscape(title)}</b><span>${healthEscape(detail)}</span></div>`});
-  healthText("#healthUpdated","auto-updated "+new Date((h.generated_at||Date.now()/1000)*1000).toLocaleTimeString()+" · every 2 s");
+  healthHistory("#healthLifecycleHistory",life,row=>{let title="",detail="",state="on";if(row._kind==="route"){title="Route";detail=`${row.selected_host||"—"} → ${row.control_host||"—"} · ${row.reason||""}`}else if(row._kind==="config"){title="Config save";detail=`${row.success?"Success":"Failed"} · ${healthMs(row.elapsed_ms,2)}`;state=row.success?"on":"bad"}else{title=row.name||"Activity";detail=`${healthStatusLabel(row.phase||"")} · ${healthStatusLabel(row.outcome||"complete")} · ${Number(row.elapsed_seconds||0).toFixed(2)}s`;state=row.outcome==="error"?"bad":"on"}return `<div class="health-history-row"><span class="health-history-time">${healthClock(row.time)}</span><span class="badge ${state}">${healthEscape(healthStatusLabel(row._kind))}</span><b>${healthEscape(title)}</b><span>${healthEscape(detail)}</span></div>`});
+  healthText("#healthUpdated","Auto-updated "+new Date((h.generated_at||Date.now()/1000)*1000).toLocaleTimeString()+" · every 2 s");
 }
 
 async function healthLoad(force=false){
   if(HEALTH.busy)return;if(!force&&(!document.querySelector("#tab-health.active")||document.hidden))return;
   HEALTH.busy=true;try{await healthReportBrowser();healthRender(await api("/api/health",{timeoutMs:5000}))}
-  catch(e){healthText("#healthUpdated","health unavailable: "+e.message)}finally{HEALTH.busy=false}
+  catch(e){healthText("#healthUpdated","Health unavailable: "+e.message)}finally{HEALTH.busy=false}
 }
 function healthStart(){healthLoad(true);if(!HEALTH.timer)HEALTH.timer=setInterval(healthLoad,2000)}
 function healthStop(){if(HEALTH.timer){clearInterval(HEALTH.timer);HEALTH.timer=null}}
@@ -506,6 +522,7 @@ async function clearDiscoveredDevices(){
     const sub=$("#discSubnet").value.trim();
     const r=await api("/api/discover/clear"+(sub?"?subnet="+encodeURIComponent(sub):""),{method:"POST",timeoutMs:30000});
     closeLocalStreamsForLinkChange();
+    clearStandaloneScreenNotice();
     LINK_STATUS={ip:"",link_type:"unknown",label:"Unknown",addresses:[],ethernet_ip:"",wifi_ip:"",control_ip:"",control_link_type:"unknown",rest_via_alternate:false,rest_route_label:"",streaming_available:true,rest_timeout:8};
     LAST_DEVICE_INFO=null;DRIVE_STATUS_READY=false;INPUT_STATUS={available:false,mode:"buffer",label:"Legacy KERNAL buffer",status:0};
     applyLinkStatus(LINK_STATUS);matrixClearLocalState();renderInputMode();
@@ -525,6 +542,7 @@ function scheduleInputProbe(delay=2500){
 }
 async function connectTo(host){
   host=(host||"").trim();if(!host||uiInteractive())return;
+  clearStandaloneScreenNotice();
   const previousDriveReady=DRIVE_STATUS_READY;DRIVE_STATUS_READY=false;
   const connectStarted=performance.now(),body=$("#discBody");
   if(body)body.innerHTML=`Connecting to <b>${esc(host)}</b>… <span class='cursor'></span>`;
@@ -539,8 +557,9 @@ async function connectTo(host){
       if(r.input){INPUT_STATUS=r.input;renderInputMode()}
       if(r.link)applyLinkStatus(r.link);
       if(r.info){LAST_DEVICE_INFO=r.info;INFO_FAILURES=0;DRIVE_STATUS_READY=true;renderDeviceInfo(r.info)}
+      loadBootOptions();
       matrixClearLocalState();closeDiscover(false);
-      if(INPUT_STATUS.pending||INPUT_STATUS.available===null)scheduleInputProbe();
+      if(inputStatusPending())scheduleInputProbe();
       if(DRIVE_STATUS_READY)setTimeout(refreshDrives,0);
     }else{
       DRIVE_STATUS_READY=previousDriveReady;
@@ -602,7 +621,7 @@ async function loadIfaces(){
   try{
     const r=await api("/api/interfaces");
     const sel=$("#qIface");
-    sel.innerHTML=`<option value="">Auto${r.auto?" ("+esc(r.auto)+")":""}</option>`+
+    sel.innerHTML=`<option value="">AUTO${r.auto?" ("+esc(r.auto)+")":""}</option>`+
       r.interfaces.map(i=>`<option value="${esc(i.ip)}">${esc(i.name)} — ${esc(i.ip)}</option>`).join("");
     sel.value=r.selected||"";
   }catch(e){}
@@ -612,7 +631,7 @@ async function ifaceChanged(){
     const r=await api("/api/interfaces",{method:"POST",
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({ip:$("#qIface").value})});
-    toast("Streams bound to "+(r.selected||("auto: "+r.auto)),"ok");
+    toast("Streams bound to "+(r.selected||("AUTO: "+r.auto)),"ok");
   }catch(e){toast(e.message,"err")}
 }
 
@@ -654,40 +673,158 @@ async function switchToEthernet(){if(!LINK_STATUS.ethernet_ip)return;await conne
 let VER_SHOWN=false,LAST_DEVICE_INFO=null,INFO_FAILURES=0,INFO_RETRY_TIMER=null;
 let MOUNT_RUN_STATUS_WATCH=null,MOUNT_RUN_BUSY=false;
 let INPUT_STATUS={available:null,pending:true,mode:"unknown",label:"Input capability pending",status:0};
+function inputModeKind(status=INPUT_STATUS){
+  const mode=String(status?.mode||"").trim().toLowerCase();
+  if(mode==="matrix"||mode==="cia1"||mode==="cia1_matrix")return "matrix";
+  if(mode==="buffer"||mode==="legacy"||mode==="legacy_buffer"||mode==="kernal_buffer"||mode==="legacy kernal buffer")return "legacy";
+  if(status?.pending===true)return "pending";
+  if(status?.available===null||status?.available===undefined)return "pending";
+  if(typeof status.available==="string"){
+    const value=status.available.trim().toLowerCase();
+    if(value==="true"||value==="1"||value==="yes")return "matrix";
+    if(value==="false"||value==="0"||value==="no")return "legacy";
+  }
+  return status.available?"matrix":"legacy";
+}
+function inputStatusPending(status=INPUT_STATUS){return inputModeKind(status)==="pending"}
+function isMatrixInput(status=INPUT_STATUS){return inputModeKind(status)==="matrix"}
+function isLegacyInput(status=INPUT_STATUS){return inputModeKind(status)==="legacy"}
+let MOUNT_RUN_PROMPT_KEY="",MOUNT_RUN_PROMPT_STATE=null,STANDALONE_SCREEN_NOTICE=null;
+let STANDALONE_READY_TIMER=null,STANDALONE_READY_CONSECUTIVE=0,STANDALONE_NOTICE_GENERATION=0;
 function inputModeSuffix(){
-  if(INPUT_STATUS.pending||INPUT_STATUS.available===null)return ` <span class="input-mode buffer" title="${esc(INPUT_STATUS.label||"")}">· input checking</span>`;
-  const matrix=INPUT_STATUS.available;
-  return ` <span class="input-mode ${matrix?"matrix":"buffer"}" title="${esc(INPUT_STATUS.label||"")}">· input ${matrix?"CIA1":"buffer"}</span>`;
+  if(inputStatusPending())return ` <span class="input-mode buffer" title="${esc(INPUT_STATUS.label||"")}">· Input: Checking</span>`;
+  const matrix=isMatrixInput();
+  return ` <span class="input-mode ${matrix?"matrix":"buffer"}" title="${esc(INPUT_STATUS.label||"")}">· Input: ${matrix?"CIA1":"Legacy KERNAL buffer"}</span>`;
 }
 function renderInputMode(){
   const badge=$("#inputModeBadge"),help=$("#kbhelp");if(!badge||!help)return;
-  if(INPUT_STATUS.pending||INPUT_STATUS.available===null){
+  if(inputStatusPending()){
     badge.textContent="Checking input…";badge.className="badge";
     help.innerHTML="Keyboard capability is being checked in the background. Other device controls remain available.";
-  }else if(INPUT_STATUS.available){
+  }else if(isMatrixInput()){
+    clearStandaloneScreenNotice();
     badge.textContent="CIA1 matrix";badge.className="badge matrix";
     help.innerHTML="Esc = RUN/STOP · F1–F8 · cursor keys · Backspace = DEL · Home / Shift-Home = CLR. <b>CIA1 matrix input is active</b>: held keys, chords, cracktros, games and the Ultimate menu are supported.";
   }else{
     badge.textContent="Legacy buffer";badge.className="badge buffer";
-    help.innerHTML="Esc = RUN/STOP · F1–F8 · cursor keys · Backspace = DEL · Home / Shift-Home = CLR. This Ultimate is using the <b>legacy KERNAL keyboard buffer</b>; matrix-scanning software and the Ultimate menu may not see remote keys.";
+    help.innerHTML="Esc = RUN/STOP · F1–F6/F8 · cursor keys · Backspace = DEL · Home / Shift-Home = CLR. This Ultimate is using the <b>legacy KERNAL keyboard buffer</b>. Retro Replay F7 requires the physical C64 keyboard; matrix-scanning software and the Ultimate menu may not see remote keys.";
   }
+  renderAutoFastloadState();
 }
 function renderDeviceInfo(i,suffix=""){
-  $("#devinfo").innerHTML=`<b>${esc(i.product||"?")}</b> fw ${esc(i.firmware_version||"?")}`+
-    (i.core_version?` · core ${esc(i.core_version)}`:"")+(i.hostname?` · ${esc(i.hostname)}`:"")+linkBadgeHtml()+inputModeSuffix()+suffix;
+  $("#devinfo").innerHTML=`<b>${esc(i.product||"?")}</b> · FW ${esc(i.firmware_version||"?")}`+
+    (i.core_version?` · Core ${esc(i.core_version)}`:"")+(i.hostname?` · ${esc(i.hostname)}`:"")+linkBadgeHtml()+inputModeSuffix()+suffix;
 }
 function stopMountRunStatusWatch(){
   if(MOUNT_RUN_STATUS_WATCH){clearInterval(MOUNT_RUN_STATUS_WATCH);MOUNT_RUN_STATUS_WATCH=null}
 }
+function renderScreenOperationOverlay(){
+  const overlay=$("#legacyF7Overlay");if(!overlay)return;
+  const prompt=MOUNT_RUN_PROMPT_STATE?.active?MOUNT_RUN_PROMPT_STATE:STANDALONE_SCREEN_NOTICE;
+  if(!prompt?.active){overlay.style.display="none";overlay.className="screen-operation-overlay";MOUNT_RUN_PROMPT_KEY="";return}
+  const informational=prompt.informational===true;
+  const key=(informational?"info:":String(prompt.generation||"")+":")+String(prompt.phase||prompt.kind||"");
+  $("#legacyF7Title").textContent=prompt.title||"Physical F7 required";
+  $("#legacyF7Message").textContent=prompt.message||"Press F7 on the C64 keyboard to continue.";
+  const cancel=$("#legacyF7Cancel"),cont=$("#legacyF7Continue"),dismiss=$("#legacyF7Dismiss");
+  cancel.style.display=!informational&&prompt.cancel_available!==false?"inline-flex":"none";
+  cancel.disabled=prompt.phase==="cancelling";
+  cont.style.display=!informational&&prompt.phase==="manual_continue"?"inline-flex":"none";
+  cont.disabled=false;
+  dismiss.style.display=informational?"inline-flex":"none";
+  dismiss.textContent=prompt.dismiss_label||"Dismiss";
+  overlay.className="screen-operation-overlay"+(prompt.phase==="detected"?" detected":"")+(informational?" informational":"");
+  overlay.style.display="flex";
+  if(key!==MOUNT_RUN_PROMPT_KEY){
+    MOUNT_RUN_PROMPT_KEY=key;
+    if(!document.querySelector("#tab-screen.active")){
+      if(informational&&prompt.phase!=="detected")toast("Physical F7 required — open Screen or press F7 on the C64","err");
+      else if(!informational&&prompt.phase==="physical_f7")toast("Physical F7 required — open Screen or press F7 on the C64","err");
+      else if(prompt.phase==="cartridge_attention")toast("Cartridge startup requires attention — open Screen","err");
+    }
+  }
+}
+function renderMountRunPrompt(prompt){
+  MOUNT_RUN_PROMPT_STATE=prompt?.active?prompt:null;
+  renderScreenOperationOverlay();
+}
+function stopStandaloneReadyWatch(){
+  if(STANDALONE_READY_TIMER){clearTimeout(STANDALONE_READY_TIMER);STANDALONE_READY_TIMER=null}
+  STANDALONE_READY_CONSECUTIVE=0;
+}
+function scheduleStandaloneReadyWatch(generation,delay=700){
+  stopStandaloneReadyWatch();
+  STANDALONE_READY_TIMER=setTimeout(()=>pollStandaloneBasicReady(generation),delay);
+}
+async function pollStandaloneBasicReady(generation){
+  STANDALONE_READY_TIMER=null;
+  if(generation!==STANDALONE_NOTICE_GENERATION||!STANDALONE_SCREEN_NOTICE?.active)return;
+  try{
+    const r=await api("/api/machine/basic-ready",{timeoutMs:2500});
+    if(generation!==STANDALONE_NOTICE_GENERATION||!STANDALONE_SCREEN_NOTICE?.active)return;
+    if(r?.supported===false){stopStandaloneReadyWatch();return}
+    if(!r?.busy&&r?.ready===true)STANDALONE_READY_CONSECUTIVE++;
+    else if(!r?.busy)STANDALONE_READY_CONSECUTIVE=0;
+    if(STANDALONE_READY_CONSECUTIVE>=2){
+      stopStandaloneReadyWatch();
+      STANDALONE_SCREEN_NOTICE={
+        ...STANDALONE_SCREEN_NOTICE,
+        kind:"standalone_ready",phase:"detected",
+        title:"Fastload detected — ready",
+        message:"BASIC is ready.",monitor_basic_ready:false,
+      };
+      renderScreenOperationOverlay();
+      setTimeout(()=>{
+        if(generation===STANDALONE_NOTICE_GENERATION&&STANDALONE_SCREEN_NOTICE?.kind==="standalone_ready")clearStandaloneScreenNotice();
+      },900);
+      return;
+    }
+  }catch(e){
+    // A short status probe may lose a race with another device operation.
+    // Keep the guidance visible and try again without surfacing a toast.
+  }
+  if(generation===STANDALONE_NOTICE_GENERATION&&STANDALONE_SCREEN_NOTICE?.active){
+    STANDALONE_READY_TIMER=setTimeout(()=>pollStandaloneBasicReady(generation),700);
+  }
+}
+function showStandaloneScreenNotice(notice){
+  if(!notice)return;
+  stopStandaloneReadyWatch();
+  const generation=++STANDALONE_NOTICE_GENERATION;
+  STANDALONE_SCREEN_NOTICE={...notice,active:true,informational:true,phase:notice.kind||"standalone_f7"};
+  renderScreenOperationOverlay();
+  if(notice.monitor_basic_ready===true)scheduleStandaloneReadyWatch(generation);
+}
+function clearStandaloneScreenNotice(){
+  ++STANDALONE_NOTICE_GENERATION;
+  stopStandaloneReadyWatch();
+  STANDALONE_SCREEN_NOTICE=null;
+  renderScreenOperationOverlay();
+}
+function dismissStandaloneScreenNotice(){clearStandaloneScreenNotice()}
+
+async function cancelLegacyMountRun(){
+  const btn=$("#legacyF7Cancel");if(btn)btn.disabled=true;
+  try{
+    await api("/api/mount/run/cancel",{method:"POST"});
+    renderMountRunPrompt({active:true,phase:"cancelling",title:"Cancelling Mount & Run…",message:"The current wait is being released.",cancel_available:false});
+  }catch(e){toast(e.message,"err");if(btn)btn.disabled=false}
+}
+async function continueLegacyMountRun(){
+  const btn=$("#legacyF7Continue");if(btn)btn.disabled=true;
+  try{await api("/api/mount/run/continue",{method:"POST"})}
+  catch(e){toast(e.message,"err");if(btn)btn.disabled=false}
+}
 function beginMountRunStatusWatch(){
-  MOUNT_RUN_BUSY=false;stopMountRunStatusWatch();
+  clearStandaloneScreenNotice();
+  MOUNT_RUN_BUSY=true;stopMountRunStatusWatch();
   setTimeout(loadInfo,150);
   // The mount request is synchronous at the API level, so poll the local busy
   // snapshot until the server confirms the mount and begins the load phase.
   MOUNT_RUN_STATUS_WATCH=setInterval(loadInfo,750);
 }
 function finishMountRunStatusWatch(){
-  stopMountRunStatusWatch();MOUNT_RUN_BUSY=false;loadInfo();
+  stopMountRunStatusWatch();MOUNT_RUN_BUSY=false;renderMountRunPrompt(null);loadInfo();
 }
 let INPUT_STATUS_IN_FLIGHT=false;
 async function loadInputStatus(refresh=false){
@@ -695,8 +832,8 @@ async function loadInputStatus(refresh=false){
   INPUT_STATUS_IN_FLIGHT=true;
   try{
     const r=await api("/api/input/status"+(refresh?"?refresh=true":""),{timeoutMs:15000});
-    const wasMatrix=!!INPUT_STATUS.available;INPUT_STATUS=r||INPUT_STATUS;
-    if(wasMatrix&&!INPUT_STATUS.available)matrixClearLocalState();
+    const wasMatrix=isMatrixInput();INPUT_STATUS=r||INPUT_STATUS;
+    if(wasMatrix&&!isMatrixInput())matrixClearLocalState();
     renderInputMode();if(LAST_DEVICE_INFO)renderDeviceInfo(LAST_DEVICE_INFO);
     return INPUT_STATUS;
   }catch(e){
@@ -711,8 +848,8 @@ async function loadInfo(){
   try{
     if(!VER_SHOWN){try{const c=await api("/api/app_config");
       if(c.version){$("#ver").textContent="v"+c.version+(c.release_label?" · "+c.release_label:"")+(c.build?" · "+c.build:"");
-        $("#ver").title="version "+c.version+(c.release_label?" ("+c.release_label+")":"")+", build "+(c.build||"?")+" — quote this in bug reports";
-        const exitBtn=$("#btnAppExit");if(exitBtn)exitBtn.style.display=c.local_exit_available===false?"none":"";
+        $("#ver").title="Version "+c.version+(c.release_label?" ("+c.release_label+")":"")+", build "+(c.build||"?")+" — quote this in bug reports";
+        const exitBtn=$("#btnAppExit");if(exitBtn)exitBtn.style.display=c.local_exit_available!==false?"":"none";
         VER_SHOWN=true}}catch(e){}}
     const previousFailures=INFO_FAILURES,i=await api("/api/info");
     if(i?.u64deck_discovery_busy||i?.u64deck_operation_busy){
@@ -724,6 +861,7 @@ async function loadInfo(){
     if(i?.u64deck_busy){
       INFO_FAILURES=0;MOUNT_RUN_BUSY=true;stopMountRunStatusWatch();
       applyBusyMountSnapshot(i.u64deck_mounts);
+      renderMountRunPrompt(i.u64deck_mount_run_prompt);
       const label=esc(i.u64deck_busy_label||"BUSY — loading program…");
       if(LAST_DEVICE_INFO)renderDeviceInfo(LAST_DEVICE_INFO,` <span class="device-busy">· ${label}</span>`);
       else $("#devinfo").innerHTML=`<span class="device-busy">${label}</span>`;
@@ -732,56 +870,102 @@ async function loadInfo(){
       INFO_RETRY_TIMER=setTimeout(()=>{INFO_RETRY_TIMER=null;loadInfo()},retry);
       return;
     }
-    LAST_DEVICE_INFO=i;INFO_FAILURES=0;MOUNT_RUN_BUSY=false;
+    LAST_DEVICE_INFO=i;INFO_FAILURES=0;MOUNT_RUN_BUSY=false;renderMountRunPrompt(null);
     if(INFO_RETRY_TIMER){clearTimeout(INFO_RETRY_TIMER);INFO_RETRY_TIMER=null}
     if(i.u64deck_link)applyLinkStatus(i.u64deck_link);else await loadLinkStatus(previousFailures>0);
     if(i.u64deck_input){INPUT_STATUS=i.u64deck_input;renderInputMode();
-      if(INPUT_STATUS.pending||INPUT_STATUS.available===null)scheduleInputProbe()}
+      if(inputStatusPending())scheduleInputProbe()}
     renderDeviceInfo(i);
     const firstDriveReady=!DRIVE_STATUS_READY;DRIVE_STATUS_READY=true;
     if(firstDriveReady)setTimeout(refreshDrives,0);
+    if(document.querySelector("#tab-settings.active")&&!SET.loaded)settingsRetry(0);
   }catch(e){
     const unconfig=/No device configured/.test(e.message);
     if(!unconfig&&LAST_DEVICE_INFO&&INFO_FAILURES===0){
       INFO_FAILURES=1;
-      renderDeviceInfo(LAST_DEVICE_INFO,` <span class="reconnecting">· reconnecting…</span>`);
+      renderDeviceInfo(LAST_DEVICE_INFO,` <span class="reconnecting">· Reconnecting…</span>`);
       if(INFO_RETRY_TIMER)clearTimeout(INFO_RETRY_TIMER);
       INFO_RETRY_TIMER=setTimeout(()=>{INFO_RETRY_TIMER=null;loadInfo()},2000);
       return;
     }
     INFO_FAILURES++;
     $("#devinfo").innerHTML=`<span style="color:var(--err)">${unconfig
-      ?"No device configured — click Select Ultimate… →":esc("offline: "+e.message)}</span>`;
+      ?"No device configured — click Select Ultimate… →":esc("Offline: "+e.message)}</span>`;
   }finally{INFO_IN_FLIGHT=false}
 }
 
-let AUTO_FASTLOAD=false;
+let AUTO_FASTLOAD=false,EFFECTIVE_AUTO_FASTLOAD=false,BOOT_OPTIONS_SAVING=false;
+let BOOT_CARTRIDGE={known:false,classification:"unknown",label:"Unknown"};
+function renderAutoFastloadState(){
+  const box=$("#autoFastload"),hint=$("#autoFastloadHint"),label=$("#autoFastloadLabel");
+  if(!box)return;
+  const legacy=isLegacyInput();
+  const retro=BOOT_CARTRIDGE?.classification==="retro_replay";
+  EFFECTIVE_AUTO_FASTLOAD=AUTO_FASTLOAD&&!legacy&&retro;
+  box.checked=AUTO_FASTLOAD;
+  box.disabled=BOOT_OPTIONS_SAVING||legacy;
+  if(hint){
+    hint.style.display=legacy?"inline-flex":"none";
+    hint.textContent=retro?"Legacy: physical F7 for Retro Replay"
+      :BOOT_CARTRIDGE?.classification==="other"?"Legacy: manual cartridge startup"
+      :BOOT_CARTRIDGE?.classification==="none"?"Legacy: Auto F7 unavailable"
+      :"Legacy: cartridge checked at launch";
+  }
+  if(label)label.title=legacy
+    ?"Retro Replay is configured, but automatic F7 is disabled with Legacy KERNAL-buffer input because an emulated F7 can open the Freeze Menu. Press physical F7 on the C64 instead. Your saved Auto F7 preference is retained for CIA1-capable devices."
+    :"Automatically presses F7 after Reset, Reboot and Mount & Run when Retro Replay is configured. Disable this option to handle the Retro Replay startup menu manually.";
+}
 async function loadBootOptions(){
   try{
     const r=await api("/api/boot_options");
     AUTO_FASTLOAD=!!r.auto_fastload;
-    $("#autoFastload").checked=AUTO_FASTLOAD;
+    BOOT_CARTRIDGE=r.cartridge||BOOT_CARTRIDGE;
+    EFFECTIVE_AUTO_FASTLOAD=!!r.effective_auto_fastload;
+    renderAutoFastloadState();
   }catch(e){}
 }
 async function autoFastloadChanged(){
   const box=$("#autoFastload"),wanted=box.checked;
-  box.disabled=true;
+  if(isLegacyInput()){
+    box.checked=AUTO_FASTLOAD;renderAutoFastloadState();
+    toast("Legacy input detected — physical F7 is required on the C64","err");return
+  }
+  BOOT_OPTIONS_SAVING=true;renderAutoFastloadState();
   try{
     const r=await api("/api/boot_options",{method:"POST",
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({auto_fastload:wanted})});
-    AUTO_FASTLOAD=!!r.auto_fastload;box.checked=AUTO_FASTLOAD;
+    AUTO_FASTLOAD=!!r.auto_fastload;
+    BOOT_CARTRIDGE=r.cartridge||BOOT_CARTRIDGE;
+    EFFECTIVE_AUTO_FASTLOAD=!!r.effective_auto_fastload;
     toast(AUTO_FASTLOAD
       ?"Retro Replay Fastload: F7 will be pressed after u64deck resets"
       :"Automatic Retro Replay F7 disabled","ok");
-  }catch(e){box.checked=AUTO_FASTLOAD;toast(e.message,"err")}
-  finally{box.disabled=false}
+  }catch(e){toast(e.message,"err")}
+  finally{BOOT_OPTIONS_SAVING=false;renderAutoFastloadState()}
 }
-async function machine(a){try{
-    await put("/api/machine/"+a);
-    const fast=(AUTO_FASTLOAD&&(a==="reset"||a==="reboot"))?" + F7 Fastload":"";
-    toast(a.replace("_"," ")+fast+" ✓","ok")
+async function machine(a){
+  if(MOUNT_RUN_BUSY&&(a==="reset"||a==="reboot")){
+    toast("Mount & Run is in progress — "+a+" was not queued","err");return
+  }
+  const resetLike=a==="reset"||a==="reboot";
+  if(resetLike)clearStandaloneScreenNotice();
+  try{
+    const r=await put("/api/machine/"+a);
+    if(r?.u64deck_cartridge){BOOT_CARTRIDGE=r.u64deck_cartridge;renderAutoFastloadState()}
+    if(r?.u64deck_screen_notice)showStandaloneScreenNotice(r.u64deck_screen_notice);
+    const retro=BOOT_CARTRIDGE?.classification==="retro_replay";
+    const legacy=isLegacyInput();
+    if(resetLike&&AUTO_FASTLOAD&&retro&&legacy){
+      toast(healthStatusLabel(a)+" ✓ — physical F7 required for Retro Replay Fastload","ok");
+    }else if(resetLike&&AUTO_FASTLOAD&&!retro){
+      toast(healthStatusLabel(a)+" ✓ — Auto F7 skipped (Retro Replay not configured)","ok");
+    }else{
+      const fast=(EFFECTIVE_AUTO_FASTLOAD&&resetLike)?" + F7 Fastload":"";
+      toast(healthStatusLabel(a)+fast+" ✓","ok");
+    }
   }catch(e){toast(e.message,"err")}}
+
 
 /* ---------- keyboard ---------- */
 const P={ // KeyboardEvent.key -> PETSCII for the legacy KERNAL buffer
@@ -800,8 +984,16 @@ function legacyCodeForEvent(ev){
   if(ev.key.length===1&&!ev.ctrlKey&&!ev.metaKey)return chToPet(ev.key);
   return null;
 }
-let keyq=[],keyTimer=null,keySending=false,sentKeys=0;
+let keyq=[],keyTimer=null,keySending=false,sentKeys=0,legacyBusyToastAt=0;
 function queueKeys(codes){
+  if(MOUNT_RUN_BUSY){
+    const now=Date.now();
+    if(now-legacyBusyToastAt>1500){
+      legacyBusyToastAt=now;
+      toast("Mount & Run is in progress — Legacy keys were not queued","err");
+    }
+    return;
+  }
   keyq.push(...codes);
   // A tiny debounce combines normal typing into one ordered command without
   // adding the noticeable 25 ms delay used by older builds.
@@ -817,11 +1009,11 @@ async function flushKeys(){
     // concurrent HTTP requests from turning RUN into RNU.
     while(keyq.length){
       const batch=keyq.splice(0,8);
-      await api("/api/keys",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({petscii:batch})});
+      await api("/api/keys",{method:"POST",headers:{"Content-Type":"application/json",
+        "X-U64deck-Key-Origin":"screen-mirror"},body:JSON.stringify({petscii:batch})});
       sentKeys+=batch.length;updateKeyboardStatus();
     }
-  }catch(e){toast("keys: "+e.message,"err")}
+  }catch(e){toast("Keys: "+e.message,"err")}
   finally{
     keySending=false;
     if(keyq.length&&!keyTimer)keyTimer=setTimeout(flushKeys,6);
@@ -896,10 +1088,10 @@ function queueMatrixEvent(event){
   if(!MATRIX_SENDING)flushMatrixEvents();
 }
 async function flushMatrixEvents(){
-  if(MATRIX_SENDING||!MATRIX_QUEUE.length||!INPUT_STATUS.available)return;
+  if(MATRIX_SENDING||!MATRIX_QUEUE.length||!isMatrixInput())return;
   MATRIX_SENDING=true;
   try{
-    while(MATRIX_QUEUE.length&&INPUT_STATUS.available){
+    while(MATRIX_QUEUE.length&&isMatrixInput()){
       const batch=MATRIX_QUEUE.splice(0,64);
       await api("/api/input/events",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({events:batch})});
@@ -907,13 +1099,13 @@ async function flushMatrixEvents(){
       updateKeyboardStatus();
     }
   }catch(e){
-    matrixClearLocalState();toast("matrix input: "+e.message,"err");await loadInputStatus(true);
-  }finally{MATRIX_SENDING=false;if(MATRIX_QUEUE.length&&INPUT_STATUS.available)flushMatrixEvents()}
+    matrixClearLocalState();toast("Matrix input: "+e.message,"err");await loadInputStatus(true);
+  }finally{MATRIX_SENDING=false;if(MATRIX_QUEUE.length&&isMatrixInput())flushMatrixEvents()}
 }
 function matrixReleaseAll(reason="",keepalive=false){
   const hadState=MATRIX_HELD.size>0||MATRIX_QUEUE.length>0||MATRIX_SENDING;
   MATRIX_HELD.clear();MATRIX_QUEUE=[];
-  if(!hadState||!INPUT_STATUS.available)return;
+  if(!hadState||!isMatrixInput())return;
   if(keepalive){
     fetch("/api/input/release_all",{method:"POST",keepalive:true}).catch(()=>{});return;
   }
@@ -923,11 +1115,11 @@ function matrixReleaseAll(reason="",keepalive=false){
 }
 function updateKeyboardStatus(){
   const stat=$("#kbstat");if(!stat)return;
-  const mode=INPUT_STATUS.available?"CIA1 matrix":"legacy buffer";
+  const mode=isMatrixInput()?"CIA1 matrix":"legacy buffer";
   stat.innerHTML=`Keyboard captured — <b>${sentKeys}</b> key events sent via ${mode}. Esc = RUN/STOP.`;
 }
 async function quickC64Key(name){
-  if(INPUT_STATUS.available){
+  if(isMatrixInput()){
     queueMatrixEvent({kind:"keyboard",inputs:[name],transition:"tap"});
     screenEl.focus({preventScroll:true});return;
   }
@@ -943,7 +1135,7 @@ function screenshot(){
     const a=document.createElement("a");
     a.href=URL.createObjectURL(b);a.download="u64-"+ts+".png";a.click();
     setTimeout(()=>URL.revokeObjectURL(a.href),1000);
-    toast("screenshot saved ✓","ok")},"image/png")}
+    toast("Screenshot saved ✓","ok")},"image/png")}
 function toggleFullscreen(){
   if(LINK_STATUS.link_type==="wifi"){toast("Streaming is not available over Wi-Fi; switch to Ethernet for Full Screen","err");return}
   const crt=screenEl.closest(".crt");
@@ -957,7 +1149,7 @@ screenEl.addEventListener("pointerdown",()=>screenEl.focus({preventScroll:true})
 screenEl.addEventListener("keydown",ev=>{
   // In fullscreen the browser reserves Esc for exiting — don't also send RUN/STOP.
   if(ev.key==="Escape"&&document.fullscreenElement)return;
-  if(INPUT_STATUS.available){
+  if(isMatrixInput()){
     const mapped=matrixMapping(ev);if(!mapped)return;
     ev.preventDefault();
     const id=ev.code||ev.key;
@@ -986,10 +1178,15 @@ screenEl.addEventListener("keydown",ev=>{
     return;
   }
   const code=legacyCodeForEvent(ev);
+  if(code===136){
+    ev.preventDefault();
+    toast("Physical F7 is required on Legacy KERNAL-buffer input","err");
+    return;
+  }
   if(code!==null){ev.preventDefault();queueKeys([code])}
 });
 screenEl.addEventListener("keyup",ev=>{
-  if(!INPUT_STATUS.available)return;
+  if(!isMatrixInput())return;
   const id=ev.code||ev.key,record=MATRIX_HELD.get(id);if(!record)return;
   ev.preventDefault();MATRIX_HELD.delete(id);
   if(record.directModifier){
@@ -1006,9 +1203,9 @@ screenEl.addEventListener("keyup",ev=>{
   }
 });
 screenEl.addEventListener("focus",()=>{
-  $("#kbstat").innerHTML=INPUT_STATUS.available
+  $("#kbstat").innerHTML=isMatrixInput()
     ?"Keyboard captured — CIA1 matrix input active. Held keys and chords go directly to the C64."
-    :"Keyboard captured — legacy KERNAL buffer active. Esc = RUN/STOP.";
+    :"Keyboard captured — legacy KERNAL buffer active. Esc = RUN/STOP; use physical C64 F7 for cartridge Fastload.";
 });
 screenEl.addEventListener("blur",()=>{
   matrixReleaseAll("screen blur");
@@ -1018,9 +1215,10 @@ document.addEventListener("visibilitychange",()=>{if(document.hidden)matrixRelea
 window.addEventListener("pagehide",()=>matrixReleaseAll("page hide",true));
 window.addEventListener("beforeunload",()=>matrixReleaseAll("page unload",true));
 async function sendLine(){const t=$("#typeline").value;if(!t)return;
-  try{await api("/api/keys",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({text:t+"\n"})});
-    $("#typeline").value="";toast("typed to C64 ✓","ok")}
+  if(MOUNT_RUN_BUSY){toast("Mount & Run is in progress — text was not queued","err");return}
+  try{await api("/api/keys",{method:"POST",headers:{"Content-Type":"application/json",
+      "X-U64deck-Key-Origin":"type-line"},body:JSON.stringify({text:t+"\n"})});
+    $("#typeline").value="";toast("Typed to C64 ✓","ok")}
   catch(e){toast(e.message,"err")}}
 
 /* ---------- video ---------- */
@@ -1039,7 +1237,8 @@ let VIDEO_NO_FRAME_TIMER=null;
 let wsA=null,actx=null,nextT=0,audioOn=false,audioWanted=false,audioState="off",audioRate=0;
 let audioReconnectTimer=null;
 const AUDIO_SOURCES=new Set(),AUDIO_MAX_AHEAD=0.32,AUDIO_START_LEAD=0.04;
-let AUDIO_JUKE_STOP_MUTED=false;
+let AUDIO_JUKE_STOP_MUTED=false,AUDIO_OUTPUT_GAIN=null,AUDIO_RECORD_DEST=null;
+let JUKE_FADE_TIMER=null,JUKE_FADE_TRANSITION_TIMER=null,JUKE_FADE_TOKEN="",JUKE_FADE_STATE=null,JUKE_FADE_HELD=false;
 
 setInterval(()=>{
   HEALTH_BROWSER.videoRenderFps=frames;
@@ -1139,18 +1338,78 @@ async function toggleVideo(){
   screenEl.focus()}
 
 /* ---------- audio ---------- */
+function ensureAudioOutputGain(){
+  if(!actx)return null;
+  if(!AUDIO_OUTPUT_GAIN){AUDIO_OUTPUT_GAIN=actx.createGain();AUDIO_OUTPUT_GAIN.gain.value=1;AUDIO_OUTPUT_GAIN.connect(actx.destination)}
+  return AUDIO_OUTPUT_GAIN;
+}
+function audioRecordDestinationSet(dest){
+  if(!AUDIO_OUTPUT_GAIN)ensureAudioOutputGain();
+  if(AUDIO_RECORD_DEST&&AUDIO_OUTPUT_GAIN){try{AUDIO_OUTPUT_GAIN.disconnect(AUDIO_RECORD_DEST)}catch(e){}}
+  AUDIO_RECORD_DEST=dest||null;if(AUDIO_RECORD_DEST&&AUDIO_OUTPUT_GAIN)AUDIO_OUTPUT_GAIN.connect(AUDIO_RECORD_DEST);
+}
+function jukeFadeGainImmediate(value=1){
+  if(!actx)return;const node=ensureAudioOutputGain(),g=node.gain,now=actx.currentTime;
+  try{g.cancelScheduledValues(now)}catch(e){}g.setValueAtTime(Math.max(0,Math.min(1,value)),now);
+}
+function jukeFadeCancel(restore=true){
+  clearTimeout(JUKE_FADE_TIMER);clearTimeout(JUKE_FADE_TRANSITION_TIMER);JUKE_FADE_TIMER=JUKE_FADE_TRANSITION_TIMER=null;
+  JUKE_FADE_TOKEN="";JUKE_FADE_STATE=null;JUKE_FADE_HELD=false;
+  if(restore)jukeFadeGainImmediate(1);
+}
+async function jukeFadeAwaitReplacement(token){
+  if(!JUKE_FADE_HELD||token!==JUKE_FADE_TOKEN)return;
+  try{
+    const s=await api("/api/juke",{timeoutMs:1500});
+    const current=String(s?.playback_id||s?.active_browser_fade?.playback_id||"");
+    if(!s?.playing||!current||current!==token){
+      flushBrowserAudio();JUKE_FADE_HELD=false;jkRender(s);return;
+    }
+  }catch(e){}
+  if(JUKE_FADE_HELD&&token===JUKE_FADE_TOKEN){
+    JUKE_FADE_TRANSITION_TIMER=setTimeout(()=>{JUKE_FADE_TRANSITION_TIMER=null;jukeFadeAwaitReplacement(token)},125);
+  }
+}
+function jukeFadeHoldSilence(token=JUKE_FADE_TOKEN){
+  if(!actx||token!==JUKE_FADE_TOKEN)return;
+  jukeFadeGainImmediate(0);JUKE_FADE_HELD=true;
+  clearTimeout(JUKE_FADE_TRANSITION_TIMER);
+  JUKE_FADE_TRANSITION_TIMER=setTimeout(()=>{JUKE_FADE_TRANSITION_TIMER=null;jukeFadeAwaitReplacement(token)},50);
+}
+function jukeFadeRamp(duration,initial=1,token=JUKE_FADE_TOKEN){
+  if(!actx||!audioWanted)return;const node=ensureAudioOutputGain(),g=node.gain,now=actx.currentTime,d=Math.max(0.02,Number(duration)||0);
+  try{g.cancelScheduledValues(now)}catch(e){}g.setValueAtTime(Math.max(0,Math.min(1,initial)),now);g.linearRampToValueAtTime(0,now+d);
+  JUKE_FADE_HELD=false;clearTimeout(JUKE_FADE_TRANSITION_TIMER);
+  JUKE_FADE_TRANSITION_TIMER=setTimeout(()=>{JUKE_FADE_TRANSITION_TIMER=null;if(token===JUKE_FADE_TOKEN)jukeFadeHoldSilence(token)},d*1000+20);
+}
+function jukeFadeSync(s,force=false){
+  const f=s?.active_browser_fade||{},enabled=!!(s?.playing&&f.enabled&&Number(f.duration_secs)>0);
+  const stateToken=String(s?.playback_id||f.playback_id||"");
+  const changed=!!(JUKE_FADE_TOKEN&&stateToken&&stateToken!==JUKE_FADE_TOKEN);
+  if(changed&&JUKE_FADE_HELD)flushBrowserAudio();
+  JUKE_FADE_STATE=f;if(!enabled){jukeFadeCancel(true);return}
+  const token=String(f.playback_id||stateToken||"");
+  clearTimeout(JUKE_FADE_TIMER);clearTimeout(JUKE_FADE_TRANSITION_TIMER);JUKE_FADE_TIMER=JUKE_FADE_TRANSITION_TIMER=null;JUKE_FADE_TOKEN=token;JUKE_FADE_HELD=false;
+  if(!actx||!audioWanted)return;
+  const duration=Math.max(0.05,Number(f.duration_secs)||0),starts=Number(f.starts_in_secs),remaining=Math.max(0,Number(f.remaining_secs)||0);
+  if(remaining<=0){jukeFadeHoldSilence(token);return}
+  if(starts>0){jukeFadeGainImmediate(1);JUKE_FADE_TIMER=setTimeout(()=>{JUKE_FADE_TIMER=null;jukeFadeRamp(duration,1,token)},starts*1000);return}
+  const gain=Math.max(0,Math.min(1,remaining/duration));jukeFadeRamp(remaining,gain,token);
+}
+function jukeFadePrepareReplacement(){
+  jukeFadeCancel(false);jukeFadeGainImmediate(0);flushBrowserAudio();
+}
 function flushBrowserAudio(){
   for(const src of [...AUDIO_SOURCES]){try{src.onended=null;src.stop()}catch(e){}try{src.disconnect()}catch(e){}}
   AUDIO_SOURCES.clear();nextT=actx?actx.currentTime:0;achunks=0;
 }
-function playChunk(ab){if(!actx||!audioWanted||AUDIO_JUKE_STOP_MUTED)return;const i16=new Int16Array(ab);const n=i16.length>>1;if(!n)return;
+function playChunk(ab){if(!actx||!audioWanted||AUDIO_JUKE_STOP_MUTED||JUKE_FADE_HELD)return;const i16=new Int16Array(ab);const n=i16.length>>1;if(!n)return;
   const now=actx.currentTime;if(nextT&&nextT<now-0.015)HEALTH_BROWSER.audioUnderruns++;
   if(nextT>now+AUDIO_MAX_AHEAD){HEALTH_BROWSER.audioDroppedAhead++;return}
   const buf=actx.createBuffer(2,n,47983);
   const L=buf.getChannelData(0),R=buf.getChannelData(1);
   for(let i=0;i<n;i++){L[i]=i16[2*i]/32768;R[i]=i16[2*i+1]/32768}
-  const src=actx.createBufferSource();src.buffer=buf;src.connect(actx.destination);
-  if(REC.audioDest)src.connect(REC.audioDest);
+  const src=actx.createBufferSource();src.buffer=buf;src.connect(ensureAudioOutputGain());
   const t=Math.max(now+AUDIO_START_LEAD,nextT);if(t>now+AUDIO_MAX_AHEAD){HEALTH_BROWSER.audioDroppedAhead++;try{src.disconnect()}catch(e){}return}
   AUDIO_SOURCES.add(src);src.onended=()=>{AUDIO_SOURCES.delete(src);try{src.disconnect()}catch(e){}};
   src.start(t);nextT=t+n/47983}
@@ -1162,7 +1421,7 @@ function setAudioState(state,rate=audioRate){
   badge.classList.toggle("on",state==="live");
   badge.classList.toggle("warn",state==="connecting"||state==="reconnecting");
   badge.classList.toggle("bad",state==="error");
-  badge.title=state==="live"?"audio WebSocket chunks received per second":"Ultimate audio stream status";
+  badge.title=state==="live"?"Audio WebSocket chunks received per second":"Ultimate audio stream status";
   button.textContent=audioWanted?"Stop audio":"Start audio";
   if(!videoHasFrame)drawVideoPlaceholder(videoPlaceholderMessage);
 }
@@ -1195,7 +1454,7 @@ async function toggleAudio(){
     const AudioCtor=window.AudioContext||window.webkitAudioContext;
     if(!AudioCtor)throw new Error("This browser does not support Web Audio");
     if(!actx)actx=new AudioCtor();
-    await actx.resume();flushBrowserAudio();
+    await actx.resume();ensureAudioOutputGain();flushBrowserAudio();jukeFadeSync(JK.state,true);
   }catch(e){audioWanted=false;audioOn=false;setAudioState("error",0);toast(e.message,"err");return}
   if(actx.state!=="running")
     toast("Browser blocked audio playback (AudioContext: "+actx.state+")","err");
@@ -1295,7 +1554,7 @@ async function updateRecDrops(force=false){
   try{REC.statsLast=await api("/api/stream/stats");const b=REC.statsBase||REC.statsLast,
     vd=Math.max(0,(REC.statsLast.video?.dropped||0)-(b.video?.dropped||0)),
     ad=Math.max(0,(REC.statsLast.audio?.dropped||0)-(b.audio?.dropped||0));
-    $("#recDrops").textContent=`drops: video ${vd} · audio ${ad}`;
+    $("#recDrops").textContent=`Drops: video ${vd} · audio ${ad}`;
   }catch(e){}
 }
 function ebmlReadVint(bytes,offset,id=false){
@@ -1341,7 +1600,7 @@ async function fixWebmDuration(blob,durationMs){
 
 async function saveRecordingBlob(blob){
   const filename=recordingFilename(REC.mode,REC.ext);
-  if(REC.fileHandle){try{const w=await REC.fileHandle.createWritable();await w.write(blob);await w.close();return filename}catch(e){toast("chosen location failed; using browser download: "+e.message,"err")}}
+  if(REC.fileHandle){try{const w=await REC.fileHandle.createWritable();await w.write(blob);await w.close();return filename}catch(e){toast("Chosen location failed; using browser download: "+e.message,"err")}}
   const url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=filename;
   document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);return filename;
 }
@@ -1356,13 +1615,13 @@ async function startRecording(){
   if(cfg.choose&&window.showSaveFilePicker){
     const major=choice.mime.split(";")[0],accept={};accept[major]=["."+choice.ext];
     try{REC.fileHandle=await showSaveFilePicker({suggestedName:recordingFilename(cfg.mode,choice.ext),types:[{description:`${choice.format.toUpperCase()} media`,accept}]})}
-    catch(e){if(e.name==="AbortError")return;toast("save location unavailable; using Downloads","err")}
+    catch(e){if(e.name==="AbortError")return;toast("Save location unavailable; using Downloads","err")}
   }else if(cfg.choose&&!window.showSaveFilePicker)toast("This browser cannot choose a save location; using Downloads","err");
   if(cfg.mode!=="audio"&&!videoOn)await toggleVideo();if(cfg.mode!=="video"&&!audioOn)await toggleAudio();
   if((cfg.mode!=="audio"&&!videoOn)||(cfg.mode!=="video"&&(!audioOn||!actx))){toast("Required stream could not be started","err");return}
   try{
     const tracks=[];if(cfg.mode!=="audio")tracks.push(...recordingVideoStream(cfg.scale).getVideoTracks());
-    if(cfg.mode!=="video"){REC.audioDest=actx.createMediaStreamDestination();tracks.push(...REC.audioDest.stream.getAudioTracks())}
+    if(cfg.mode!=="video"){REC.audioDest=actx.createMediaStreamDestination();audioRecordDestinationSet(REC.audioDest);tracks.push(...REC.audioDest.stream.getAudioTracks())}
     REC.stream=new MediaStream(tracks);REC.chunks=[];const q=REC_QUALITY[cfg.quality]||REC_QUALITY.standard,opts={mimeType:REC.mime};
     if(cfg.mode!=="audio")opts.videoBitsPerSecond=q.video;if(cfg.mode!=="video")opts.audioBitsPerSecond=q.audio;
     REC.quality={...q,bits:recBitrate(cfg).bits};
@@ -1370,13 +1629,13 @@ async function startRecording(){
     catch(first){REC.recorder=new MediaRecorder(REC.stream,{mimeType:REC.mime});toast("Browser ignored the requested bitrate preset","err")}
     REC.mime=REC.recorder.mimeType||REC.mime;REC.ext=REC.mime.includes("mp4")?(cfg.mode==="audio"?"m4a":"mp4"):"webm";
     REC.recorder.ondataavailable=e=>{if(e.data&&e.data.size)REC.chunks.push(e.data)};
-    REC.recorder.onerror=e=>toast("recording error: "+(e.error?.message||e.message||"unknown"),"err");
+    REC.recorder.onerror=e=>toast("Recording error: "+(e.error?.message||e.message||"unknown"),"err");
     REC.recorder.onstop=async()=>{
       const elapsed=Math.max(0,(Date.now()-REC.started)/1000);await updateRecDrops(true);
       const fallbackMime=REC.mode==="audio"?"audio/webm":"video/webm";let blob=new Blob(REC.chunks,{type:REC.mime||fallbackMime});
       if(REC.ext==="webm")blob=await fixWebmDuration(blob,elapsed*1000);
       const name=await saveRecordingBlob(blob);
-      REC.stream?.getTracks().forEach(t=>t.stop());REC.stream=null;REC.audioDest=null;REC.chunks=[];REC.fileHandle=null;
+      REC.stream?.getTracks().forEach(t=>t.stop());REC.stream=null;audioRecordDestinationSet(null);REC.audioDest=null;REC.chunks=[];REC.fileHandle=null;
       clearInterval(REC.copyTimer);REC.copyTimer=null;REC.captureCanvas=null;
       toast(`${name} saved · ${Math.round(elapsed)} sec · ${(blob.size/1048576).toFixed(1)} MiB ✓`,"ok");updateRecSummary();
     };
@@ -1384,8 +1643,8 @@ async function startRecording(){
     REC.recorder.start(1000);REC.active=true;REC.started=Date.now();REC.timer=setInterval(()=>{recUi();updateRecDrops()},250);recUi();updateRecSummary();
     if(cfg.duration>0)REC.stopTimer=setTimeout(stopRecording,cfg.duration*1000);
     if(!localStorage.getItem("u64deck.recording.seen")){localStorage.setItem("u64deck.recording.seen","1");$("#recordOptions").open=true}
-    toast(`recording ${cfg.mode.replace("combined","video + audio")} as ${REC.format.toUpperCase()}…`,"ok");
-  }catch(e){REC.audioDest=null;REC.stream?.getTracks().forEach(t=>t.stop());REC.stream=null;clearInterval(REC.copyTimer);toast(e.message,"err")}
+    toast(`Recording ${cfg.mode.replace("combined","video + audio")} as ${REC.format.toUpperCase()}…`,"ok");
+  }catch(e){audioRecordDestinationSet(null);REC.audioDest=null;REC.stream?.getTracks().forEach(t=>t.stop());REC.stream=null;clearInterval(REC.copyTimer);toast(e.message,"err")}
 }
 function stopRecording(){
   if(!REC.active)return;REC.active=false;clearInterval(REC.timer);clearTimeout(REC.stopTimer);REC.timer=REC.stopTimer=null;recUi();updateRecSummary();
@@ -1420,7 +1679,7 @@ async function loadMountOptions(){
 async function mountModeChanged(source){
   const mode=(source?.value)||$("#mountModeDefault")?.value||"unlinked";syncMountMode(mode);
   try{await api("/api/mount/options",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({default_mode:mode})});
-    toast(`default mount mode: ${mountModeLong(mode)} ✓`,"ok")}
+    toast(`Default mount mode: ${mountModeLong(mode)} ✓`,"ok")}
   catch(e){toast(e.message,"err")}
 }
 const FS={loaded:false,path:"/"};
@@ -1436,7 +1695,7 @@ function parentPath(p){
 function fsUp(){if(FS.path!=="/")fsGo(parentPath(FS.path))}
 async function fsGo(path){
   FS.loaded=true;FS.path=path;
-  $("#fslist").textContent="loading…";
+  $("#fslist").textContent="Loading…";
   renderCrumbs(path);
   const atVirtualRoot=(path==="/");
   const up=$("#btnUp");if(up)up.disabled=atVirtualRoot;
@@ -1444,8 +1703,8 @@ async function fsGo(path){
   if(nd){
     nd.disabled=atVirtualRoot;
     nd.title=atVirtualRoot
-      ? "open USB0, SD, Flash, Temp or another storage folder first"
-      : "create a blank disk image in "+path;
+      ? "Open USB0, SD, Flash, Temp or another storage folder first"
+      : "Create a blank disk image in "+path;
   }
   const ndCreate=$("#newDiskCreateBtn");if(ndCreate)ndCreate.disabled=atVirtualRoot;
   const ndHint=$("#newDiskHint");
@@ -1456,7 +1715,7 @@ async function fsGo(path){
   try{
     const r=await api("/api/fs?path="+encodeURIComponent(path));
     const parentRow=path==="/"?"":`<tr class="fsentry" onclick="fsUp()">
-      <td><span class="dirmark">▴</span> ..</td><td></td><td class="hint" style="text-align:right">up</td></tr>`;
+      <td><span class="dirmark">▴</span> ..</td><td></td><td class="hint" style="text-align:right">Up</td></tr>`;
     const rows=parentRow+r.entries.map(e=>{
       const full=joinPath(path,e.name);
       if(e.dir){
@@ -1467,9 +1726,9 @@ async function fsGo(path){
       let acts="";
       let rowClick="";
       if(isImage(e.name)){
-        rowClick=` onclick="rowBrowse(event,'${jsq(full)}')" style="cursor:pointer" title="click to browse inside"`;
+        rowClick=` onclick="rowBrowse(event,'${jsq(full)}')" style="cursor:pointer" title="Click to browse inside"`;
         const fav=itemSpec("disk",e.name,full,"disk_run",{path:full});
-        acts=starButton(fav)+` <button class="mini" onclick="queueAdd('${jsq(full)}')" title="add to disk swap queue">Add to Swap Queue</button>
+        acts=starButton(fav)+` <button class="mini" onclick="queueAdd('${jsq(full)}')" title="Add to disk swap queue">Add to Swap Queue</button>
         <button class="mini primary tip mount-mode-action" data-mount-base="Mount & Run" data-tip="Mount with the selected safety mode, reset the C64, then load and run the first program." onclick="mountRunDevice('${jsq(full)}')">Mount & Run · ${mountModeShort()}</button>
         <button class="mini" onclick="imgOpenDevice('${jsq(full)}')">Open Image</button>
         <button class="mini tip mount-mode-action" data-mount-base="Mount to A" data-tip="Mount to drive A without resetting the C64." onclick="mountDevice('${jsq(full)}','a')">Mount to A · ${mountModeShort()}</button>
@@ -1484,7 +1743,7 @@ async function fsGo(path){
       acts+=` <a class="mini" style="color:var(--dim)" href="/api/fs/download?path=${encodeURIComponent(full)}">⤓</a>`;
       return `<tr${rowClick}><td>${esc(e.name)}</td><td class="hint">${fmtSize(e.size)}</td><td style="text-align:right">${acts}</td></tr>`;
     }).join("");
-    $("#fslist").innerHTML=rows?`<table><tbody>${rows}</tbody></table>`:'<span class="hint">empty directory</span>';
+    $("#fslist").innerHTML=rows?`<table><tbody>${rows}</tbody></table>`:'<span class="hint">Empty directory</span>';
   }catch(e){$("#fslist").innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`}
   idxButtonRefresh();
 }
@@ -1529,8 +1788,8 @@ function idxButtonRefresh(){
   const verify=indexLocalCover(FS.path||"/",IDX.last);
   btn.textContent=verify?"🔎 Verify Index":"🗂 Build Index";
   btn.title=verify
-    ?"optional full FTP verification of the local USB import; normal browsing already refreshes individual folders"
-    :"walk this subtree once and store folders plus disk-image directories in SQLite";
+    ?"Optional full FTP verification of the local USB import; normal browsing already refreshes individual folders"
+    :"Walk this subtree once and store folders plus disk-image directories in SQLite";
 }
 async function localVolumesLoad(){
   const sel=$("#localVolume");
@@ -1538,13 +1797,13 @@ async function localVolumesLoad(){
   try{
     const r=await api("/api/local/volumes");
     LOCAL_VOLUMES=r.volumes||[];
-    sel.innerHTML='<option value="">select a detected drive…</option>'+LOCAL_VOLUMES.map((v,i)=>{
+    sel.innerHTML='<option value="">Select a detected drive…</option>'+LOCAL_VOLUMES.map((v,i)=>{
       const label=(v.label?`${v.label} · `:"")+v.path+` · ${v.type}`;
       return `<option value="${i}">${esc(label)}</option>`;
-    }).join("")+ '<option value="manual">manual path…</option>';
+    }).join("")+ '<option value="manual">Manual path…</option>';
     const first=LOCAL_VOLUMES.findIndex(v=>v.removable);
     if(first>=0){sel.value=String(first);localVolumePicked()}
-  }catch(e){sel.innerHTML='<option value="">drive detection unavailable</option>'}
+  }catch(e){sel.innerHTML='<option value="">Drive detection unavailable</option>'}
 }
 function localVolumePicked(){
   const value=$("#localVolume").value;
@@ -1558,7 +1817,7 @@ async function localIndexToggle(){
     if(state.running){await api("/api/fs/index/stop",{method:"POST"});return}
     const source=$("#localIndexSource").value.trim();
     const root=$("#localIndexRoot").value.trim()||"/USB0";
-    if(!source){toast("choose a local USB drive or folder","err");return}
+    if(!source){toast("Choose a local USB drive or folder","err");return}
     const selected=LOCAL_VOLUMES[+$("#localVolume").value];
     if(selected&&!selected.removable&&!confirm(
       `${selected.path} is reported as a ${selected.type} drive, not removable storage.\n\n`+
@@ -1566,7 +1825,7 @@ async function localIndexToggle(){
     if(!confirm(`Build the SQLite index from:\n\n${source}\n\nas ${root}?\n\nThe scan is read-only and does not copy or change files.`))return;
     await api("/api/fs/index/local",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({source,root})});
-    toast(`indexing ${source} locally as ${root}…`,"ok");
+    toast(`Indexing ${source} locally as ${root}…`,"ok");
     idxPollStart();
   }catch(e){toast(e.message,"err")}}
 
@@ -1597,7 +1856,7 @@ async function idxPauseToggle(){
   try{
     await api("/api/fs/index/pause",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({paused})});
-    toast(paused?"index paused":"index resumed","ok");
+    toast(paused?"Index paused":"Index resumed","ok");
     idxPollTick();
   }catch(e){toast(e.message,"err")}}
 function idxPollStart(){
@@ -1683,7 +1942,7 @@ async function fsSearch(){
     return;
   }
   const q=$("#fsQuery").value.trim();
-  if(q.length<2){toast("type at least 2 characters","err");return}
+  if(q.length<2){toast("Type at least 2 characters","err");return}
   FSRCH.running=true;FSRCH.abort=new AbortController();
   $("#fsGo").textContent="⏹ Stop";
   $("#fsSearchOut").style.display="block";
@@ -1726,7 +1985,7 @@ async function fsSearch(){
   finally{FSRCH.running=false;$("#fsGo").textContent="Search"}}
 async function searchRunInImage(path,index){
   try{
-    toast("opening image + running…","ok");
+    toast("Opening image + running…","ok");
     await imgOpenDevice(path);       // loads the image, sets INSP.token
     await inspRun(index);            // DMA-run that entry
     tab("screen");screenEl.focus();
@@ -1754,7 +2013,7 @@ async function newDiskCreate(){
     return;
   }
   const name=$("#ndName").value.trim();
-  if(!name){toast("give the disk a file name","err");return}
+  if(!name){toast("Give the disk a file name","err");return}
   if(!allowReplaceDrive("a"))return;
   const kind=$("#ndKind").value;
   const body={kind,folder:FS.path,name,diskname:$("#ndLabel").value.trim()||undefined};
@@ -1768,10 +2027,10 @@ async function newDiskCreate(){
     btn.textContent="Mounting RW…";
     try{
       await put(`/api/mount/device?drive=a&mode=readwrite&image=${encodeURIComponent(createdPath)}`,{timeoutMs:20000});
-      toast(`created ${createdPath} · mounted read/write on drive A ✓`,"ok");
+      toast(`Created ${createdPath} · mounted read/write on drive A ✓`,"ok");
       refreshDrives();swapRefresh();
     }catch(mountError){
-      toast(`created ${createdPath}, but it could not be mounted read/write: ${mountError.message}`,"err");
+      toast(`Created ${createdPath}, but it could not be mounted read/write: ${mountError.message}`,"err");
     }
     $("#ndName").value="";fsGo(FS.path);
   }catch(e){toast(e.message,"err")}
@@ -1782,25 +2041,25 @@ function allowReplaceDrive(drive){
 }
 async function duplicateImage(path){
   if(!confirm(`Create a timestamped copy of ${path.split("/").pop()} on Ultimate storage?`))return;
-  toast("copying image…","ok");
+  toast("Copying image…","ok");
   try{const r=await api("/api/fs/duplicate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path})});
-    toast(`created ${r.destination} ✓`,"ok");fsGo(FS.path)}catch(e){toast(e.message,"err")}
+    toast(`Created ${r.destination} ✓`,"ok");fsGo(FS.path)}catch(e){toast(e.message,"err")}
 }
 async function backupMountRW(path,drive="a"){
   if(!allowReplaceDrive(drive))return;
   if(!confirm(`Create a timestamped backup, then mount the original READ/WRITE on drive ${drive.toUpperCase()}?`))return;
-  toast("backing up image before read/write mount…","ok");
+  toast("Backing up image before read/write mount…","ok");
   try{const r=await api("/api/mount/backup_then_rw",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path,drive})});
-    toast(`backup ${r.backup.destination.split("/").pop()} created · mounted RW ✓`,"ok");
+    toast(`Backup ${r.backup.destination.split("/").pop()} created · mounted RW ✓`,"ok");
     showSwapDecision(r.swap_decision);refreshDrives()}catch(e){toast(e.message,"err")}
 }
 async function mountRunDevice(path){
   if(!allowReplaceDrive("a"))return;
   const mode=mountMode();
-  toast("mounting + booting…","ok");
+  toast("Mounting + booting…","ok");
   beginMountRunStatusWatch();
-  try{const r=await put(`/api/mount/run/device?drive=a&mode=${mode}&image=${encodeURIComponent(path)}`);
-    toast((r.typed||"booted")+" ✓","ok");
+  try{const r=await put(`/api/mount/run/device?drive=a&mode=${mode}&image=${encodeURIComponent(path)}`,{timeoutMs:MOUNT_RUN_REQUEST_TIMEOUT_MS});
+    toast((r.typed||"Booted")+" ✓","ok");
     showSwapDecision(r.swap_decision);
     rememberRecent(itemSpec("disk",path.split("/").pop()||path,path,"disk_run",{path}));
     refreshDrives();tab("screen");screenEl.focus()}
@@ -1808,26 +2067,27 @@ async function mountRunDevice(path){
   finally{finishMountRunStatusWatch()}}
 async function localMountRun(){
   if(!allowReplaceDrive("a"))return;
-  const f=$("#localfile").files[0];if(!f){toast("choose a file first","err");return}
+  const f=$("#localfile").files[0];if(!f){toast("Choose a file first","err");return}
   if(!isImage(f.name)){toast("Mount & Run is for disk images (.d64/.d71/.d81)","err");return}
   const fd=new FormData();fd.append("file",f);fd.append("drive","a");
   fd.append("mode",$("#localmode").value);
-  toast("uploading + booting…","ok");
+  toast("Uploading + booting…","ok");
   beginMountRunStatusWatch();
-  try{const r=await api("/api/mount/run/upload",{method:"POST",body:fd});
-    toast((r.typed||"booted")+" ✓","ok");refreshDrives();tab("screen");screenEl.focus()}
+  try{const r=await api("/api/mount/run/upload",{method:"POST",body:fd,timeoutMs:MOUNT_RUN_REQUEST_TIMEOUT_MS});
+    toast((r.typed||"Booted")+" ✓","ok");refreshDrives();tab("screen");screenEl.focus()}
   catch(e){toast(e.message,"err")}
   finally{finishMountRunStatusWatch()}}
 async function mountDevice(path,drive){
   if(!allowReplaceDrive(drive))return;
   const mode=mountMode();
   try{const r=await put(`/api/mount/device?drive=${drive}&mode=${mode}&image=${encodeURIComponent(path)}`);
-    toast(`mounted on ${drive.toUpperCase()} ✓`,"ok");
+    toast(`Mounted on ${drive.toUpperCase()} ✓`,"ok");
     showSwapDecision(r.swap_decision);
     rememberRecent(itemSpec("disk",path.split("/").pop()||path,path,"disk_run",{path}));
     refreshDrives()}catch(e){toast(e.message,"err")}}
 async function runDevice(path){
-  try{await put("/api/run/device?path="+encodeURIComponent(path));toast("running ✓","ok");
+  if(String(path||"").toLowerCase().endsWith(".crt"))clearStandaloneScreenNotice();
+  try{await put("/api/run/device?path="+encodeURIComponent(path));toast("Running ✓","ok");
     rememberRecent(itemSpec("program",path.split("/").pop()||path,path,"program_run",{path}))}
   catch(e){toast(e.message,"err")}}
 function driveImageName(state){
@@ -1932,22 +2192,23 @@ async function imgOpenDevice(path){
   try{const r=await api("/api/image/open/device?path="+encodeURIComponent(path));
     r.device_path=path;showInspector(r);return r}catch(e){toast(e.message,"err");return null}}
 async function localOpen(){
-  const f=$("#localfile").files[0];if(!f){toast("choose a file first","err");return}
-  if(!isImage(f.name)){toast("that's not a disk image — use Run PRG/CRT","err");return}
+  const f=$("#localfile").files[0];if(!f){toast("Choose a file first","err");return}
+  if(!isImage(f.name)){toast("That's not a disk image — use Run PRG/CRT","err");return}
   const fd=new FormData();fd.append("file",f);
   try{const r=await api("/api/image/open/upload",{method:"POST",body:fd});showInspector(r)}
   catch(e){toast(e.message,"err")}}
 async function localMount(drive){
   if(!allowReplaceDrive(drive))return;
-  const f=$("#localfile").files[0];if(!f){toast("choose a file first","err");return}
+  const f=$("#localfile").files[0];if(!f){toast("Choose a file first","err");return}
   const fd=new FormData();fd.append("file",f);fd.append("drive",drive);
   fd.append("mode",$("#localmode").value);
   try{await api("/api/mount/upload",{method:"POST",body:fd});
-    toast(`mounted on ${drive.toUpperCase()} ✓`,"ok");refreshDrives();swapRefresh()}catch(e){toast(e.message,"err")}}
+    toast(`Mounted on ${drive.toUpperCase()} ✓`,"ok");refreshDrives();swapRefresh()}catch(e){toast(e.message,"err")}}
 async function localRun(){
-  const f=$("#localfile").files[0];if(!f){toast("choose a file first","err");return}
+  const f=$("#localfile").files[0];if(!f){toast("Choose a file first","err");return}
+  if(String(f.name||"").toLowerCase().endsWith(".crt"))clearStandaloneScreenNotice();
   const fd=new FormData();fd.append("file",f);
-  try{await api("/api/run/upload",{method:"POST",body:fd});toast("running ✓","ok")}
+  try{await api("/api/run/upload",{method:"POST",body:fd});toast("Running ✓","ok")}
   catch(e){toast(e.message,"err")}}
 function diskEntryItem(f,action){
   if(!INSP?.device_path)return null;
@@ -1985,13 +2246,13 @@ async function inspLoad(i){try{await api(`/api/image/${INSP.token}/run?index=${i
 async function inspMountLoad(i){
   const q=`index=${i}&drive=${$("#inspDrive").value}&mode=${$("#inspMode").value}`+
     (INSP.device_path?`&device_path=${encodeURIComponent(INSP.device_path)}`:"");
-  toast("mounting + typing LOAD… (takes a few seconds)");
+  toast("Mounting + typing LOAD… (takes a few seconds)");
   try{const r=await api(`/api/image/${INSP.token}/mount_load?${q}`,{method:"POST"});
     const f=(INSP.files||[]).find(x=>x.index===i);if(f){const it=diskEntryItem(f,"disk_entry_run");if(it)rememberRecent(it)}
     toast(r.typed+" ✓","ok");showSwapDecision(r.swap_decision);refreshDrives()}catch(e){toast(e.message,"err")}}
 async function inspMountWhole(){
   if(INSP.device_path)return mountDevice(INSP.device_path,$("#inspDrive").value);
-  toast("re-select the file under Local files and use Mount → A/B","err")}
+  toast("Re-select the file under Local files and use Mount → A/B","err")}
 
 /* ---------- local launcher settings ---------- */
 async function localSettingsLoad(){
@@ -2006,12 +2267,12 @@ async function localSettingsSave(){
   const sel=$("#localBrowserStartup"),status=$("#localBrowserStatus");if(!sel)return;
   try{const r=await api("/api/local_settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({browser_startup:sel.value})});
     if(status)status.textContent=r.edge_available?"Saved · applies the next time start.bat is used":"Saved · Edge unavailable, so fallback will be used";
-    toast("local browser startup saved ✓","ok");
+    toast("Local browser startup saved ✓","ok");
   }catch(e){toast(e.message,"err")}
 }
 
 /* ---------- settings ---------- */
-const SET={loaded:false,cat:null,detail:{},dirty:{}};
+const SET={loaded:false,loading:false,localInitialised:false,cat:null,detail:{},dirty:{},retryTimer:null,retryCount:0,maxRetries:40};
 const SETW_KEY="u64deck.setitems.w";
 function setitemsResizeInit(){
   const el=$("#setitems");if(!el)return;
@@ -2039,6 +2300,7 @@ async function cacheStatsLoad(){
       `Updates are incremental; completed subtrees search directly in SQLite.<br>`+
       `SID metadata: <b>${db.sid_metadata||0}</b> tunes`+
       ((db.sid_index_runs||[]).length?` · last ${esc(db.sid_index_runs[0].mode)} scan ${esc(db.sid_index_runs[0].completed)}`:"")+`.<br>`+
+      `Approved disk grouping: <b>${db.disk_group_rules||0}</b> reusable rules · <b>${db.disk_group_overrides||0}</b> exact sets.<br>`+
       `Songlengths: <b>${s.songlengths.entries}</b> tunes`+
       (s.songlengths.state==="loading"?" <span class='badge warn'>still loading…</span>":"")+
       (s.songlengths.state&&s.songlengths.state.startsWith("error")?` <span style="color:var(--err)">${esc(s.songlengths.state)}</span>`:"")+
@@ -2066,25 +2328,224 @@ async function cacheParseErrorsToggle(){
   }catch(e){list.innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`}
 }
 
+function diskNamingAmbiguousShown(){
+  const out=[];
+  for(const bucket of DISKNAMING.report?.ambiguous||[]){
+    for(const item of bucket.examples||[])out.push({...item,pattern:bucket.pattern});
+  }
+  return out
+}
+function diskNamingExamples(items,section,allowPatternScope){
+  if(!items?.length)return '<span class="hint">No examples.</span>';
+  return items.map(item=>{
+    const ambiguous=section==="ambiguous";
+    const selector=ambiguous?`<label class="hint" style="display:flex;align-items:center;gap:4px;white-space:nowrap"><input type="checkbox" class="disk-naming-ambiguous-check" data-set-id="${esc(item.set_id||"")}"> Select</label>`:"";
+    const folder=ambiguous?`<button class="mini" onclick="diskNamingApproveAmbiguousFolder(this.dataset.parent)" data-parent="${esc(item.parent||"/")}">Approve folder</button>`:"";
+    return `<div class="item-card" style="align-items:flex-start">
+      ${selector}<div class="item-main"><div class="item-label">${esc(item.parent||"/")}</div>
+      <div class="item-detail hint">${(item.names||[]).map(esc).join(" · ")}${Number(item.total_files||0)>(item.names||[]).length?` · … ${Number(item.total_files)} files total`:""}</div></div>
+      <span style="display:flex;gap:4px;flex-wrap:wrap">${allowPatternScope?`<button class="mini" onclick="diskNamingApproveRuleForFolder(this.dataset.i,this.dataset.e)" data-i="${item._item}" data-e="${item._example}">Approve for folder</button>`:""}${folder}<button class="mini" onclick="diskNamingApproveExactByIndex(this.dataset.s,this.dataset.i,this.dataset.e)" data-s="${section}" data-i="${item._item}" data-e="${item._example}">Approve this set only</button></span>
+    </div>`
+  }).join("");
+}
+function diskNamingSummarySection(title,items,kind){
+  if(!items?.length)return `<details><summary>${esc(title)} · 0</summary><div class="hint" style="margin-top:6px">None found.</div></details>`;
+  const totalSets=items.reduce((n,x)=>n+Number(x.sets||0),0);
+  const batch=kind==="ambiguous"?`<div class="row" style="gap:6px;flex-wrap:wrap;margin:7px 0">
+    <button class="mini primary" onclick="diskNamingApproveAmbiguousBatch('selected')">Approve selected examples</button>
+    <button class="mini" onclick="diskNamingApproveAmbiguousBatch('all')">Approve all ambiguous (${totalSets.toLocaleString()})</button>
+    <span class="hint">Selected applies to the examples displayed below. Approve all covers every current ambiguous set, not only the examples. Both create exact local sets only.</span>
+  </div>`:"";
+  return `<details ${kind==="candidate"?"open":""}><summary>${esc(title)} · ${totalSets.toLocaleString()} sets</summary>${batch}`+
+    items.map((item,idx)=>{
+      const examples=(item.examples||[]).map((x,e)=>({...x,_item:idx,_example:e}));
+      const approve=kind==="candidate"?`<button class="mini primary" onclick="diskNamingApproveRule(${idx})">Approve pattern</button>`:"";
+      const exampleHtml=kind==="recognised"
+        ?(item.examples||[]).map(x=>`<div class="hint">${esc(x.parent||"/")}: ${(x.names||[]).map(esc).join(" · ")}</div>`).join("")
+        :diskNamingExamples(examples,kind,kind==="candidate");
+      return `<div class="panel" style="margin-top:7px;padding:8px"><div class="row" style="justify-content:space-between;align-items:baseline;gap:8px">
+        <b>${esc(item.pattern)}</b><span class="hint">${Number(item.sets||0).toLocaleString()} sets · ${Number(item.files||0).toLocaleString()} files</span>${approve}</div>`+
+        (item.reason?`<div class="hint" style="margin-top:4px">${esc(item.reason)}</div>`:"")+
+        `<div style="margin-top:5px">${exampleHtml}</div></div>`;
+    }).join("")+`</details>`;
+}
+
+function diskNamingRulesHtml(r){
+  const rules=r.rules||[],overrides=r.overrides||[],total=rules.length+overrides.length,pageSize=50;
+  const pages=Math.max(1,Math.ceil(overrides.length/pageSize));
+  DISKNAMING.overridePage=Math.max(0,Math.min(DISKNAMING.overridePage,pages-1));
+  const start=DISKNAMING.overridePage*pageSize,end=Math.min(overrides.length,start+pageSize),visible=overrides.slice(start,end);
+  let html=`<details ${DISKNAMING.overrideOpen?'open':''} ontoggle="DISKNAMING.overrideOpen=this.open"><summary>Approved local rules and exact sets · ${total}</summary>`;
+  html+='<div style="margin-top:6px">';
+  if(!total)html+='<span class="hint">No local approvals have been saved.</span>';
+  else html+=`<div class="row" style="gap:6px;flex-wrap:wrap;margin-bottom:7px"><button class="mini danger" onclick="diskNamingRemoveAllApprovals()">Remove all local approvals</button><span class="hint">${rules.length} reusable rules · ${overrides.length.toLocaleString()} exact sets</span></div>`;
+  for(const rule of rules)html+=`<div class="item-card"><div class="item-main"><div class="item-label">${esc(rule.label||rule.pattern_key)}</div><div class="item-detail hint">${esc(rule.scope||"/")} · ${(rule.extensions||[]).join(", ")} · last approval match count ${Number(rule.last_match_count||0)}</div></div><button class="mini" onclick="diskNamingRuleToggle(${rule.id},${rule.enabled?'false':'true'})">${rule.enabled?'Disable':'Enable'}</button><button class="mini danger" onclick="diskNamingRuleRemove(${rule.id})">Remove</button></div>`;
+  if(overrides.length){
+    html+=`<div class="row" style="gap:6px;flex-wrap:wrap;margin:8px 0 5px"><button class="mini" onclick="diskNamingManageExactSelected('enable')">Enable selected exact sets</button><button class="mini" onclick="diskNamingManageExactSelected('disable')">Disable selected exact sets</button><button class="mini danger" onclick="diskNamingManageExactSelected('remove')">Remove selected exact sets</button><span class="hint">Selection applies to the current page.</span></div>`;
+    if(pages>1)html+=`<div class="row" style="gap:6px;align-items:center;margin:5px 0"><button class="mini" onclick="diskNamingOverridePage(-1)" ${DISKNAMING.overridePage===0?'disabled':''}>← Previous</button><span class="hint">Page ${DISKNAMING.overridePage+1} of ${pages} · showing ${(start+1).toLocaleString()}–${end.toLocaleString()} of ${overrides.length.toLocaleString()}</span><button class="mini" onclick="diskNamingOverridePage(1)" ${DISKNAMING.overridePage>=pages-1?'disabled':''}>Next →</button></div>`;
+  }
+  for(const item of visible)html+=`<div class="item-card"><input type="checkbox" class="disk-naming-approved-exact-check" data-id="${item.id}"><div class="item-main"><div class="item-label">Exact set · ${esc(item.parent)}</div><div class="item-detail hint">${(item.names||[]).map(esc).join(" · ")}</div></div><button class="mini" onclick="diskNamingOverrideToggle(${item.id},${item.enabled?'false':'true'})">${item.enabled?'Disable':'Enable'}</button><button class="mini danger" onclick="diskNamingOverrideRemove(${item.id})">Remove</button></div>`;
+  return html+'</div></details>';
+}
+function diskNamingOverridePage(delta){DISKNAMING.overrideOpen=true;DISKNAMING.overridePage+=Number(delta)||0;diskNamingRender(DISKNAMING.report)}
+function diskNamingRender(r){
+  DISKNAMING.report=r;const panel=$("#diskNamingPanel"),copy=$("#diskNamingCopyBtn");
+  if(!panel)return;panel.style.display="block";if(copy)copy.disabled=!r?.report_text;
+  const s=r.summary||{};
+  panel.innerHTML=`<div class="hint"><b>${Number(s.indexed_disk_images||0).toLocaleString()}</b> indexed disk images in <b>${Number(s.directories||0).toLocaleString()}</b> folders · <b>${Number(s.recognised_sets||0).toLocaleString()}</b> recognised sets · <b>${Number(s.candidate_sets||0).toLocaleString()}</b> high-confidence unrecognised sets · <b>${Number(s.ambiguous_sets||0).toLocaleString()}</b> ambiguous · <b>${Number(s.rejected_sets||0).toLocaleString()}</b> rejected.</div>`+
+    `<div style="display:grid;gap:7px;margin-top:8px">`+
+    diskNamingSummarySection("High-confidence unrecognised patterns",r.candidates||[],"candidate")+
+    diskNamingSummarySection("Recognised patterns",r.recognised||[],"recognised")+
+    diskNamingSummarySection("Ambiguous candidates",r.ambiguous||[],"ambiguous")+
+    diskNamingSummarySection("Rejected / protected patterns",r.rejected||[],"rejected")+
+    diskNamingRulesHtml(r)+`</div>`;
+}
+async function diskNamingAnalyse(){
+  if(DISKNAMING.busy)return;DISKNAMING.busy=true;const btn=$("#diskNamingAnalyseBtn"),panel=$("#diskNamingPanel");
+  if(btn){btn.disabled=true;btn.textContent="Analysing index…"}if(panel){panel.style.display="block";panel.innerHTML='<span class="hint">Reading indexed disk-image filenames…</span>'}
+  try{diskNamingRender(await api("/api/fs/index/disk-naming",{timeoutMs:60000}));toast("Disk-image naming analysis complete","ok")}
+  catch(e){if(panel)panel.innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`;toast(e.message,"err")}
+  finally{DISKNAMING.busy=false;if(btn){btn.disabled=false;btn.textContent="Analyse Disk-Image Names"}}
+}
+async function diskNamingApproveRule(index){
+  const item=DISKNAMING.report?.candidates?.[index];if(!item)return;
+  const examples=(item.examples||[]).map(x=>`${x.parent}: ${(x.names||[]).join(" | ")}`).slice(0,4).join("\n");
+  if(!confirm(`Approve this reusable disk-grouping pattern?\n\n${item.pattern}\n${item.sets} sets / ${item.files} files\nScope: all indexed folders\n\n${examples}\n\nThe constrained rule will persist across index rebuilds. No files will be renamed or modified.`))return;
+  try{const r=await api("/api/fs/index/disk-naming/rules",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pattern_key:item.pattern_key,scope:"/"}),timeoutMs:60000});diskNamingRender(r.analysis);toast("Disk-grouping pattern approved","ok")}
+  catch(e){toast(e.message,"err")}
+}
+async function diskNamingApproveRuleForFolder(candidateIndex,exampleIndex){
+  const candidate=DISKNAMING.report?.candidates?.[Number(candidateIndex)],item=candidate?.examples?.[Number(exampleIndex)];if(!candidate||!item)return;
+  if(!confirm(`Approve this disk-grouping pattern only for this folder?\n\n${candidate.pattern}\nScope: ${item.parent}\n\n${(item.names||[]).join("\n")}\n\nThe constrained rule persists across index rebuilds but applies only inside this folder. No files are modified.`))return;
+  try{const r=await api("/api/fs/index/disk-naming/rules",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pattern_key:candidate.pattern_key,scope:item.parent}),timeoutMs:60000});diskNamingRender(r.analysis);toast("Folder-scoped disk-grouping pattern approved","ok")}
+  catch(e){toast(e.message,"err")}
+}
+async function diskNamingApproveExactByIndex(section,itemIndex,exampleIndex){
+  const map={candidate:"candidates",ambiguous:"ambiguous",rejected:"rejected"},key=map[section];
+  const item=key?DISKNAMING.report?.[key]?.[Number(itemIndex)]?.examples?.[Number(exampleIndex)]:null;if(!item)return;
+  const warning=section==="rejected"?"\n\nThis set was rejected by a safety rule. Exact approval overrides that protection only for these filenames.":section==="ambiguous"?"\n\nThis set is ambiguous. Confirm only if these files are genuinely swap media.":"";
+  if(!confirm(`Approve this exact disk set only?\n\n${item.parent}\n${(item.names||[]).join("\n")}${warning}\n\nOnly these indexed filenames in this folder will be grouped. No reusable pattern is created and no files are modified.`))return;
+  try{
+    const path=section==="ambiguous"&&item.set_id?"/api/fs/index/disk-naming/overrides/batch":"/api/fs/index/disk-naming/overrides";
+    const body=section==="ambiguous"&&item.set_id?{set_ids:[item.set_id]}:{parent:item.parent,names:item.names,label:`approved ${section} set from disk naming analysis`};
+    const r=await api(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body),timeoutMs:60000});diskNamingRender(r.analysis);toast("Exact disk set approved","ok")
+  }catch(e){toast(e.message,"err")}
+}
+function diskNamingAmbiguousSelection(){
+  const shown=diskNamingAmbiguousShown(),byId=new Map(shown.map(item=>[item.set_id,item]));
+  return [...document.querySelectorAll(".disk-naming-ambiguous-check:checked")].map(box=>byId.get(box.dataset.setId)).filter(Boolean)
+}
+async function diskNamingApproveAmbiguousBatch(mode){
+  const all=mode==="all",items=all?diskNamingAmbiguousShown():diskNamingAmbiguousSelection();
+  const summary=DISKNAMING.report?.summary||{},totalSets=all?Number(summary.ambiguous_sets||0):items.length;
+  if(!totalSets){toast(all?"No ambiguous sets are available":"Select one or more ambiguous examples","err");return}
+  const ids=all?[]:[...new Set(items.map(item=>item.set_id))];
+  const folders=all?Number((DISKNAMING.report?.ambiguous_folders||[]).length):new Set(items.map(item=>(item.parent||"/").toLowerCase())).size;
+  const files=all?(DISKNAMING.report?.ambiguous||[]).reduce((n,item)=>n+Number(item.files||0),0):items.reduce((n,item)=>n+Number(item.total_files||(item.names||[]).length),0);
+  const examples=items.slice(0,5).map(item=>`${item.parent}: ${(item.names||[]).join(" | ")}`).join("\n");
+  const scope=all?`every current ambiguous disk set, including sets not displayed as examples`:`the ${ids.length} selected examples`;
+  if(!confirm(`Approve ${totalSets.toLocaleString()} ambiguous disk sets?\n\n${files.toLocaleString()} files in ${folders.toLocaleString()} folders\nScope: ${scope}\n\n${examples}${items.length>5||all?"\n…":""}\n\nThis creates exact local set approvals only. It does not create a general filename pattern, rename files or modify the storage index.`))return;
+  if(all&&totalSets>250&&!confirm(`Final confirmation: approve all ${totalSets.toLocaleString()} current ambiguous disk sets as exact local sets?`))return;
+  try{
+    DISKNAMING.busy=true;
+    const r=await api("/api/fs/index/disk-naming/overrides/batch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(all?{all_ambiguous:true}:{set_ids:ids}),timeoutMs:120000});
+    DISKNAMING.overridePage=0;diskNamingRender(r.analysis);toast(`${r.summary.sets.toLocaleString()} ambiguous disk sets approved`,"ok")
+  }catch(e){toast(e.message,"err")}
+  finally{DISKNAMING.busy=false}
+}
+async function diskNamingApproveAmbiguousFolder(parent){
+  const stats=(DISKNAMING.report?.ambiguous_folders||[]).find(item=>(item.parent||"/").toLowerCase()===(parent||"/").toLowerCase());
+  if(!stats){toast("That folder no longer has ambiguous sets in the current report","err");return}
+  const examples=diskNamingAmbiguousShown().filter(item=>(item.parent||"/").toLowerCase()===(parent||"/").toLowerCase()).slice(0,4).map(item=>(item.names||[]).join(" | ")).join("\n");
+  if(!confirm(`Approve every ambiguous disk set in this folder?\n\n${stats.parent}\n${stats.sets} sets / ${stats.files} files\n\n${examples}\n\nThis creates exact local set approvals only. It does not create a reusable pattern or modify files.`))return;
+  try{const r=await api("/api/fs/index/disk-naming/overrides/batch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({parent:stats.parent}),timeoutMs:60000});diskNamingRender(r.analysis);toast(`${r.summary.sets} folder sets approved`,"ok")}
+  catch(e){toast(e.message,"err")}
+}
+
+async function diskNamingRuleToggle(id,enabled){try{const r=await api(`/api/fs/index/disk-naming/rules/${id}`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled})});diskNamingRender(r.analysis)}catch(e){toast(e.message,"err")}}
+async function diskNamingRuleRemove(id){if(!confirm("Remove this approved disk-grouping pattern?\n\nFiles and index entries are not changed."))return;try{const r=await api(`/api/fs/index/disk-naming/rules/${id}`,{method:"DELETE"});diskNamingRender(r.analysis);toast("Disk-grouping pattern removed","ok")}catch(e){toast(e.message,"err")}}
+async function diskNamingOverrideToggle(id,enabled){try{const r=await api(`/api/fs/index/disk-naming/overrides/${id}`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled})});diskNamingRender(r.analysis)}catch(e){toast(e.message,"err")}}
+async function diskNamingOverrideRemove(id){if(!confirm("Remove this approved exact disk set?\n\nFiles and index entries are not changed."))return;try{const r=await api(`/api/fs/index/disk-naming/overrides/${id}`,{method:"DELETE"});diskNamingRender(r.analysis);toast("Exact disk set removed","ok")}catch(e){toast(e.message,"err")}}
+async function diskNamingManageExactSelected(action){
+  const ids=[...document.querySelectorAll(".disk-naming-approved-exact-check:checked")].map(box=>Number(box.dataset.id)).filter(Number.isInteger);
+  if(!ids.length){toast("Select one or more approved exact sets","err");return}
+  const verb={enable:"Enable",disable:"Disable",remove:"Remove"}[action];if(!verb)return;
+  if(!confirm(`${verb} ${ids.length} selected exact-set approvals?\n\nFiles and index entries are not changed.`))return;
+  try{const r=await api("/api/fs/index/disk-naming/overrides/manage",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action,ids}),timeoutMs:60000});diskNamingRender(r.analysis);toast(`${r.result.count} exact-set approvals ${action}d`,"ok")}
+  catch(e){toast(e.message,"err")}
+}
+async function diskNamingRemoveAllApprovals(){
+  const rules=DISKNAMING.report?.rules?.length||0,overrides=DISKNAMING.report?.overrides?.length||0,total=rules+overrides;if(!total)return;
+  if(!confirm(`Remove all local disk-grouping approvals?\n\n${rules} reusable rules\n${overrides} exact sets\n\nFiles and index entries will not be changed. Built-in disk detection, including terminal -a/-b grouping, will continue to work.`))return;
+  if(!confirm("Final confirmation: remove every local reusable rule and exact-set approval now?"))return;
+  try{const r=await api("/api/fs/index/disk-naming/approvals",{method:"DELETE",timeoutMs:60000});diskNamingRender(r.analysis);toast(`${r.removed.total} local approvals removed`,"ok")}
+  catch(e){toast(e.message,"err")}
+}
+
+async function diskNamingCopyReport(){
+  const text=DISKNAMING.report?.report_text;if(!text)return;
+  try{
+    if(navigator.clipboard?.writeText)await navigator.clipboard.writeText(text);
+    else{const box=document.createElement("textarea");box.value=text;box.style.position="fixed";box.style.opacity="0";document.body.append(box);box.select();if(!document.execCommand("copy"))throw new Error("browser copy command was rejected");box.remove()}
+    toast("Disk naming analysis report copied","ok")
+  }catch(e){toast("Could not copy report: "+e.message,"err")}
+}
+
 async function cacheClearImages(){
   try{const r=await api("/api/cache/clear_images",{method:"POST"});
-    toast("cleared "+r.cleared+" cached image dirs; completed roots will be refreshed","ok");cacheStatsLoad()}
+    toast("Cleared "+r.cleared+" cached image dirs; completed roots will be refreshed","ok");cacheStatsLoad()}
   catch(e){toast(e.message,"err")}}
 async function cacheClearIndex(){
-  if(!confirm("Clear the entire local storage index?\n\nThis does not delete anything from the Ultimate, but searches will use live FTP until you index again."))return;
+  if(!confirm("Clear the entire local storage index?\n\nThis does not delete anything from the Ultimate. Approved disk-grouping rules and exact sets are preserved, but searches will use live FTP until you index again."))return;
   try{await api("/api/cache/clear_index",{method:"POST"});
-    toast("local storage index cleared","ok");cacheStatsLoad()}
+    toast("Local storage index cleared","ok");cacheStatsLoad()}
   catch(e){toast(e.message,"err")}}
+function settingsTransientError(message){
+  return /10061|actively refused|connect(?:ion)?|client is closed|client has been closed|timed out|temporar|not ready|503|busy/i.test(String(message||""));
+}
+function settingsWaiting(message="Waiting for the Ultimate connection before reading firmware settings…"){
+  $("#catlist").innerHTML=`<span class="hint">${esc(message)}</span>`;
+  $("#setitems").innerHTML='<span class="hint">Settings will load automatically when the connection is ready.</span>';
+}
+function settingsRetry(delay=750){
+  if(SET.retryTimer)clearTimeout(SET.retryTimer);
+  SET.retryTimer=setTimeout(()=>{SET.retryTimer=null;loadCats()},Math.max(0,delay));
+}
+function settingsPersistentError(message){
+  SET.loaded=false;
+  $("#catlist").innerHTML=`<span style="color:var(--err)">${esc(message)}</span><br><button class="mini" onclick="settingsRetryNow()">Retry settings</button>`;
+  $("#setitems").innerHTML='<span class="hint">No firmware settings were changed.</span>';
+}
+function settingsRetryNow(){SET.retryCount=0;SET.loaded=false;settingsWaiting("Retrying the Ultimate connection…");loadInfo();settingsRetry(250)}
 async function loadCats(){
-  localSettingsLoad();
-  cacheStatsLoad();
-  setitemsResizeInit();
-  SET.loaded=true;
-  try{const r=await api("/api/configs");
+  if(!SET.localInitialised){
+    SET.localInitialised=true;localSettingsLoad();cacheStatsLoad();setitemsResizeInit();
+  }
+  if(SET.loaded||SET.loading)return;
+  if(!LAST_DEVICE_INFO){
+    SET.retryCount++;settingsWaiting(SET.retryCount>1?"Ultimate connection not ready — retrying…":"Waiting for the Ultimate connection before reading firmware settings…");
+    if(!INFO_IN_FLIGHT)loadInfo();
+    if(SET.retryCount<=SET.maxRetries)settingsRetry();
+    else settingsPersistentError("Ultimate settings are still unavailable after bounded retries. Check the connection, then retry.");
+    return;
+  }
+  SET.loading=true;
+  try{
+    const r=await api("/api/configs");
+    SET.loaded=true;SET.retryCount=0;
+    if(SET.retryTimer){clearTimeout(SET.retryTimer);SET.retryTimer=null}
     $("#catlist").innerHTML=(r.categories||[]).map(c=>
-      `<button onclick="loadCat('${jsq(c)}',this)">${esc(c)}</button>`).join("")}
-  catch(e){$("#catlist").innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`}}
-async function loadCat(cat,btn){
+      `<button onclick="loadCat('${jsq(c)}',this)">${esc(c)}</button>`).join("")||'<span class="hint">No firmware categories returned.</span>';
+    $("#setitems").innerHTML='<span class="hint">Pick a category.</span>';
+  }catch(e){
+    SET.loaded=false;
+    if(settingsTransientError(e.message)&&SET.retryCount<SET.maxRetries){
+      SET.retryCount++;settingsWaiting("Ultimate settings are not ready — retrying automatically…");
+      loadInfo();settingsRetry();
+    }else settingsPersistentError(e.message);
+  }finally{SET.loading=false}
+}
+async function loadCat(cat,btn,attempt=0){
   document.querySelectorAll("#catlist button").forEach(b=>b.classList.toggle("active",b===btn));
   SET.cat=cat;SET.dirty={};updApply();
   $("#setitems").innerHTML='<span class="hint">loading…</span>';
@@ -2098,7 +2559,12 @@ async function loadCat(cat,btn){
         <label title="${esc(name)}">${esc(name)}</label>
         <span class="val">${editorFor(name,d,cur)}</span></div>`}).join("")
       ||'<span class="hint">no items</span>';
-  }catch(e){$("#setitems").innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`}}
+  }catch(e){
+    if(settingsTransientError(e.message)&&attempt<3){
+      $("#setitems").innerHTML='<span class="hint">Ultimate connection changed — retrying this category…</span>';
+      loadInfo();setTimeout(()=>loadCat(cat,btn,attempt+1),750);
+    }else $("#setitems").innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`;
+  }}
 function editorFor(name,d,cur){
   const n=esc(name);
   const vals=d&&typeof d==="object"?(d.values||d.options||d.choices):null;
@@ -2134,11 +2600,12 @@ async function saveDirty(){
     payload[SET.cat][k]=isNum&&v!==""&&!isNaN(v)?Number(v):v}
   try{await api("/api/configs",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify(payload)});
-    toast("applied ✓ (use Save to flash to persist)","ok");
+    toast("Applied ✓ (use Save to Flash to persist)","ok");
+    loadBootOptions();
     SET.dirty={};updApply();
     document.querySelectorAll(".setrow.dirty").forEach(e=>e.classList.remove("dirty"))}
   catch(e){toast(e.message,"err")}}
-async function cfgAction(a){try{await put("/api/configs_action/"+a);toast(a.replace(/_/g," ")+" ✓","ok")}
+async function cfgAction(a){try{await put("/api/configs_action/"+a);loadBootOptions();toast(healthStatusLabel(a)+" ✓","ok")}
   catch(e){toast(e.message,"err")}}
 
 /* ---------- assembly64 ---------- */
@@ -2146,7 +2613,7 @@ const ASM_CATEGORY_LABELS={
   0:"Games",1:"Demos",2:"C128",3:"Graphics",4:"Music",5:"Disc Mags",
   6:"BBS",7:"Misc",8:"Tools",9:"Charts",11:"Intros",18:"SID"
 };
-let ASM={results:[],current:null,selectedIndex:-1,formLoaded:false,presetLabels:{category:{}}};
+let ASM={results:[],current:null,selectedIndex:-1,files:[],formLoaded:false,presetLabels:{category:{}}};
 Object.entries(ASM_CATEGORY_LABELS).forEach(([id,label])=>ASM.presetLabels.category[id]=label);
 const ASM_TEXT_FIELDS=[
   {name:"name",label:"Release Name",placeholder:"e.g. Last Ninja"},
@@ -2236,7 +2703,7 @@ function asmCollectFields(){
 }
 function asmClear(){
   document.querySelectorAll("#asmForm [data-asmfield]").forEach(el=>el.value="");
-  ASM.results=[];ASM.current=null;ASM.selectedIndex=-1;
+  ASM.results=[];ASM.current=null;ASM.selectedIndex=-1;ASM.files=[];
   $("#asmResTitle").textContent="SEARCH RESULTS";
   $("#asmResMeta").textContent="Enter one or more search terms above.";
   $("#asmtable").className="asm-scroll asm-empty-state";
@@ -2302,7 +2769,7 @@ function asmFileType(path){
 }
 async function asmFiles(i){
   const e=ASM.results[i];if(!e)return;
-  ASM.current=e;ASM.selectedIndex=i;asmRenderResults();
+  ASM.current=e;ASM.selectedIndex=i;ASM.files=[];asmRenderResults();
   $("#asmFilesTitle").textContent="RELEASE FILES";
   $("#asmFilesMeta").textContent=[e.name,e.group,e.year].filter(Boolean).join(" · ");
   $("#asmfilelist").className="asm-scroll asm-empty-state";
@@ -2310,7 +2777,7 @@ async function asmFiles(i){
   try{
     const r=await api(`/api/asm64/entries?id=${encodeURIComponent(e.id)}&category=${e.category??0}`);
     $("#asmraw").textContent=JSON.stringify(r,null,2).slice(0,20000);
-    const files=Array.isArray(r.contentEntry)?r.contentEntry:[];
+    const files=Array.isArray(r.contentEntry)?r.contentEntry:[];ASM.files=files;
     if(!files.length){
       $("#asmfilelist").className="asm-scroll asm-empty-state";
       $("#asmfilelist").innerHTML=asmEmpty("0","No downloadable files","Assembly64 did not list any deployable files for this release.");
@@ -2342,15 +2809,18 @@ function asmDeployEncoded(item,filename,action){
 }
 async function asmDeploy(item,filename,action){
   const e=ASM.current;if(!e)return;
+  if(action==="run"&&String(filename||"").toLowerCase().endsWith(".crt"))clearStandaloneScreenNotice();
   toast((action==="inspect"?"Downloading ":"Deploying ")+filename+"…","ok");
   if(action==="mount_run")beginMountRunStatusWatch();
   try{
-    const r=await api("/api/asm64/deploy",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({id:e.id,category:e.category??0,item,filename,action})});
+    const manifest=(ASM.files||[]).map(f=>({item:f.id,filename:String(f.path??("item"+f.id))}));
+    const r=await api("/api/asm64/deploy",{method:"POST",timeoutMs:MOUNT_RUN_REQUEST_TIMEOUT_MS,headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({id:e.id,category:e.category??0,item,filename,action,manifest})});
     if(action==="inspect"&&r&&r.token){tab("disks");showInspector(r);}
     else toast(asmActionLabel(action)+" ✓","ok");
+    if(r?.swap_decision)showSwapDecision(r.swap_decision);
     rememberRecent(itemSpec("assembly64",e.name||filename,[e.group,e.handle].filter(Boolean).join(" · "),"assembly_open",{entry:e}));
-    if(action.startsWith("mount"))refreshDrives();
+    if(action.startsWith("mount")||r?.swap_decision)refreshDrives();
   }catch(e2){toast(e2.message,"err")}
   finally{if(action==="mount_run")finishMountRunStatusWatch()}}
 
@@ -2394,7 +2864,7 @@ async function doSwap(url){
   swapControlsBusy(true);
   try{
     const r=await put(url);
-    toast("disk swapped → "+r.swapped_to+" ✓","ok");
+    toast("Disk swapped → "+r.swapped_to+" ✓","ok");
     await refreshDrives();
   }catch(e){toast(e.message,"err")}
   finally{
@@ -2411,44 +2881,44 @@ async function swapPrev(){return doSwap("/api/swap/prev")}
 const QUEUE=[];
 function queueRender(){
   const el=$("#queueList");
-  if(!QUEUE.length){el.innerHTML="empty — ＋Queue disks above (in order: 1, 2, 3…), or pick local images below";return}
+  if(!QUEUE.length){el.innerHTML="Empty — ＋Queue disks above (in order: 1, 2, 3…), or pick local images below";return}
   el.innerHTML="<ol style='margin:4px 0 0 18px;padding:0'>"+QUEUE.map((p,i)=>
     `<li>${esc(p.rsplit?p:p.split("/").pop())} <a class="mini" style="color:var(--err);cursor:pointer"
       onclick="QUEUE.splice(${i},1);queueRender()">✕</a></li>`).join("")+"</ol>";
 }
 function queueAdd(path){
-  if(QUEUE.includes(path)){toast("already queued","err");return}
-  QUEUE.push(path);queueRender();toast("queued as disk "+QUEUE.length,"ok");
+  if(QUEUE.includes(path)){toast("Already queued","err");return}
+  QUEUE.push(path);queueRender();toast("Queued as disk "+QUEUE.length,"ok");
 }
 function queueClear(){QUEUE.length=0;queueRender()}
 async function queueArm(mountFirst){
-  if(!QUEUE.length){toast("queue is empty","err");return}
+  if(!QUEUE.length){toast("Queue is empty","err");return}
   try{
     const r=await api("/api/swap/set_paths",{method:"POST",
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({paths:QUEUE,mount_first:mountFirst,
         mode:$("#localmode")?$("#localmode").value:"unlinked"})});
-    toast(mountFirst?("mounted "+(r.swapped_to||"disk 1")+" ✓ — queue armed"):"queue armed ✓","ok");
+    toast(mountFirst?("Mounted "+(r.swapped_to||"disk 1")+" ✓ — queue armed"):"Queue armed ✓","ok");
     swapRefresh();refreshDrives();
     if(mountFirst){tab("screen");screenEl.focus()}
   }catch(e){toast(e.message,"err")}
 }
 async function queueLocalArm(){
   const fl=$("#queueLocal").files;
-  if(!fl.length){toast("pick local disk images first","err");return}
+  if(!fl.length){toast("Pick local disk images first","err");return}
   const fd=new FormData();
   for(const f of fl)fd.append("files",f);
   fd.append("drive","a");fd.append("mode",$("#localmode")?$("#localmode").value:"unlinked");
-  toast("uploading set…","ok");
+  toast("Uploading set…","ok");
   try{
     const r=await api("/api/swap/upload",{method:"POST",body:fd});
-    toast("mounted "+(r.swapped_to||"disk 1")+" ✓ — set armed","ok");
+    toast("Mounted "+(r.swapped_to||"disk 1")+" ✓ — set armed","ok");
     $("#queueLocal").value="";swapRefresh();refreshDrives();tab("screen");screenEl.focus();
   }catch(e){toast(e.message,"err")}
 }
 
 /* ---------- SID jukebox ---------- */
-let JK={state:null,poll:null,pollBusy:false,stopPending:false,listSignature:""};
+let JK={state:null,poll:null,pollBusy:false,stopPending:false,listSignature:"",activeRowKey:""};
 const SIDFLOWUI={status:null,poll:null};
 const SIDIDX={poll:null,volumes:[],volumesLoaded:false,last:null};
 function fmtLen(s){if(s==null||s==="")return"—";const m=Math.floor(s/60),x=Math.round(s%60);
@@ -2465,7 +2935,7 @@ function sidChipBadge(meta,showUnknown=false){
   if(kind==="unknown"&&!showUnknown&&!m.format)return "";
   const label=kind==="unknown"?"Unknown":raw;
   const count=(Number(m.sids)||1)>1?" ×"+(Number(m.sids)||1):"";
-  return `<span class="badge chip-${kind}" title="declared in the SID header — used by the firmware to select the matching SID socket">${esc(label)}${count}</span>`;
+  return `<span class="badge chip-${kind}" title="Declared in the SID header — used by the firmware to select the matching SID socket">${esc(label)}${count}</span>`;
 }
 function jkAudioSync(){
   const b=$("#jkAudio");if(!b)return;
@@ -2476,6 +2946,27 @@ function jkListSignature(s){
   return JSON.stringify([s.folder||"",s.source||"",!!s.loading,(s.items||[]).map(it=>[
     it.path||"",it.label||"",it.lazy?1:0,it.meta?.name||"",it.meta?.author||"",
     it.meta?.chip||"",it.meta?.songs||1,it.song||1,it.similarity??null,it.length??null])]);
+}
+function jkQueueContext(s){
+  if(s.radio)return "SIDFlow Radio";
+  if(s.recommendation_seed_label)return `More like ${s.recommendation_seed_label}`;
+  if(s.folder==="SIDFlow Radio")return "SIDFlow Radio";
+  const parts=[s.folder||"",s.source||""].filter(Boolean);
+  return [...new Set(parts)].join(" · ");
+}
+function jkLocateCurrent(smooth=true){
+  const s=JK.state||{},index=Number(s.index),list=$("#jkList");
+  if(!list||!Number.isInteger(index)||index<0)return false;
+  const row=list.querySelector(`[data-juke-index="${index}"]`);
+  if(!row)return false;
+  const head=list.querySelector(".jkq-head"),listRect=list.getBoundingClientRect(),rowRect=row.getBoundingClientRect();
+  const headHeight=head?head.offsetHeight:0;
+  const rowTop=list.scrollTop+(rowRect.top-listRect.top);
+  const room=Math.max(0,list.clientHeight-headHeight-rowRect.height);
+  const wanted=rowTop-headHeight-Math.round(room*.34);
+  const top=Math.min(Math.max(0,list.scrollHeight-list.clientHeight),Math.max(0,wanted));
+  list.scrollTo({top,left:list.scrollLeft,behavior:smooth?"smooth":"auto"});
+  return true;
 }
 
 function jkNowFavouriteSync(n){
@@ -2494,9 +2985,22 @@ async function jkToggleNowFavourite(){
   jkNowFavouriteSync((JK.state||{}).now);
 }
 
+function jukeFadeControlsSync(s){
+  const cfg=s?.browser_fade||{},box=$("#jkFadeEnabled"),sel=$("#jkFadeSecs"),note=$("#jkFadeNote");if(!box||!sel)return;
+  box.checked=!!cfg.enabled;sel.value=String(Number(cfg.duration_secs||2.5).toFixed(1));sel.disabled=!box.checked;
+  if(note)note.textContent=cfg.note||"Browser/recording only — Ultimate HDMI and analogue audio do not fade.";
+}
+async function jukeFadeChanged(){
+  const box=$("#jkFadeEnabled"),sel=$("#jkFadeSecs"),enabled=!!box.checked,duration=Number(sel.value||2.5);sel.disabled=!enabled;
+  try{const r=await api("/api/juke/fade",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled,duration_secs:duration})});
+    if(JK.state)JK.state={...JK.state,browser_fade:r};jukeFadeControlsSync(JK.state);
+    toast(enabled?`Browser SID fade: ${duration.toFixed(1)} seconds — applies from the next SID`:`Browser SID fade disabled — applies from the next SID`,"ok");}
+  catch(e){toast(e.message,"err");jkRefresh()}
+}
+
 function jkRender(s){
   jkAudioSync();
-  JK.state=s;
+  JK.state=s;jukeFadeControlsSync(s);jukeFadeSync(s);
   const n=s.now;
   if(n){
     const m=n.meta||{};
@@ -2514,7 +3018,7 @@ function jkRender(s){
   moreNow.disabled=!n||!n.path;
   $("#jkSidflowCredit").classList.toggle("hint",!(s.sidflow||{}).available);
   $("#jkSlInfo").textContent=s.songlengths_loaded
-    ?`Songlengths loaded (${s.songlengths_loaded} entries) — accurate auto-advance`
+    ?`Songlengths loaded (${Number(s.songlengths_loaded).toLocaleString()} entries) — accurate auto-advance`
     :"No Songlengths.md5 configured — auto-advance uses sid_default_secs (config.json)";
   const songSel=$("#jkSong");
   if(n&&n.meta.songs>1){
@@ -2529,6 +3033,8 @@ function jkRender(s){
     $("#jkListTitle").textContent="PLAY QUEUE — 0 TUNES";
     $("#jkListContext").textContent="";
     $("#jkListContext").title="";
+    $("#jkLocateCurrentBtn").disabled=true;
+    JK.activeRowKey="";
     if(JK.listSignature!=="empty"){
       JK.listSignature="empty";
       $("#jkList").innerHTML='<div class="sid-queue-empty" role="status"><strong>No tunes queued</strong><span>Choose a saved play queue above, add a SID, or play a folder.</span></div>';
@@ -2542,8 +3048,10 @@ function jkRender(s){
   $("#jkListTitle").textContent=singleAuthor
     ?`PLAY QUEUE — ${knownAuthors[0]} · ${items.length} ${tuneWord}`
     :`PLAY QUEUE — ${items.length} ${tuneWord}`;
-  $("#jkListContext").textContent=[s.folder||"",s.source||"",s.loading?"loading…":""].filter(Boolean).join(" · ");
+  const queueContext=jkQueueContext(s);
+  $("#jkListContext").textContent=[queueContext,s.loading?"Loading…":""].filter(Boolean).join(" · ");
   $("#jkListContext").title=$("#jkListContext").textContent;
+  $("#jkLocateCurrentBtn").disabled=!(s.playing&&Number(s.index)>=0);
   const sig=jkListSignature(s)+"|singleAuthor:"+(singleAuthor?knownAuthors[0]:"");
   if(sig!==JK.listSignature){
     JK.listSignature=sig;
@@ -2551,20 +3059,28 @@ function jkRender(s){
     const rows=items.map((it,i)=>{
       const m=it.meta||{},author=String(m.author||""),released=String(m.released||"");
       const compactMeta=[singleAuthor?"":author,released].filter(Boolean).join(" · ");
-      const authorCell=singleAuthor?"":`<div class="jkq-cell jkq-author" role="cell">${esc(author)}</div>`;
+      const authorCell=singleAuthor?"":`<div class="jkq-cell jkq-author" role="cell" title="${esc(author)}">${esc(author)}</div>`;
       return `<div class="jkq-row" role="row" data-juke-index="${i}" onclick="jkPlay(${i},${Number(it.song||0)})">
-        <div class="jkq-cell jkq-index" role="cell">${i+1}</div>
-        <div class="jkq-cell jkq-title" role="cell">${esc(m.name||it.label)}${it.similarity!=null?` <span class="jkq-similarity" title="${it.recommendation_source==="u64deck-fallback"?"u64deck fallback feature similarity":"SIDFlow 0.8.0 weighted neighbour similarity"}">${Math.round(Number(it.similarity)*100)}% match</span>`:""}${it.lazy?' <span class="hint">· loads when played</span>':""}<div class="jkq-submeta">${esc(compactMeta)}${it.song&&m.songs>1?` · song ${it.song}`:""}</div></div>
+        <div class="jkq-cell jkq-index" role="cell"><span class="jkq-current-marker" aria-hidden="true">▶</span><span class="jkq-row-number">${i+1}</span></div>
+        <div class="jkq-cell jkq-title" role="cell" title="${esc(m.name||it.label)}">${esc(m.name||it.label)}${it.similarity!=null?` <span class="jkq-similarity" title="${it.recommendation_source==="u64deck-fallback"?"Fallback feature similarity from u64deck":"SIDFlow 0.8.0 weighted neighbour similarity"}">${Math.round(Number(it.similarity)*100)}% match</span>`:""}${it.lazy?' <span class="hint">· loads when played</span>':""}<div class="jkq-submeta">${esc(compactMeta)}${it.song&&m.songs>1?` · song ${it.song}`:""}</div></div>
         ${authorCell}<div class="jkq-cell jkq-chip" role="cell">${sidChipBadge(m)}</div>
         <div class="jkq-cell jkq-released hint" role="cell">${esc(released)}</div>
         <div class="jkq-cell jkq-length" role="cell">${fmtLen(it.length)}</div>
-        <div class="jkq-cell jkq-actions" role="cell">${it.path?`<button class="mini" onclick="event.stopPropagation();jkMoreLike(${i})" title="insert similar SIDFlow tunes after the current tune">♪</button>`:""}${it.path?starButton(itemSpec("sid",m.name||it.label,it.path,"sid_play",{folder:parentPath(it.path),name:it.path.split("/").pop()})):""}
-          <button class="mini" onclick="event.stopPropagation();jkRemove(${i})" title="remove from play queue">✕</button></div></div>`;
+        <div class="jkq-cell jkq-actions" role="cell">${it.path?`<button class="mini" onclick="event.stopPropagation();jkMoreLike(${i})" title="Find tunes similar to this queue entry and insert them after the current tune">♪</button>`:""}${it.path?starButton(itemSpec("sid",m.name||it.label,it.path,"sid_play",{folder:parentPath(it.path),name:it.path.split("/").pop()})):""}
+          <button class="mini" onclick="event.stopPropagation();jkRemove(${i})" title="Remove from play queue">✕</button></div></div>`;
     }).join("");
     $("#jkList").innerHTML=`<div class="jkq-grid ${singleAuthor?"single-author":""}" role="rowgroup">
       <div class="jkq-row jkq-head" role="row"><div class="jkq-cell" role="columnheader">#</div><div class="jkq-cell" role="columnheader">Title</div>${authorHead}<div class="jkq-cell" role="columnheader">Chip</div><div class="jkq-cell jkq-released" role="columnheader">Released</div><div class="jkq-cell" role="columnheader">Length</div><div class="jkq-cell" role="columnheader"></div></div>${rows}</div>`;
   }
-  document.querySelectorAll("#jkList [data-juke-index]").forEach(row=>row.classList.toggle("sel",+row.dataset.jukeIndex===s.index));
+  document.querySelectorAll("#jkList [data-juke-index]").forEach(row=>{
+    const current=+row.dataset.jukeIndex===Number(s.index)&&!!s.playing;
+    row.classList.toggle("playing",current);
+    if(current){row.setAttribute("aria-current","true");row.title="Currently playing"}
+    else{row.removeAttribute("aria-current");row.removeAttribute("title")}
+  });
+  const activeRowKey=s.playing&&Number(s.index)>=0?`${Number(s.playback_id)||0}:${Number(s.index)}`:"";
+  if(activeRowKey&&activeRowKey!==JK.activeRowKey)requestAnimationFrame(()=>jkLocateCurrent(true));
+  JK.activeRowKey=activeRowKey;
 }
 
 async function jkRefresh(){
@@ -2616,9 +3132,9 @@ async function jkBrowse(path){
           const path=(JKB.path==="/"?"":JKB.path)+"/"+n;
           const fav=itemSpec("sid",n.replace(/\.sid$/i,""),path,"sid_play",{folder:JKB.path,name:n});
           return `<span style="display:inline-flex;align-items:center;margin-right:10px">
-            <a style="cursor:pointer" title="play only this tune now"
+            <a style="cursor:pointer" title="Play only this tune now"
               onclick="jkPlayFrom('${jsq(JKB.path)}','${jsq(n)}')">♪ ${esc(n.replace(/\.sid$/i,""))}</a>
-              <button class="mini" onclick="jkAdd('${jsq(JKB.path)}','${jsq(n)}')" title="add only this tune to the current play queue">＋</button>${starButton(fav)}</span>`;
+              <button class="mini" onclick="jkAdd('${jsq(JKB.path)}','${jsq(n)}')" title="Add only this tune to the current play queue">＋</button>${starButton(fav)}</span>`;
         }).join("")+
         (sids>60?` …and ${sids-60} more`:"")+
         (loadedHere?' <span class="badge ok">this folder is the current play queue</span>':"")+
@@ -2631,16 +3147,16 @@ function jkBrowseUp(){
   jkBrowse(p.includes("/")?(p.slice(0,p.lastIndexOf("/"))||"/"):"/");
 }
 async function jukeFolder(path){
-  if(!path){toast("enter a folder path","err");return}
+  if(!path){toast("Enter a folder path","err");return}
   tab("sid");$("#jkPath").value=path;
-  toast("loading SIDs…","ok");
+  toast("Loading SIDs…","ok");
   try{const s=await api("/api/juke/folder",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({path}),timeoutMs:25000});
     jkRender(s);toast(s.items.length+" tunes loaded"+(s.skipped?` (${s.skipped} skipped)`:""),"ok");
     rememberRecent(itemSpec("sid_folder",path.split("/").filter(Boolean).pop()||path,path,"sid_folder",{path}))}
   catch(e){toast(e.message,"err")}}
 async function jukeLocal(){
-  const fl=$("#jkLocal").files;if(!fl.length){toast("pick .sid files first","err");return}
+  const fl=$("#jkLocal").files;if(!fl.length){toast("Pick .sid files first","err");return}
   const fd=new FormData();for(const f of fl)fd.append("files",f);
   try{const s=await api("/api/juke/upload",{method:"POST",body:fd});
     $("#jkLocal").value="";jkRender(s);toast(s.items.length+" tunes loaded","ok")}
@@ -2654,11 +3170,11 @@ async function jkHvsc(force){
       if(h.detected)toast("HVSC "+(force?"re-":"")+"detected: "+h.path+
         (h.songlengths_loaded?` — ${h.songlengths_loaded} songlengths`:""),"ok");
       jkBrowse(h.path);
-    }else{toast("no HVSC found on device storage (a folder containing MUSICIANS + DOCUMENTS)","err");
+    }else{toast("No HVSC found on device storage (a folder containing MUSICIANS + DOCUMENTS)","err");
       jkBrowse("/")}
   }catch(e){toast(e.message,"err")}}
 function jkSearchFilterChanged(){
-  const filtered=$("#jkChip").value!=="all"||$("#jkFormat").value!=="all";
+  const filtered=$("#jkChip").value!=="all"||$("#jkFormat").value!=="all"||!!$("#jkYear").value.trim();
   $("#jkSearch").placeholder=filtered?"optional title, author or path…":"🔎 search all of HVSC…";
 }
 function jkSidBadges(meta){
@@ -2668,13 +3184,14 @@ function jkSidBadges(meta){
   return out.join(" ");
 }
 async function jkSearchGo(){
-  const q=$("#jkSearch").value.trim(),chip=$("#jkChip").value,format=$("#jkFormat").value;
-  if(q&&q.length<2){toast("type at least 2 characters","err");return}
-  if(!q&&chip==="all"&&format==="all"){toast("enter a search term or choose a Chip/Format filter","err");return}
+  const q=$("#jkSearch").value.trim(),chip=$("#jkChip").value,format=$("#jkFormat").value,year=$("#jkYear").value.trim();
+  if(q&&q.length<2){toast("Type at least 2 characters","err");return}
+  if(year&&!/^(?:19|20)\d{2}$/.test(year)){toast("Enter a four-digit year from 1900 to 2099","err");return}
+  if(!q&&chip==="all"&&format==="all"&&!year){toast("Enter a search term or choose a Chip/Format/Year filter","err");return}
   $("#jkSearchOut").style.display="block";
   $("#jkSearchList").innerHTML='<span class="hint">searching…</span>';
   try{
-    const params=new URLSearchParams({q,chip,format});
+    const params=new URLSearchParams({q,chip,format,year});
     const r=await api("/api/juke/search?"+params.toString());
     const what=q?`"${q}"`:"filtered search";
     $("#jkSearchTitle").textContent=`${what} — ${r.total} match${r.total===1?"":"es"} in ${r.indexed} indexed tunes · ${r.backend||"index"}`+
@@ -2683,13 +3200,13 @@ async function jkSearchGo(){
     $("#jkSearchList").innerHTML=r.results.map(h=>{
       const m=h.meta||{},title=m.name||h.name.replace(/\.sid$/i,"");
       return `<div class="hitrow" onclick="jkPlayFrom('${jsq(h.folder)}','${jsq(h.name)}')"
-         title="play only this tune now">
+         title="Play only this tune now">
         <span style="flex:0 0 auto">▶</span>
         <span style="min-width:170px"><b>${esc(title)}</b>${m.author?`<br><span class="hint">${esc(m.author)}</span>`:""}</span>
         <span style="white-space:nowrap">${jkSidBadges(m)}</span>
         <span class="hint" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(h.rel.slice(0,h.rel.lastIndexOf("/")))}</span>
         ${starButton(itemSpec("sid",title,h.path,"sid_play",{folder:h.folder,name:h.name}))}
-        <button class="mini" onclick="event.stopPropagation();jkAdd('${jsq(h.folder)}','${jsq(h.name)}')" title="add only this tune to the current play queue without interrupting playback">＋</button>
+        <button class="mini" onclick="event.stopPropagation();jkAdd('${jsq(h.folder)}','${jsq(h.name)}')" title="Add only this tune to the current play queue without interrupting playback">＋</button>
         <button class="mini" onclick="event.stopPropagation();jkBrowse('${jsq(h.folder)}')">📁 folder</button></div>`}).join("");
   }catch(e){$("#jkSearchList").innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`}}
 
@@ -2717,11 +3234,11 @@ async function jkSidVolumesLoad(){
   const sel=$("#jkSidVolume");if(!sel)return;
   try{
     const r=await api("/api/local/volumes");SIDIDX.volumes=r.volumes||[];SIDIDX.volumesLoaded=true;
-    sel.innerHTML='<option value="">select a detected drive…</option>'+SIDIDX.volumes.map((v,i)=>
-      `<option value="${i}">${esc((v.label?v.label+" · ":"")+v.path+" · "+v.type)}</option>`).join("")+'<option value="manual">manual path…</option>';
+    sel.innerHTML='<option value="">Select a detected drive…</option>'+SIDIDX.volumes.map((v,i)=>
+      `<option value="${i}">${esc((v.label?v.label+" · ":"")+v.path+" · "+v.type)}</option>`).join("")+'<option value="manual">Manual path…</option>';
     const first=SIDIDX.volumes.findIndex(v=>v.removable);
     if(first>=0&&!$("#jkSidSource").value){sel.value=String(first);jkSidVolumePicked()}
-  }catch(e){sel.innerHTML='<option value="">drive detection unavailable</option>'}
+  }catch(e){sel.innerHTML='<option value="">Drive detection unavailable</option>'}
 }
 function jkSidVolumePicked(){
   const value=$("#jkSidVolume").value;if(value==="manual"){$("#jkSidSource").focus();return}
@@ -2730,9 +3247,9 @@ function jkSidVolumePicked(){
 async function jkSidIndexUltimate(){
   try{
     const state=SIDIDX.last||await api("/api/juke/index/status");
-    if(state.running){await api("/api/juke/index/stop",{method:"POST"});toast("stopping SID metadata refresh…","ok");return}
+    if(state.running){await api("/api/juke/index/stop",{method:"POST"});toast("Stopping SID metadata refresh…","ok");return}
     const root=$("#jkSidRoot").value.trim()||$("#jkPath").value.trim();
-    if(!root){toast("enter or detect the Ultimate HVSC path","err");return}
+    if(!root){toast("Enter or detect the Ultimate HVSC path","err");return}
     if(!confirm(`Refresh SID metadata from the Ultimate?\n\n${root}\n\nOnly SID headers are read. A complete collection may take a long time over FTP; the local option is faster.`))return;
     await api("/api/juke/index/ultimate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({root,force:$("#jkSidForce").checked})});
     toast("SID metadata refresh started from Ultimate","ok");jkSidIndexPollStart();
@@ -2741,12 +3258,12 @@ async function jkSidIndexUltimate(){
 async function jkSidIndexLocal(){
   try{
     const state=SIDIDX.last||await api("/api/juke/index/status");
-    if(state.running){await api("/api/juke/index/stop",{method:"POST"});toast("stopping SID metadata refresh…","ok");return}
+    if(state.running){await api("/api/juke/index/stop",{method:"POST"});toast("Stopping SID metadata refresh…","ok");return}
     const source=$("#jkSidSource").value.trim(),root=$("#jkSidRoot").value.trim()||"/USB0/HVSC";
-    if(!source){toast("choose the local HVSC folder","err");return}
+    if(!source){toast("Choose the local HVSC folder","err");return}
     if(!confirm(`Build the SID metadata index from:\n\n${source}\n\nas ${root}?\n\nThe scan reads only SID headers and does not modify files.`))return;
     await api("/api/juke/index/local",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({source,root,force:$("#jkSidForce").checked})});
-    toast("local SID metadata scan started","ok");jkSidIndexPollStart();
+    toast("Local SID metadata scan started","ok");jkSidIndexPollStart();
   }catch(e){toast(e.message,"err")}
 }
 async function jkSidIndexPause(){
@@ -2768,13 +3285,13 @@ function jkSidIndexRender(s){
     tb.textContent=s.running?`SID Index · ${Number(s.parsed||0).toLocaleString()} parsed`:
       (count?`SID Index · ${count.toLocaleString()}`:"SID Index");
     tb.title=s.running?"SID metadata indexing is running — open controls and progress":
-      (count?`${count.toLocaleString()} SID tunes indexed — open SID Index controls and status`:"open SID metadata indexing controls and status");
+      (count?`${count.toLocaleString()} SID tunes indexed — open SID Index controls and status`:"Open SID metadata indexing controls and status");
   }
   if(!out)return;
   if(s.running){
     out.style.display="block";ub.textContent="⏹ Stop SID Refresh";lb.textContent="⏹ Stop SID Refresh";pb.style.display="inline-block";pb.textContent=s.manual_paused?"▶ Resume":"⏸ Pause";
-    const head=s.mode==="local"?`💻 local SID index ${s.source} → ${s.root}`:`♪ SID refresh from Ultimate · ${s.root}`;
-    const state=s.paused?`⏸ ${s.pause_reason||"paused"}`:`${s.current||"starting…"}`;
+    const head=s.mode==="local"?`💻 Local SID index ${s.source} → ${s.root}`:`♪ SID refresh from Ultimate · ${s.root}`;
+    const state=s.paused?`⏸ ${s.pause_reason||"Paused"}`:`${s.current||"Starting…"}`;
     out.textContent=`${head} — ${s.files||0} files · ${s.parsed||0} parsed · ${s.cached||0} unchanged · ${s.errors||0} errors · ${fmtDuration(s.elapsed||0)} · ${s.files_per_sec||0} files/s · ${state}`;
   }else{
     ub.textContent="Refresh From Ultimate";lb.textContent="Build From Local HVSC";pb.style.display="none";
@@ -2790,10 +3307,10 @@ async function jkSidIndexPollTick(){
   catch(e){}
 }
 async function jkUpdateCheck(){
-  $("#jkVer").textContent="checking…";
+  $("#jkVer").textContent="Checking…";
   try{
     const v=await api("/api/juke/hvsc_version");
-    if(!v.installed&&!v.latest){$("#jkVer").textContent="couldn't determine versions";return}
+    if(!v.installed&&!v.latest){$("#jkVer").textContent="Couldn't determine versions";return}
     let msg=(v.installed?("installed: #"+v.installed):"installed: ?")+
             (v.latest?(" · latest: #"+v.latest):" · latest: ?");
     if(v.up_to_date)msg+=" — up to date ✓";
@@ -2804,10 +3321,10 @@ async function jkUpdateCheck(){
   }catch(e){$("#jkVer").textContent=e.message}}
 async function jkRandom(){
   const root=JKB.path&&JKB.path!=="/"?JKB.path:($("#jkPath").value||"/");
-  toast("choosing a random indexed SID…","ok");
+  toast("Choosing a random indexed SID…","ok");
   try{const s=await api("/api/juke/random",{method:"POST",
     headers:{"Content-Type":"application/json"},body:JSON.stringify({root}),timeoutMs:25000});
-    jkRender(s);toast("♪ selected from "+(s.indexed_candidates||0)+" indexed SIDs"+
+    jkRender(s);toast("♪ Selected from "+(s.indexed_candidates||0)+" indexed SIDs"+
       (s.loading?" — loading its folder in the background":""),"ok");
     if(s.selected)rememberRecent(itemSpec("sid",s.selected.split("/").pop().replace(/\.sid$/i,""),s.selected,"sid_play",{folder:parentPath(s.selected),name:s.selected.split("/").pop()}))}
   catch(e){toast(e.message,"err")}}
@@ -2830,7 +3347,7 @@ async function plRefresh(){
   }catch(e){}}
 async function plSave(){
   const name=$("#plName").value.trim();
-  if(!name){toast("give the play queue a name","err");return}
+  if(!name){toast("Give the play queue a name","err");return}
   try{
     const r=await api("/api/playlists/save",{method:"POST",
       headers:{"Content-Type":"application/json"},body:JSON.stringify({name})});
@@ -2840,7 +3357,7 @@ async function plSave(){
   }catch(e){toast(e.message,"err")}}
 async function plLoad(){
   const name=$("#plSel").value;
-  if(!name){toast("pick a saved play queue first","err");return}
+  if(!name){toast("Pick a saved play queue first","err");return}
   try{
     const s=await api("/api/playlists/load",{method:"POST",
       headers:{"Content-Type":"application/json"},body:JSON.stringify({name})});
@@ -2850,7 +3367,7 @@ async function plLoad(){
   }catch(e){toast(e.message,"err")}}
 async function plDelete(){
   const name=$("#plSel").value;
-  if(!name){toast("pick a saved play queue first","err");return}
+  if(!name){toast("Pick a saved play queue first","err");return}
   try{await api("/api/playlists/delete",{method:"POST",
     headers:{"Content-Type":"application/json"},body:JSON.stringify({name})});
     toast(`🗑 "${name}" deleted`,"ok");plRefresh();
@@ -2871,7 +3388,7 @@ async function jkClearQueue(){
   const s=JK.state||{},items=s.items||[];
   const keepCurrent=!!(s.playing&&s.index>=0&&s.index<items.length);
   const removeCount=Math.max(0,items.length-(keepCurrent?1:0));
-  if(!removeCount&&!s.radio){toast(keepCurrent?"no queued tunes behind the current SID":"play queue is already empty","ok");return}
+  if(!removeCount&&!s.radio){toast(keepCurrent?"No queued tunes behind the current SID":"Play queue is already empty","ok");return}
   if(removeCount>1&&!confirm(`Clear ${removeCount} queued tunes?\n\n${keepCurrent?"The current SID will continue playing and Radio will be turned off.":"Radio will be turned off."}`))return;
   try{const out=await api("/api/juke/clear",{method:"POST"});jkRender(out);
     toast(out.cleared?
@@ -2879,6 +3396,7 @@ async function jkClearQueue(){
       "Radio is off — current SID will stop at its normal end","ok")}
   catch(e){toast(e.message,"err")}}
 async function jkPlayFrom(folder,name){
+  jukeFadePrepareReplacement();
   try{
     const path=(folder==="/"?"":folder)+"/"+name;
     const s=await api("/api/juke/play_path",{method:"POST",
@@ -2887,15 +3405,15 @@ async function jkPlayFrom(folder,name){
     jkRender(s);
     rememberRecent(itemSpec("sid",s.now?.meta?.name||name,path,"sid_play",{folder,name}));
     toast("♪ "+(s.now?.meta?.name||name)+" — playing as a one-tune queue","ok");
-  }catch(e){toast(e.message,"err")}}
-async function jkPlay(i,song){try{
+  }catch(e){jukeFadeCancel(true);toast(e.message,"err")}}
+async function jkPlay(i,song){jukeFadePrepareReplacement();try{
   jkRender(await put("/api/juke/play?index="+i+(song?"&song="+song:""),{timeoutMs:20000}))}
-  catch(e){toast(e.message,"err")}}
+  catch(e){jukeFadeCancel(true);toast(e.message,"err")}}
 function jkPlayCurrent(){jkPlay(Math.max(0,(JK.state||{}).index||0))}
 function jkPlaySong(s){if(JK.state&&JK.state.index>=0)jkPlay(JK.state.index,+s)}
 async function jkStop(){
   if(JK.stopPending)return;
-  JK.stopPending=true;AUDIO_JUKE_STOP_MUTED=true;
+  JK.stopPending=true;AUDIO_JUKE_STOP_MUTED=true;jukeFadeCancel(true);
   // Stop all browser-scheduled audio immediately and drop incoming chunks until
   // the backend reset completes. This prevents the live WebSocket from simply
   // refilling the Web Audio queue while Stop is in flight.
@@ -2908,7 +3426,7 @@ async function jkStop(){
   catch(e){toast(e.message,"err")}
   finally{flushBrowserAudio();AUDIO_JUKE_STOP_MUTED=false;JK.stopPending=false}
 }
-async function jk(a){try{jkRender(await put("/api/juke/"+a))}catch(e){toast(e.message,"err")}}
+async function jk(a){jukeFadePrepareReplacement();try{jkRender(await put("/api/juke/"+a))}catch(e){jukeFadeCancel(true);toast(e.message,"err")}}
 async function jkShuffleSet(){try{
   jkRender(await put("/api/juke/shuffle?on="+($("#jkShuffle").checked?"true":"false")))}
   catch(e){toast(e.message,"err")}}
@@ -2980,7 +3498,7 @@ async function sidflowEnsure(){
 async function jkMoreLike(index=null){
   if(!await sidflowEnsure())return;
   const i=index==null?Number((JK.state||{}).index):Number(index);
-  if(i<0){toast("choose a tune first","err");return}
+  if(i<0){toast("Choose a tune first","err");return}
   try{const s=await api("/api/juke/more_like",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({index:i,limit:20}),timeoutMs:10000});jkRender(s);
     toast(`♪ ${s.added||0} SIDFlow matches inserted after the current tune — thanks Chris!`,"ok")}
@@ -3009,16 +3527,16 @@ async function qlRefresh(){
   }catch(e){}
 }
 async function qlRun(name){
-  toast("launching "+name+"…","ok");
+  toast("Launching "+name+"…","ok");
   try{await put("/api/library/run?name="+encodeURIComponent(name));
     toast(name+" running ✓","ok");rememberRecent(itemSpec("library",name,name,"library_run",{name}));screenEl.focus()}
   catch(e){toast(e.message,"err")}
 }
 async function qlAdd(){
-  const f=$("#qlfile").files[0];if(!f){toast("choose a file first","err");return}
+  const f=$("#qlfile").files[0];if(!f){toast("Choose a file first","err");return}
   const fd=new FormData();fd.append("file",f);
   try{await api("/api/library/upload",{method:"POST",body:fd});
-    $("#qlfile").value="";qlRefresh();toast("added to library ✓","ok")}
+    $("#qlfile").value="";qlRefresh();toast("Added to library ✓","ok")}
   catch(e){toast(e.message,"err")}
 }
 async function qlDel(name){

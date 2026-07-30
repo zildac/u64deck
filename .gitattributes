@@ -1,4 +1,10 @@
-*.py text eol=lf
-*.js text eol=lf
+# Keep release fingerprints stable across Linux development and Windows CI.
+*.py   text eol=lf
+*.js   text eol=lf
 *.html text eol=lf
-*.css text eol=lf
+*.css  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.bat  text eol=crlf

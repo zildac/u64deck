@@ -19,6 +19,10 @@ class OperationCancelled(RuntimeError):
     """Raised when a waiting background operation is cancelled."""
 
 
+class OperationExpired(RuntimeError):
+    """Raised when a time-sensitive queued operation is no longer useful."""
+
+
 @dataclass(frozen=True)
 class CoordinatorSnapshot:
     active_priority: str | None
@@ -38,6 +42,7 @@ class CoordinatorSnapshot:
     completed_status: int
     completed_background: int
     cancelled: int
+    expired: int
 
 
 class DeviceOperationCoordinator:
@@ -66,6 +71,7 @@ class DeviceOperationCoordinator:
         self._wait_samples = deque(maxlen=240)
         self._completed_by_priority = {name: 0 for name in self.PRIORITIES}
         self._cancelled = 0
+        self._expired = 0
         self._history = deque(maxlen=40)
 
     def _priority_number(self, priority: str) -> int:
@@ -126,12 +132,18 @@ class DeviceOperationCoordinator:
         *,
         wait_callback: Callable[[str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        max_wait_seconds: float | None = None,
     ) -> Iterator[None]:
         """Acquire the device transport at the requested priority.
 
         ``wait_callback`` receives the reason while blocked and an empty string
         once acquired. ``cancel_check`` is useful for a background index that
         may be stopped while waiting behind an interactive operation.
+
+        ``max_wait_seconds`` is deliberately opt-in. It is intended only for
+        time-sensitive manual actions, such as a screen-mirror keypress or a
+        Reset request, which would be dangerous if delivered against a later
+        machine state. Existing callers retain unlimited waiting by default.
         """
         depth = getattr(self._local, "depth", 0)
         if depth:
@@ -151,14 +163,26 @@ class DeviceOperationCoordinator:
             with self._cond:
                 self._waiting[number] += 1
                 try:
+                    deadline = None
+                    if max_wait_seconds is not None:
+                        deadline = start_wait + max(0.0, float(max_wait_seconds))
                     while not self._can_start(number):
                         if cancel_check and cancel_check():
                             raise OperationCancelled("device operation cancelled")
+                        now = time.monotonic()
+                        if deadline is not None and now >= deadline:
+                            blocked = self._blocked_reason(number)
+                            raise OperationExpired(
+                                f"{reason} expired while waiting for {blocked}"
+                            )
                         if wait_callback:
                             wait_callback(self._blocked_reason(number))
-                        self._cond.wait(timeout=0.10)
+                        remaining = max(0.0, deadline - now) if deadline is not None else 0.10
+                        self._cond.wait(timeout=min(0.10, remaining) if deadline is not None else 0.10)
                     if cancel_check and cancel_check():
                         raise OperationCancelled("device operation cancelled")
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise OperationExpired(f"{reason} expired before delivery")
                     acquired_at = time.monotonic()
                     wait_seconds = max(0.0, acquired_at - start_wait)
                     self._active = True
@@ -174,15 +198,20 @@ class DeviceOperationCoordinator:
                     self._waiting[number] -= 1
                 if wait_callback:
                     wait_callback("")
-        except OperationCancelled as exc:
+        except (OperationCancelled, OperationExpired) as exc:
             with self._cond:
-                self._cancelled += 1
+                outcome = "expired" if isinstance(exc, OperationExpired) else "cancelled"
+                if outcome == "expired":
+                    self._expired += 1
+                else:
+                    self._cancelled += 1
                 self._record_history(
                     priority=priority, reason=reason,
                     wait_seconds=max(0.0, time.monotonic() - start_wait),
-                    duration_seconds=0.0, outcome="cancelled", error=str(exc),
+                    duration_seconds=0.0, outcome=outcome, error=str(exc),
                     started_at=started_wall,
                 )
+                self._cond.notify_all()
             raise
 
         outcome = "ok"
@@ -252,6 +281,7 @@ class DeviceOperationCoordinator:
                 completed_status=self._completed_by_priority["status"],
                 completed_background=self._completed_by_priority["background"],
                 cancelled=self._cancelled,
+                expired=self._expired,
             )
 
     def recent_operations(self, limit: int = 20) -> list[dict]:

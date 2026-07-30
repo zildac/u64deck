@@ -44,8 +44,14 @@ from network_awareness import (
 from d64 import DiskImage, ascii_to_petscii
 from ultimate import (AudioReceiver, CommandSocket, DeviceFS, UltimateError,
                       UltimateREST, VideoReceiver)
-from device_coordinator import DeviceOperationCoordinator, OperationCancelled
+from device_coordinator import (DeviceOperationCoordinator, OperationCancelled,
+                                OperationExpired)
 from index_store import IndexStore
+from disk_naming import (SUPPORTED_EXTENSIONS as DISK_NAMING_EXTENSIONS,
+                         analyse_disk_names, candidate_by_key,
+                         custom_signature as _custom_swap_signature,
+                         group_with_rule as _group_with_custom_rule,
+                         rule_pattern_key, validate_rule)
 from index_migration import STABLE_INDEX_NAME, prepare_stable_index
 from local_indexer import (list_local_volumes, normalise_ultimate_root,
                            resolve_source, scan_local_tree, volume_identity)
@@ -236,6 +242,13 @@ DEFAULT_CONFIG = {
     # next Jukebox tune is launched. This preserves short audible tails/fades
     # without changing the duration sent to the Ultimate's native SID player.
     "sid_jukebox_end_grace_secs": 0.5,
+    # Optional browser-stream fade after a matched Songlengths duration. The
+    # Ultimate's selected subtune is extended by the same amount so streamed
+    # audio remains available for the fade. This changes neither HDMI nor
+    # analogue output volume; those outputs continue at full level until the
+    # extended native endpoint.
+    "sid_jukebox_browser_fade_enabled": True,
+    "sid_jukebox_browser_fade_secs": 2.5,
     # Last-used local SID metadata source. This is only a convenience value;
     # the scanner remains read-only and stores Ultimate-style paths in SQLite.
     "sid_local_source": "",
@@ -339,6 +352,29 @@ INPUT_IO_LOCK = threading.RLock()
 # Video disconnect cleanup is a safety action, not a reason to queue repeated
 # release_all calls.  Keep at most one cleanup request in flight.
 MATRIX_CLEANUP_LOCK = threading.Lock()
+
+# Legacy KERNAL-buffer F7 is not equivalent to a physical keyboard-matrix F7
+# while freezer cartridges are in their startup menu.  Hardware testing on an
+# older C64 Ultimate with Retro Replay showed that injected code 136 can enter
+# the Freeze Menu, whereas the physical C64 F7 key is reliable.  Mount & Run
+# therefore exposes a small local-only interaction state while it waits for a
+# physical F7.  The cancellation event is deliberately independent of the
+# device coordinator so the browser can release a waiting operation without
+# queueing another Ultimate request behind it.
+_MOUNT_RUN_PROMPT_LOCK = threading.RLock()
+_MOUNT_RUN_PROMPT_GENERATION = 0
+_MOUNT_RUN_PROMPT: dict[str, object] = {}
+
+# Cartridge state is read from the Ultimate firmware, cached per device for UI
+# and diagnostics, and refreshed live immediately before Mount & Run.  A CRT
+# started through a runner is temporary firmware state and is tracked
+# separately because it does not update the persistent Cartridge setting.
+_CART_CAT = "C64 and Cartridge Settings"
+_CART_ITEM = "Cartridge"
+_CART_CACHE_FALLBACK_SECONDS = 20.0
+_CART_STATE_LOCK = threading.RLock()
+_CART_CONFIG_CACHE: dict[str, dict] = {}
+_TEMPORARY_CRT_ACTIVE: dict[str, dict] = {}
 
 # Ethernet/Wi-Fi awareness. The optional Wireshark cache is additive-only;
 # the bundled 2026-07 Espressif list remains the permanent floor.
@@ -448,6 +484,7 @@ CFG["browser_startup"] = _normalise_browser_startup(CFG.get("browser_startup"))
 _UVICORN_SERVER: uvicorn.Server | None = None
 _BROWSER_PROCESS: subprocess.Popen | None = None
 _APP_EXIT_REQUESTED = threading.Event()
+_APP_EXIT_REQUEST_LOCK = threading.Lock()
 _APP_EXIT_CLEANUP_COMPLETE = threading.Event()
 _LOCAL_EXIT_HEADER = "X-U64deck-Local-Exit"
 
@@ -457,7 +494,10 @@ def _client_is_loopback(host: str | None) -> bool:
     if not value:
         return False
     try:
-        return ipaddress.ip_address(value).is_loopback
+        addr = ipaddress.ip_address(value)
+        if addr.version == 6 and addr.ipv4_mapped is not None:
+            addr = addr.ipv4_mapped
+        return addr.is_loopback
     except ValueError:
         return value.lower() == "localhost"
 
@@ -634,6 +674,15 @@ async def _browser_security_headers(request, call_next):
     return response
 
 DEVICE_OP = DeviceOperationCoordinator()
+
+# Manual Legacy keypresses and Reset/Reboot requests are state-sensitive. They
+# must never wait behind a long Mount & Run and then fire against a different
+# cartridge or BASIC state. The deadline is intentionally opt-in; CIA1 matrix
+# input, release_all, SID Stop and Mount & Run's own inline reset are unchanged.
+_MANUAL_INPUT_MAX_WAIT = 2.0
+_MANUAL_MACHINE_MAX_WAIT = 2.0
+_MANUAL_MACHINE_PENDING_LOCK = threading.Lock()
+_MANUAL_MACHINE_PENDING = ""
 
 rest: UltimateREST = None
 cmd: CommandSocket = None
@@ -1079,12 +1128,73 @@ def _matrix_release_cleanup(*, caller: str) -> bool:
         MATRIX_CLEANUP_LOCK.release()
 
 
-def _legacy_type(data: bytes, *, chunk: int = 8, delay: float = 0.02):
-    """Serialised wrapper for legacy KERNAL keyboard-buffer injection."""
-    with INPUT_IO_LOCK:
+def _legacy_type(
+    data: bytes,
+    *,
+    chunk: int = 8,
+    delay: float = 0.02,
+    max_wait_seconds: float | None = None,
+    origin: str = "internal",
+    log_codes: bool = False,
+):
+    """Serialised wrapper for Legacy KERNAL keyboard-buffer injection.
+
+    Only manual browser/API Legacy input supplies ``max_wait_seconds``. The
+    established internal boot-prekey, Mount & Run LOAD/RUN and other nested
+    callers retain unlimited/re-entrant delivery.
+    """
+    payload = bytes(data)
+    reason = f"keyboard input [{origin}]" if origin else "keyboard input"
+    requested_wall = time.time()
+    wait_started = time.monotonic()
+    acquired_io = False
+    try:
+        if max_wait_seconds is None:
+            INPUT_IO_LOCK.acquire()
+            acquired_io = True
+            remaining = None
+        else:
+            limit = max(0.0, float(max_wait_seconds))
+            acquired_io = INPUT_IO_LOCK.acquire(timeout=limit)
+            if not acquired_io:
+                raise OperationExpired(
+                    f"{reason} expired while waiting for input serialisation"
+                )
+            remaining = max(0.0, limit - (time.monotonic() - wait_started))
         if chunk == 8 and abs(float(delay) - 0.02) < 0.0001:
-            return cmd.type_petscii(data)
-        return cmd.type_petscii(data, chunk=chunk, delay=delay)
+            result = cmd.type_petscii(
+                payload,
+                max_wait_seconds=remaining,
+                reason=reason,
+            )
+        else:
+            result = cmd.type_petscii(
+                payload,
+                chunk=chunk,
+                delay=delay,
+                max_wait_seconds=remaining,
+                reason=reason,
+            )
+    finally:
+        if acquired_io:
+            INPUT_IO_LOCK.release()
+    if isinstance(result, dict) and result.get("delivered_at") is not None:
+        result = dict(result)
+        result["wait_seconds"] = max(
+            0.0,
+            float(result["delivered_at"]) - requested_wall,
+        )
+    if log_codes:
+        shown = ",".join(str(value) for value in payload[:32])
+        if len(payload) > 32:
+            shown += f",…(+{len(payload) - 32})"
+        wait = float((result or {}).get("wait_seconds", 0.0))
+        _diag_event(
+            "info",
+            f"Legacy input delivered: origin={origin or 'unknown'} "
+            f"bytes={len(payload)} codes=[{shown}] wait={wait:.3f}s",
+        )
+    return result
 
 
 def cache_image(name: str, data: bytes) -> dict:
@@ -1513,6 +1623,25 @@ def api_connect(payload: dict = Body(...)):
         timing["old_client_cleanup_ms"] = round(
             (time.perf_counter() - cleanup_started) * 1000.0, 1)
 
+    cart_started = time.perf_counter()
+    try:
+        cart_state = _refresh_cartridge_cache(
+            client=rest, source="device connection"
+        )
+        timing["cartridge_cache_ms"] = round(
+            (time.perf_counter() - cart_started) * 1000.0, 1
+        )
+        timing["cartridge"] = cart_state.get("classification", "unknown")
+    except Exception as cart_error:
+        _cartridge_cache_invalidate(rest)
+        timing["cartridge_cache_ms"] = round(
+            (time.perf_counter() - cart_started) * 1000.0, 1
+        )
+        timing["cartridge"] = "unavailable"
+        _diag_event(
+            "warning", f"Cartridge cache refresh on connection failed: {cart_error}"
+        )
+
     finish(True)
     return {
         "connected": True, "host": host, "control_host": control_host,
@@ -1614,8 +1743,10 @@ def app_exit(request: Request):
     if request.headers.get(_LOCAL_EXIT_HEADER) != "1":
         raise HTTPException(403, "Local exit confirmation header is required")
 
-    first_request = not _APP_EXIT_REQUESTED.is_set()
-    _APP_EXIT_REQUESTED.set()
+    with _APP_EXIT_REQUEST_LOCK:
+        first_request = not _APP_EXIT_REQUESTED.is_set()
+        if first_request:
+            _APP_EXIT_REQUESTED.set()
     with _HEALTH_LOCK:
         _HEALTH_SHUTDOWN["state"] = "requested"
         _HEALTH_SHUTDOWN["requested_at"] = time.time()
@@ -1654,10 +1785,441 @@ def local_settings_set(payload: dict = Body(...)):
     return result
 
 
+
+def _cartridge_device_key(client: UltimateREST | None = None) -> str:
+    """Stable key for cartridge state across split Ethernet/Wi-Fi routing."""
+    identity = str(CFG.get("active_device_identity") or "").strip().casefold()
+    if identity:
+        return f"identity:{identity}"
+    selected = str(CFG.get("u64_host") or "").strip().casefold()
+    if selected:
+        return f"host:{selected}"
+    active = client or rest
+    host = str(getattr(active, "host", "") or "").strip().casefold()
+    return f"host:{host}" if host else ""
+
+
+def _extract_cartridge_value(payload: object) -> str:
+    """Extract the Cartridge item from normal or detailed config responses."""
+    if not isinstance(payload, dict):
+        raise UltimateError("firmware Cartridge response was not an object")
+    category = payload.get(_CART_CAT, payload)
+    if not isinstance(category, dict) or _CART_ITEM not in category:
+        raise UltimateError("firmware Cartridge item was not returned")
+    value = category.get(_CART_ITEM)
+    if isinstance(value, dict):
+        for key in ("current", "value", "selected"):
+            if key in value:
+                value = value.get(key)
+                break
+        else:
+            raise UltimateError("firmware Cartridge value was not returned")
+    return str(value or "").strip()
+
+
+def _classify_cartridge(value: object) -> str:
+    """Classify only the cartridge behaviour u64deck has hardware-tested."""
+    text = str(value or "").strip()
+    normalised = re.sub(r"[^a-z0-9]+", "", text.casefold())
+    leaf = text.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if leaf.casefold().endswith(".crt"):
+        leaf = leaf[:-4]
+    leaf_normalised = re.sub(r"[^a-z0-9]+", "", leaf.casefold())
+    if normalised in {"", "none", "disabled", "off", "nocartridge", "0"}:
+        return "none"
+    if "retroreplay" in normalised or leaf_normalised in {"rr38pal", "rr38ntsc"}:
+        return "retro_replay"
+    return "other"
+
+
+def _cartridge_label(value: object, classification: str | None = None) -> str:
+    classification = classification or _classify_cartridge(value)
+    if classification == "none":
+        return "None"
+    if classification == "retro_replay":
+        return "Retro Replay"
+    text = str(value or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if text.casefold().endswith(".crt"):
+        text = text[:-4]
+    return text or "Other cartridge"
+
+
+def _cartridge_cache_set(value: object, *, source: str,
+                         client: UltimateREST | None = None,
+                         device_key: str = "") -> dict:
+    key = str(device_key or _cartridge_device_key(client)).strip()
+    if not key:
+        raise UltimateError("no selected Ultimate for Cartridge cache")
+    text = str(value or "").strip()
+    classification = _classify_cartridge(text)
+    entry = {
+        "known": True,
+        "device_key": key,
+        "value": text,
+        "classification": classification,
+        "label": _cartridge_label(text, classification),
+        "source": str(source or "firmware read"),
+        "updated_at": time.time(),
+    }
+    with _CART_STATE_LOCK:
+        _CART_CONFIG_CACHE[key] = entry
+    return dict(entry)
+
+
+def _cartridge_cache_snapshot(client: UltimateREST | None = None) -> dict:
+    key = _cartridge_device_key(client)
+    with _CART_STATE_LOCK:
+        entry = dict(_CART_CONFIG_CACHE.get(key) or {})
+    if not entry:
+        return {
+            "known": False, "device_key": key, "value": "",
+            "classification": "unknown", "label": "Unknown",
+            "source": "not read", "updated_at": 0.0, "age_seconds": None,
+        }
+    entry["age_seconds"] = round(max(0.0, time.time() - float(entry.get("updated_at") or 0)), 3)
+    return entry
+
+
+def _cartridge_cache_invalidate(client: UltimateREST | None = None) -> None:
+    key = _cartridge_device_key(client)
+    if key:
+        with _CART_STATE_LOCK:
+            _CART_CONFIG_CACHE.pop(key, None)
+
+
+def _read_cartridge_live(client: UltimateREST | None = None) -> str:
+    active = client or rest
+    payload = active.get_json(f"/v1/configs/{_CART_CAT}")
+    return _extract_cartridge_value(payload)
+
+
+def _refresh_cartridge_cache(*, client: UltimateREST | None = None,
+                              source: str = "live firmware read") -> dict:
+    active = client or rest
+    value = _read_cartridge_live(active)
+    return _cartridge_cache_set(value, source=source, client=active)
+
+
+def _cartridge_preflight(*, client: UltimateREST | None = None,
+                         require_confirmation: bool = True) -> dict:
+    """Return current cartridge state, preferring an immediate firmware read.
+
+    Mount & Run uses ``require_confirmation=True`` and will not reset the C64
+    when neither a live value nor a very recent same-device cache is available.
+    Less critical actions may suppress Auto F7 and continue when state is
+    unknown rather than blocking Reset/Reboot.
+    """
+    active = client or rest
+    try:
+        entry = _refresh_cartridge_cache(
+            client=active, source="live firmware read"
+        )
+        entry["age_seconds"] = 0.0
+        return entry
+    except Exception as exc:
+        cached = _cartridge_cache_snapshot(active)
+        age = cached.get("age_seconds")
+        if cached.get("known") and age is not None and age <= _CART_CACHE_FALLBACK_SECONDS:
+            cached = dict(cached)
+            cached["source"] = "recent same-device cache"
+            cached["live_error"] = str(exc)
+            _diag_event(
+                "warning",
+                "Cartridge live read failed — using recent same-device cache",
+                cache_age_seconds=age,
+                error=str(exc),
+            )
+            return cached
+        if require_confirmation:
+            raise UltimateError(
+                f"Cartridge state could not be confirmed before Mount & Run: {exc}"
+            ) from exc
+        _diag_event(
+            "warning",
+            "Cartridge state unavailable — Auto F7 suppressed",
+            error=str(exc),
+        )
+        return cached
+
+
+def _cartridge_boot_plan(input_status: dict, cartridge: dict) -> dict:
+    """Choose automatic, physical or manual cartridge startup handling."""
+    configured_prekey = str(CFG.get("boot_prekey", "")).strip().upper()
+    saved_f7 = configured_prekey == "F7"
+    matrix = input_status.get("available") is True
+    classification = str(cartridge.get("classification") or "unknown")
+    label = str(cartridge.get("label") or "Unknown")
+    plan = {
+        "classification": classification,
+        "label": label,
+        "saved_auto_f7": saved_f7,
+        "configured_prekey": configured_prekey,
+        "automatic_prekey": False,
+        "prompt_kind": "",
+        "prompt_title": "",
+        "prompt_message": "",
+    }
+    # Preserve the existing advanced config.json prekeys. They are explicit
+    # user choices rather than cartridge guesses; RC41 narrows only F7.
+    if configured_prekey and configured_prekey != "F7":
+        plan["automatic_prekey"] = True
+        return plan
+    if classification == "none":
+        return plan
+    if classification == "retro_replay" and saved_f7:
+        if matrix:
+            plan["automatic_prekey"] = True
+        else:
+            plan.update({
+                "prompt_kind": "physical_f7",
+                "prompt_title": "Physical F7 required",
+                "prompt_message": (
+                    "Retro Replay is configured. Automatic F7 is unavailable "
+                    "with Legacy KERNAL-buffer input because an emulated F7 can "
+                    "open the Freeze Menu. Press F7 on the physical C64 keyboard "
+                    "to enter Fastload. u64deck will continue automatically when "
+                    "BASIC is ready."
+                ),
+            })
+        return plan
+
+    if classification == "retro_replay":
+        if matrix:
+            plan.update({
+                "prompt_kind": "cartridge_attention",
+                "prompt_title": "Retro Replay startup",
+                "prompt_message": (
+                    "Auto F7 Fastload is disabled. Press F7 on the C64 keyboard "
+                    "or use the Screen controls to enter the Fastload BASIC "
+                    "prompt. u64deck will continue automatically when BASIC is ready."
+                ),
+            })
+        else:
+            plan.update({
+                "prompt_kind": "cartridge_attention",
+                "prompt_title": "Physical F7 required",
+                "prompt_message": (
+                    "Retro Replay is configured and Auto F7 Fastload is disabled. "
+                    "With Legacy KERNAL-buffer input, press F7 on the physical C64 "
+                    "keyboard to enter the Fastload BASIC prompt. u64deck will "
+                    "continue automatically when BASIC is ready."
+                ),
+            })
+        return plan
+
+    # Other cartridges are not rejected; u64deck simply makes no assumptions
+    # about their startup keys. The wording explicitly follows the input mode.
+    if classification == "other":
+        reason = f"{label} is not recognised for automatic startup handling."
+    else:
+        reason = "The cartridge type could not be classified for automatic startup handling."
+    if matrix:
+        control = "Use the C64 keyboard or Screen controls to reach BASIC."
+    else:
+        control = (
+            "Legacy KERNAL-buffer input cannot reliably automate cartridge-menu "
+            "keys. Use the physical C64 keyboard to reach BASIC."
+        )
+    plan.update({
+        "prompt_kind": "cartridge_attention",
+        "prompt_title": "Cartridge startup requires attention",
+        "prompt_message": f"{reason} {control} u64deck will continue automatically when BASIC is ready.",
+    })
+    return plan
+
+
+def _temporary_crt_snapshot(client: UltimateREST | None = None) -> dict:
+    key = _cartridge_device_key(client)
+    with _CART_STATE_LOCK:
+        row = dict(_TEMPORARY_CRT_ACTIVE.get(key) or {})
+    if not row:
+        return {"active": False, "device_key": key}
+    row["active"] = True
+    row["age_seconds"] = round(max(0.0, time.time() - float(row.get("started_at") or 0)), 3)
+    return row
+
+
+def _temporary_crt_mark(label: str, client: UltimateREST | None = None) -> None:
+    key = _cartridge_device_key(client)
+    if not key:
+        return
+    row = {
+        "device_key": key,
+        "label": str(label or "temporary CRT")[:260],
+        "started_at": time.time(),
+    }
+    with _CART_STATE_LOCK:
+        _TEMPORARY_CRT_ACTIVE[key] = row
+    _diag_event("info", f"Temporary runner cartridge active: {row['label']}")
+
+
+def _temporary_crt_clear(client: UltimateREST | None = None, *, reason: str = "") -> None:
+    key = _cartridge_device_key(client)
+    if not key:
+        return
+    with _CART_STATE_LOCK:
+        previous = _TEMPORARY_CRT_ACTIVE.pop(key, None)
+    if previous and reason:
+        _diag_event("info", f"Temporary runner cartridge cleared: {reason}")
+
+
+def _temporary_crt_reboot_before_mount_run() -> bool:
+    """Restore configured firmware cartridge after a direct CRT runner."""
+    active = rest
+    marker = _temporary_crt_snapshot(active)
+    if not marker.get("active"):
+        return False
+    _diag_event(
+        "info",
+        "Mount & Run: rebooting Ultimate to clear temporary runner cartridge",
+        cartridge=marker.get("label", ""),
+    )
+    active.put("/v1/machine:reboot", request_timeout=4.0)
+    if cmd:
+        cmd.close()
+    time.sleep(max(2.5, float(CFG.get("boot_wait", 2.8))))
+    _wait_for_ultimate_after_reboot(active)
+    _temporary_crt_clear(active, reason="full reboot before Mount & Run")
+    _sid_runner_clear_reboot_required(active)
+    _cartridge_cache_invalidate(active)
+    _diag_event(
+        "info",
+        "Mount & Run: temporary runner cartridge cleared — configured firmware cartridge restored",
+    )
+    return True
+
+
+def _run_temporary_crt(fn, reason: str, label: str):
+    """Run a CRT and remember that the runner cartridge is temporary state."""
+    result = _run_direct_takeover(fn, reason)
+    _temporary_crt_mark(label, rest)
+    return result
+
+
+def _legacy_physical_f7_required(*, status: dict | None = None,
+                                 cartridge: dict | None = None) -> bool:
+    """Whether Retro Replay Auto F7 needs a physical Legacy keypress."""
+    if str(CFG.get("boot_prekey", "")).strip().upper() != "F7":
+        return False
+    current = status if isinstance(status, dict) else _cached_input_status(rest)
+    cart = cartridge if isinstance(cartridge, dict) else _cartridge_cache_snapshot(rest)
+    return (current.get("available") is False
+            and cart.get("classification") == "retro_replay")
+
+
+def _standalone_cartridge_notice(action: str, *, status: dict,
+                                 cartridge: dict, temporary_active: bool = False) -> dict | None:
+    """Return an informational Screen overlay after standalone Reset/Reboot.
+
+    This never blocks the coordinator and is deliberately limited to the
+    hardware-tested Legacy Retro Replay case with the saved Auto F7 preference.
+    """
+    if action not in {"reset", "reboot"}:
+        return None
+    if temporary_active and action == "reset":
+        return None
+    if not _legacy_physical_f7_required(status=status, cartridge=cartridge):
+        return None
+    return {
+        "kind": "standalone_f7",
+        "title": "Physical F7 required",
+        "message": (
+            "Retro Replay is configured. With Legacy KERNAL-buffer input, press "
+            "F7 on the physical C64 keyboard to enter the Fastload BASIC prompt."
+        ),
+        "dismiss_label": "Dismiss",
+        "monitor_basic_ready": True,
+    }
+
+
+def _mount_run_prompt_snapshot() -> dict:
+    with _MOUNT_RUN_PROMPT_LOCK:
+        if not _MOUNT_RUN_PROMPT.get("active"):
+            return {"active": False}
+        return {
+            key: value for key, value in _MOUNT_RUN_PROMPT.items()
+            if key not in {"cancel_event", "continue_event"}
+        }
+
+
+def _mount_run_prompt_begin(plan: dict | None = None) -> tuple[int, threading.Event, threading.Event]:
+    global _MOUNT_RUN_PROMPT_GENERATION
+    plan = dict(plan or {})
+    with _MOUNT_RUN_PROMPT_LOCK:
+        _MOUNT_RUN_PROMPT_GENERATION += 1
+        generation = _MOUNT_RUN_PROMPT_GENERATION
+        cancel_event = threading.Event()
+        continue_event = threading.Event()
+        phase = str(plan.get("prompt_kind") or "physical_f7")
+        _MOUNT_RUN_PROMPT.clear()
+        _MOUNT_RUN_PROMPT.update({
+            "active": True,
+            "generation": generation,
+            "phase": phase,
+            "title": str(plan.get("prompt_title") or "Physical F7 required"),
+            "message": str(plan.get("prompt_message") or (
+                "Press F7 on the C64 keyboard to enable Retro Replay "
+                "Fastload. u64deck will continue automatically when BASIC is ready."
+            )),
+            "cancel_available": True,
+            "started_at": time.time(),
+            "cancel_event": cancel_event,
+            "continue_event": continue_event,
+        })
+        return generation, cancel_event, continue_event
+
+
+def _mount_run_prompt_update(generation: int, *, phase: str, title: str,
+                             message: str, cancel_available: bool) -> None:
+    with _MOUNT_RUN_PROMPT_LOCK:
+        if (_MOUNT_RUN_PROMPT.get("active") and
+                int(_MOUNT_RUN_PROMPT.get("generation") or 0) == generation):
+            _MOUNT_RUN_PROMPT.update({
+                "phase": phase,
+                "title": title,
+                "message": message,
+                "cancel_available": bool(cancel_available),
+            })
+
+
+def _mount_run_prompt_finish(generation: int) -> None:
+    with _MOUNT_RUN_PROMPT_LOCK:
+        if int(_MOUNT_RUN_PROMPT.get("generation") or 0) == generation:
+            _MOUNT_RUN_PROMPT.clear()
+
+
+def _mount_run_wait_for_continue(cancel_event: threading.Event,
+                                 continue_event: threading.Event,
+                                 timeout: float = 120.0) -> str:
+    """Wait for explicit continuation on firmware without machine:readmem."""
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    while time.monotonic() < deadline:
+        if cancel_event.is_set():
+            return "cancelled"
+        if continue_event.wait(0.1):
+            return "ready"
+    return "timeout"
+
+
 def _boot_options_payload() -> dict:
     prekey = str(CFG.get("boot_prekey", "")).strip().upper()
+    status = _cached_input_status(rest)
+    cartridge = _cartridge_cache_snapshot(rest)
+    retro_replay = cartridge.get("classification") == "retro_replay"
+    physical_required = (
+        prekey == "F7" and retro_replay and status.get("available") is False
+    )
+    effective = (
+        prekey == "F7" and retro_replay and status.get("available") is True
+    )
     return {
         "auto_fastload": prekey == "F7",
+        "effective_auto_fastload": effective,
+        "physical_f7_required": physical_required,
+        "legacy_auto_f7_unavailable": (
+            prekey == "F7" and status.get("available") is False
+        ),
+        "cartridge": cartridge,
         "boot_prekey": prekey,
         "boot_wait": float(CFG.get("boot_wait", 2.8)),
     }
@@ -1822,67 +2384,172 @@ def machine(action: str):
     allowed = {"reset", "reboot", "pause", "resume", "poweroff", "menu_button"}
     if action not in allowed:
         raise HTTPException(400, "unknown action")
+
+    global _MANUAL_MACHINE_PENDING
+    guarded = action in {"reset", "reboot"}
+    claimed = False
+    if guarded:
+        busy = _mount_run_busy_payload()
+        if busy:
+            message = f"Mount & Run is in progress — {action.title()} was not queued"
+            _diag_event("warning", message)
+            raise HTTPException(409, message)
+        with _MANUAL_MACHINE_PENDING_LOCK:
+            if _MANUAL_MACHINE_PENDING:
+                message = (
+                    f"{_MANUAL_MACHINE_PENDING.title()} is already pending — "
+                    f"{action.title()} was not queued"
+                )
+                _diag_event("warning", message)
+                raise HTTPException(409, message)
+            _MANUAL_MACHINE_PENDING = action
+            claimed = True
+
     try:
-        # Keep the reset/reboot and optional post-boot key as one interactive
-        # operation so indexing cannot resume during the cartridge-menu wait.
-        with DEVICE_OP.operation("interactive", f"machine {action}"):
+        # Keep reset/reboot and their optional post-boot key as one operation.
+        # Only these manual state-changing actions opt into queue expiry.
+        with DEVICE_OP.operation(
+            "interactive",
+            f"machine {action}",
+            max_wait_seconds=_MANUAL_MACHINE_MAX_WAIT if guarded else None,
+        ):
+            cartridge_state = None
             if action in {"reset", "reboot"}:
                 _juke_disarm_machine_takeover(f"machine {action}")
                 _matrix_release_all(silent=True, caller=f"machine-{action}")
+                if _configured_boot_prekey() == "F7":
+                    cartridge_state = _cartridge_preflight(
+                        require_confirmation=False
+                    )
             result = rest.put(f"/v1/machine:{action}")
             if action == "reboot":
                 _sid_runner_clear_reboot_required(rest)
             pressed = None
             if action == "reset":
-                pressed = _send_boot_prekey()
+                pressed = _send_boot_prekey(cartridge_state=cartridge_state)
             elif action == "reboot":
                 # A full Ultimate reboot drops the persistent command socket.
                 if cmd:
                     cmd.close()
                 delay = max(2.5, float(CFG.get("boot_wait", 2.8)))
-                pressed = _send_boot_prekey(delay=delay, retry_window=8.0)
-            if pressed and isinstance(result, dict):
+                pressed = _send_boot_prekey(
+                    delay=delay, retry_window=8.0,
+                    cartridge_state=cartridge_state,
+                )
+                _temporary_crt_clear(rest, reason="explicit Ultimate reboot")
+                _cartridge_cache_invalidate(rest)
+                try:
+                    _refresh_cartridge_cache(
+                        client=rest, source="post-reboot firmware read"
+                    )
+                except Exception as cache_error:
+                    _diag_event(
+                        "warning",
+                        f"Cartridge cache refresh after reboot failed: {cache_error}",
+                    )
+            if isinstance(result, dict):
                 result = dict(result)
-                result["u64deck_boot_prekey"] = pressed
+                if pressed:
+                    result["u64deck_boot_prekey"] = pressed
+                if action in {"reset", "reboot"}:
+                    if action == "reboot":
+                        cartridge_state = _cartridge_cache_snapshot(rest)
+                    if isinstance(cartridge_state, dict):
+                        if cartridge_state.get("known"):
+                            result["u64deck_cartridge"] = cartridge_state
+                        notice = _standalone_cartridge_notice(
+                            action,
+                            status=_cached_input_status(rest),
+                            cartridge=cartridge_state,
+                            temporary_active=(
+                                _temporary_crt_snapshot(rest).get("active") is True
+                                if action == "reset" else False
+                            ),
+                        )
+                        if notice:
+                            result["u64deck_screen_notice"] = notice
             return result
+    except OperationExpired as exc:
+        message = f"{action.title()} expired before it could be delivered — nothing was sent"
+        _diag_event("warning", f"{message}: {exc}")
+        raise HTTPException(409, message) from exc
     except (UltimateError, httpx.HTTPError) as e:
         err(e)
+    finally:
+        if claimed:
+            with _MANUAL_MACHINE_PENDING_LOCK:
+                if _MANUAL_MACHINE_PENDING == action:
+                    _MANUAL_MACHINE_PENDING = ""
 
 
 # --- configuration ------------------------------------------------------
+
+def _settings_error(operation: str, exc: Exception, code: int = 502):
+    """Surface a settings failure with the exact firmware operation named.
+
+    The Settings page defers its initial reads until /api/info has established
+    the connection, but lifecycle and network failures can still occur later.
+    Keep those diagnostics actionable instead of recording a context-free
+    socket exception.
+    """
+    message = f"Settings {operation} failed: {exc}"
+    _diag_event("error", message, operation=operation, status=code)
+    raise HTTPException(code, message) from exc
+
 
 @app.get("/api/configs")
 def configs():
     try:
         return rest.get_json("/v1/configs")
-    except (UltimateError, httpx.HTTPError) as e:
-        err(e)
+    except (UltimateError, httpx.HTTPError, RuntimeError) as e:
+        _settings_error("category list read", e)
 
 
 @app.get("/api/configs/{category}")
 def config_category(category: str, detail: bool = False):
+    operation = f"category '{category}' {'detail ' if detail else ''}read"
     try:
         if detail:
-            return rest.get_json(f"/v1/configs/{category}/*")
-        return rest.get_json(f"/v1/configs/{category}")
-    except (UltimateError, httpx.HTTPError) as e:
-        err(e)
+            result = rest.get_json(f"/v1/configs/{category}/*")
+        else:
+            result = rest.get_json(f"/v1/configs/{category}")
+        if category == _CART_CAT:
+            try:
+                _cartridge_cache_set(
+                    _extract_cartridge_value(result),
+                    source="Settings category read",
+                    client=rest,
+                )
+            except Exception as cache_error:
+                _diag_event("warning", f"Cartridge Settings cache update failed: {cache_error}")
+        return result
+    except (UltimateError, httpx.HTTPError, RuntimeError) as e:
+        _settings_error(operation, e)
 
 
 @app.put("/api/configs/{category}/{item}")
 def config_set(category: str, item: str, value: str = Query(...)):
     try:
-        return rest.put(f"/v1/configs/{category}/{item}", value=value)
-    except (UltimateError, httpx.HTTPError) as e:
-        err(e)
+        result = rest.put(f"/v1/configs/{category}/{item}", value=value)
+        if category == _CART_CAT and item == _CART_ITEM:
+            _cartridge_cache_set(value, source="Settings item write", client=rest)
+        return result
+    except (UltimateError, httpx.HTTPError, RuntimeError) as e:
+        _settings_error(f"item '{category}/{item}' write", e)
 
 
 @app.post("/api/configs")
 def config_bulk(payload: dict = Body(...)):
     try:
-        return rest.post_json("/v1/configs", payload)
-    except (UltimateError, httpx.HTTPError) as e:
-        err(e)
+        result = rest.post_json("/v1/configs", payload)
+        category = payload.get(_CART_CAT) if isinstance(payload, dict) else None
+        if isinstance(category, dict) and _CART_ITEM in category:
+            _cartridge_cache_set(
+                category.get(_CART_ITEM), source="Settings bulk apply", client=rest
+            )
+        return result
+    except (UltimateError, httpx.HTTPError, RuntimeError) as e:
+        _settings_error("bulk apply", e)
 
 
 @app.put("/api/configs_action/{action}")
@@ -1890,9 +2557,21 @@ def config_action(action: str):
     if action not in {"save_to_flash", "load_from_flash", "reset_to_default"}:
         raise HTTPException(400, "unknown action")
     try:
-        return rest.put(f"/v1/configs:{action}")
-    except (UltimateError, httpx.HTTPError) as e:
-        err(e)
+        result = rest.put(f"/v1/configs:{action}")
+        if action in {"load_from_flash", "reset_to_default"}:
+            _cartridge_cache_invalidate(rest)
+            try:
+                _refresh_cartridge_cache(
+                    client=rest, source=f"Settings {action.replace('_', ' ')}"
+                )
+            except Exception as cache_error:
+                _diag_event(
+                    "warning",
+                    f"Cartridge cache refresh after {action} failed: {cache_error}",
+                )
+        return result
+    except (UltimateError, httpx.HTTPError, RuntimeError) as e:
+        _settings_error(f"action '{action}'", e)
 
 
 # --- drives -------------------------------------------------------------
@@ -1925,14 +2604,55 @@ def _mount_run_busy_payload() -> dict | None:
     snapshot = DEVICE_OP.snapshot()
     if (snapshot.active_priority == "interactive" and
             snapshot.active_reason == "mounting and booting disk"):
-        return {
+        prompt = _mount_run_prompt_snapshot()
+        payload = {
             "u64deck_busy": True,
             "u64deck_busy_reason": "mount_run",
-            "u64deck_busy_label": "BUSY — loading program…",
-            "u64deck_retry_ms": 2000,
+            "u64deck_busy_label": (
+                "BUSY — physical F7 required…"
+                if prompt.get("active") and prompt.get("phase") == "physical_f7"
+                else "BUSY — loading program…"
+            ),
+            "u64deck_retry_ms": 350 if prompt.get("active") else 2000,
             "u64deck_mounts": _mount_state_snapshot(),
         }
+        if prompt.get("active"):
+            payload["u64deck_mount_run_prompt"] = prompt
+        return payload
     return None
+
+
+@app.post("/api/mount/run/cancel")
+def mount_run_cancel():
+    """Cancel a Legacy physical-F7 wait without touching the Ultimate."""
+    with _MOUNT_RUN_PROMPT_LOCK:
+        if not _MOUNT_RUN_PROMPT.get("active"):
+            raise HTTPException(409, "No cancellable Mount & Run prompt is active")
+        event = _MOUNT_RUN_PROMPT.get("cancel_event")
+        if not isinstance(event, threading.Event):
+            raise HTTPException(409, "Mount & Run cannot be cancelled at this stage")
+        event.set()
+        _MOUNT_RUN_PROMPT.update({
+            "phase": "cancelling",
+            "title": "Cancelling Mount & Run…",
+            "message": "The current wait is being released.",
+            "cancel_available": False,
+        })
+    _diag_event("info", "Mount & Run cancelled while waiting for physical F7")
+    return {"cancelled": True}
+
+
+@app.post("/api/mount/run/continue")
+def mount_run_continue():
+    """Continue the no-readmem Legacy fallback after the user confirms READY."""
+    with _MOUNT_RUN_PROMPT_LOCK:
+        if (_MOUNT_RUN_PROMPT.get("active") and
+                _MOUNT_RUN_PROMPT.get("phase") == "manual_continue"):
+            event = _MOUNT_RUN_PROMPT.get("continue_event")
+            if isinstance(event, threading.Event):
+                event.set()
+                return {"continued": True}
+    raise HTTPException(409, "Mount & Run is not waiting for manual confirmation")
 
 @app.get("/api/mount/options")
 def mount_options():
@@ -2350,17 +3070,38 @@ def _configured_boot_prekey() -> str:
     return prekey if prekey in _PREKEYS else ""
 
 
-def _send_boot_prekey(delay: float = 1.0, retry_window: float = 0.0) -> str | None:
-    """Press the configured cartridge-menu key after a tool-initiated reset.
+def _send_boot_prekey(delay: float = 1.0, retry_window: float = 0.0,
+                      *, cartridge_state: dict | None = None) -> str | None:
+    """Press a configured boot-menu key only when its target is confirmed.
 
-    Returns the token that was sent, or None when automation is disabled. A
-    reboot can briefly take port 64 offline, so callers may request retries.
+    F7 automation is intentionally narrow: only a live/cached Retro Replay
+    configuration may receive it, and Legacy KERNAL-buffer sessions never do.
+    Other configured prekeys retain their existing advanced behaviour.
     """
     prekey = _configured_boot_prekey()
     if not prekey:
         return None
-    prefer_matrix = _input_status().get("available", False)
     time.sleep(max(0.0, delay))
+    status = _input_status()
+    prefer_matrix = status.get("available", False)
+    if prekey == "F7":
+        state = (dict(cartridge_state) if isinstance(cartridge_state, dict)
+                 else _cartridge_preflight(require_confirmation=False))
+        classification = state.get("classification")
+        if classification != "retro_replay":
+            _diag_event(
+                "info",
+                "Auto F7 suppressed — configured cartridge is not confirmed Retro Replay",
+                cartridge_classification=classification or "unknown",
+                cartridge_source=state.get("source", ""),
+            )
+            return None
+        if not prefer_matrix:
+            _diag_event(
+                "info",
+                "Auto F7 suppressed on Legacy KERNAL buffer — physical F7 required",
+            )
+            return None
     deadline = time.monotonic() + max(0.0, retry_window)
     attempts = 0
     while True:
@@ -2371,7 +3112,11 @@ def _send_boot_prekey(delay: float = 1.0, retry_window: float = 0.0) -> str | No
                                "transition": "tap"}],
                              force_probe=attempts > 0)
             else:
-                _legacy_type(bytes([_PREKEYS[prekey]]))
+                _legacy_type(
+                    bytes([_PREKEYS[prekey]]),
+                    origin=f"boot-prekey-{prekey.lower()}",
+                    log_codes=True,
+                )
             return prekey
         except (UltimateError, httpx.HTTPError):
             if time.monotonic() >= deadline:
@@ -2380,12 +3125,17 @@ def _send_boot_prekey(delay: float = 1.0, retry_window: float = 0.0) -> str | No
             time.sleep(0.4)
 
 
-def _boot_settle():
-    """Wait out the reset, answering a cartridge boot menu if configured."""
+def _boot_settle(*, allow_prekey: bool = True,
+                 cartridge_state: dict | None = None):
+    """Wait out reset, sending only an explicitly approved cartridge key."""
     wait = float(CFG.get("boot_wait", 2.8))
-    prekey = _configured_boot_prekey()
+    prekey = _configured_boot_prekey() if allow_prekey else ""
+    sent = None
     if prekey:
-        _send_boot_prekey(min(1.0, wait))
+        sent = _send_boot_prekey(
+            min(1.0, wait), cartridge_state=cartridge_state
+        )
+    if sent:
         time.sleep(max(0.0, wait - 1.0) + 0.6)   # menu handoff margin
     else:
         time.sleep(wait)
@@ -2444,6 +3194,36 @@ def _read_basic_ready_flag() -> int | None:
     if key:
         _READMEM_SUPPORT[key] = True
     return data[0] if data else -1
+
+
+@app.get("/api/machine/basic-ready")
+def standalone_basic_ready_status():
+    """Return one non-blocking BASIC-editor readiness sample.
+
+    The Legacy Reset/Reboot guidance card polls this endpoint rather than
+    holding the coordinator while the user walks to the physical keyboard.
+    Each request performs at most one $00CC read and releases the coordinator
+    immediately. The browser debounces two consecutive ready samples.
+    """
+    if not CFG.get("u64_host"):
+        raise HTTPException(503, "No device configured — use Select Ultimate…")
+    try:
+        with DEVICE_OP.operation(
+            "status",
+            "checking standalone BASIC readiness",
+            max_wait_seconds=0.25,
+        ):
+            value = _read_basic_ready_flag()
+    except OperationExpired:
+        return {"busy": True, "supported": True, "ready": False}
+    if value is None:
+        return {"busy": False, "supported": False, "ready": False, "value": None}
+    return {
+        "busy": False,
+        "supported": True,
+        "ready": value == 0,
+        "value": int(value),
+    }
 
 
 _MOUNT_RUN_MATRIX_CHAR_INPUTS = {
@@ -2508,7 +3288,11 @@ def _type_mount_run_load(data: bytes) -> tuple[bool, str]:
         )
         return True, "CIA1 matrix"
 
-    _legacy_type(payload)
+    _legacy_type(
+        payload,
+        origin="mount-run-load",
+        log_codes=True,
+    )
     _diag_event(
         "info",
         "Mount & Run LOAD delivery: Legacy KERNAL buffer "
@@ -2520,7 +3304,8 @@ def _type_mount_run_load(data: bytes) -> tuple[bool, str]:
 def _basic_ready_gate(stage: str, *, timeout: float = _BASIC_GATE_TIMEOUT,
                       poll: float = _BASIC_GATE_POLL, grace: float = 0.0,
                       reader=None, sleeper=time.sleep,
-                      clock=time.monotonic) -> str:
+                      clock=time.monotonic,
+                      cancel_event: threading.Event | None = None) -> str:
     """Wait until two consecutive reads show the BASIC editor is ready.
 
     Returns ``ready``, ``timeout`` or ``unsupported``. Every completion is
@@ -2541,11 +3326,19 @@ def _basic_ready_gate(stage: str, *, timeout: float = _BASIC_GATE_TIMEOUT,
         )
         return result
 
+    if cancel_event is not None and cancel_event.is_set():
+        return finish("cancelled")
     if grace > 0:
-        sleeper(grace)
+        if cancel_event is not None and sleeper is time.sleep:
+            if cancel_event.wait(grace):
+                return finish("cancelled")
+        else:
+            sleeper(grace)
     deadline = started + max(1.0, float(timeout))
     consecutive = 0
     while True:
+        if cancel_event is not None and cancel_event.is_set():
+            return finish("cancelled")
         last_value = reader()
         if last_value is None:
             return finish("unsupported")
@@ -2557,7 +3350,12 @@ def _basic_ready_gate(stage: str, *, timeout: float = _BASIC_GATE_TIMEOUT,
             consecutive = 0
         if clock() >= deadline:
             return finish("timeout")
-        sleeper(max(0.0, float(poll)))
+        delay = max(0.0, float(poll))
+        if cancel_event is not None and sleeper is time.sleep:
+            if cancel_event.wait(delay):
+                return finish("cancelled")
+        else:
+            sleeper(delay)
 
 
 def _bus_id_for(drive: str) -> int:
@@ -2598,7 +3396,11 @@ def _dispatch_run_after_gate() -> tuple[bool, str]:
         _diag_event("info", "Mount & Run RUN delivery: CIA1 matrix")
         return True, "CIA1 matrix"
 
-    _legacy_type(b"RUN\r")
+    _legacy_type(
+        b"RUN\r",
+        origin="mount-run-run",
+        log_codes=True,
+    )
     _diag_event("info", "Mount & Run RUN delivery: Legacy KERNAL buffer")
     return True, "Legacy KERNAL buffer"
 
@@ -2607,82 +3409,202 @@ def _mount_and_boot(drive: str, mode: str, *, device_path: str = None,
                     name: str = None, data: bytes = None):
     """Mount an image and autostart it: reset, LOAD"*",{bus},1 + RUN.
 
-    Readiness gates protect both stages when machine:readmem is available.
-    CIA1-capable U64s deliver the complete LOAD and RUN lines through ordered
-    matrix key taps. Legacy devices retain the established one-shot KERNAL
-    buffer path; a readmem 404 retains the fixed-delay readiness behaviour.
+    Cartridge state is confirmed from the firmware immediately before reset.
+    Automatic F7 is supported only for configured Retro Replay on CIA1. Legacy
+    Retro Replay uses the physical-key overlay; other configured cartridges
+    receive a generic reach-BASIC prompt. No cartridge follows the normal BASIC
+    path with no prompt or F7 action.
     """
     drive, mode = _drive_key(drive), _mount_mode(mode)
     _health_set_activity("Mount & Run", "preparing", name or device_path or drive)
-    with DEVICE_OP.operation("interactive", "mounting and booting disk"):
-        _juke_disarm_machine_takeover("Mount & Run")
-        cached_input = _cached_input_status(rest)
-        matrix_expected = cached_input.get("available") is True
-        released = _matrix_release_all(
-            silent=True,
-            cached_only=True,
-            caller="mount-run-start",
-        )
-        if matrix_expected and not released:
-            note = "CIA1 matrix release failed — Mount & Run aborted"
-            _warn_event("mount-input-release", f"Mount & Run: {note}")
-            return {"errors": [], "typed": "", "note": note}
-        _health_set_activity("Mount & Run", "SID recovery")
-        _sid_runner_reboot_before_mount_run()
-        _health_set_activity("Mount & Run", "mounting image")
-        if device_path:
-            rest.mount_path(drive, device_path, mode=mode)
-        else:
-            rest.mount_attachment(drive, name, data, mode=mode)
-        _remember_mount(drive, mode, path=device_path or "", name=name or (device_path or "").rsplit("/", 1)[-1])
-        _health_set_activity("Mount & Run", "reset and boot settle")
-        rest.put("/v1/machine:reset")
-        _boot_settle()
-        bus_id = _bus_id_for(drive)
-        load_line = f'LOAD"*",{bus_id},1'
+    prompt_generation = 0
+    prompt_kind = ""
+    try:
+        with DEVICE_OP.operation("interactive", "mounting and booting disk"):
+            _juke_disarm_machine_takeover("Mount & Run")
+            input_status = _cached_input_status(rest)
+            if input_status.get("available") is None:
+                input_status = _input_status(rest)
+            matrix_expected = input_status.get("available") is True
+            released = _matrix_release_all(
+                silent=True,
+                cached_only=True,
+                caller="mount-run-start",
+            )
+            if matrix_expected and not released:
+                note = "CIA1 matrix release failed — Mount & Run aborted"
+                _warn_event("mount-input-release", f"Mount & Run: {note}")
+                return {"errors": [], "typed": "", "note": note}
 
-        _health_set_activity("Mount & Run", "waiting for BASIC")
-        boot_gate = _basic_ready_gate("boot")
-        if boot_gate == "timeout":
-            note = "machine not ready — LOAD not typed"
-            _warn_event("mount-boot-gate", f"Mount & Run: {note}")
-            return {"errors": [], "typed": "", "note": note}
+            _health_set_activity("Mount & Run", "runner recovery")
+            temporary_rebooted = _temporary_crt_reboot_before_mount_run()
+            if not temporary_rebooted:
+                _sid_runner_reboot_before_mount_run()
 
-        _health_set_activity("Mount & Run", "typing LOAD")
-        load_sent, load_delivery = _type_mount_run_load(
-            (load_line + "\r").encode()
-        )
-        if not load_sent:
-            note = f"LOAD not completed — {load_delivery}"
-            _warn_event("mount-load-delivery", f"Mount & Run: {note}")
-            return {"errors": [], "typed": "", "note": note}
+            _health_set_activity("Mount & Run", "checking cartridge")
+            cartridge = _cartridge_preflight(require_confirmation=True)
+            plan = _cartridge_boot_plan(input_status, cartridge)
+            prompt_kind = str(plan.get("prompt_kind") or "")
+            prompt_required = bool(prompt_kind)
+            _diag_event(
+                "info",
+                "Mount & Run cartridge preflight",
+                cartridge=cartridge.get("label", "Unknown"),
+                cartridge_classification=cartridge.get("classification", "unknown"),
+                cartridge_source=cartridge.get("source", ""),
+                cartridge_cache_age_seconds=cartridge.get("age_seconds"),
+                input="CIA1" if matrix_expected else "Legacy KERNAL buffer",
+                automatic_f7=bool(plan.get("automatic_prekey")),
+                prompt=prompt_kind or "none",
+            )
 
-        if boot_gate == "unsupported":
-            time.sleep(0.4)
-            _health_set_activity("Mount & Run", "typing RUN")
-            delivered, delivery = _dispatch_run_after_gate()
-            if delivered:
-                return {"errors": [], "typed": f"{load_line} + RUN"}
-            return {"errors": [], "typed": load_line, "note": delivery}
+            _health_set_activity("Mount & Run", "mounting image")
+            if device_path:
+                rest.mount_path(drive, device_path, mode=mode)
+            else:
+                rest.mount_attachment(drive, name, data, mode=mode)
+            _remember_mount(
+                drive, mode, path=device_path or "",
+                name=name or (device_path or "").rsplit("/", 1)[-1],
+            )
 
-        _health_set_activity("Mount & Run", "waiting for LOAD")
-        load_gate = _basic_ready_gate("load", grace=1.0)
-        if load_gate == "ready":
-            delivered, delivery = _dispatch_run_after_gate()
-            if delivered:
-                return {"errors": [], "typed": f"{load_line} + RUN"}
-            return {"errors": [], "typed": load_line,
-                    "note": delivery}
-        if load_gate == "unsupported":
-            time.sleep(0.4)
-            delivered, delivery = _dispatch_run_after_gate()
-            if delivered:
-                return {"errors": [], "typed": f"{load_line} + RUN"}
-            return {"errors": [], "typed": load_line, "note": delivery}
+            cancel_event = None
+            continue_event = None
+            if prompt_required:
+                prompt_generation, cancel_event, continue_event = _mount_run_prompt_begin(plan)
+                if prompt_kind == "physical_f7":
+                    message = "Mount & Run: Retro Replay on Legacy input requires physical F7"
+                    phase = "waiting for physical F7"
+                else:
+                    message = "Mount & Run: configured cartridge requires manual BASIC startup"
+                    phase = "waiting for cartridge startup"
+                _diag_event("info", message)
+                _health_set_activity("Mount & Run", phase)
 
-        note = "load still running — RUN not sent"
-        _warn_event("mount-load-gate", f"Mount & Run: {note}")
-        return {"errors": [], "typed": load_line, "note": note}
+            _health_set_activity("Mount & Run", "reset and boot settle")
+            rest.put("/v1/machine:reset")
+            cancelled_during_settle = False
+            if prompt_required:
+                settle = max(0.0, float(CFG.get("boot_wait", 2.8))) + 0.6
+                cancelled_during_settle = bool(cancel_event.wait(settle))
+            else:
+                _boot_settle(
+                    allow_prekey=bool(plan.get("automatic_prekey")),
+                    cartridge_state=cartridge,
+                )
+            bus_id = _bus_id_for(drive)
+            load_line = f'LOAD"*",{bus_id},1'
+
+            wait_phase = (
+                "waiting for physical F7" if prompt_kind == "physical_f7"
+                else "waiting for cartridge startup" if prompt_required
+                else "waiting for BASIC"
+            )
+            _health_set_activity("Mount & Run", wait_phase)
+            boot_gate = (
+                "cancelled" if cancelled_during_settle
+                else _basic_ready_gate("boot", cancel_event=cancel_event)
+            )
+            if boot_gate == "cancelled":
+                note = "cancelled while waiting for cartridge startup — LOAD not typed"
+                _warn_event("mount-boot-gate", f"Mount & Run: {note}")
+                return {"errors": [], "typed": "", "note": note}
+            if boot_gate == "unsupported" and prompt_required:
+                if prompt_kind == "physical_f7":
+                    manual_title = "Physical F7 required"
+                    manual_message = (
+                        "Press F7 on the C64 keyboard, wait for BASIC READY, "
+                        "then choose Continue."
+                    )
+                else:
+                    manual_title = "Cartridge startup requires attention"
+                    manual_message = (
+                        "Use the cartridge's physical controls to reach BASIC READY, "
+                        "then choose Continue."
+                    )
+                _mount_run_prompt_update(
+                    prompt_generation,
+                    phase="manual_continue",
+                    title=manual_title,
+                    message=manual_message,
+                    cancel_available=True,
+                )
+                _health_set_activity("Mount & Run", "waiting for confirmation")
+                boot_gate = _mount_run_wait_for_continue(
+                    cancel_event, continue_event, _BASIC_GATE_TIMEOUT
+                )
+                _diag_event(
+                    "info",
+                    f"Mount & Run cartridge no-readmem confirmation: {boot_gate}",
+                )
+            if boot_gate == "cancelled":
+                note = "cancelled while waiting for cartridge startup — LOAD not typed"
+                _warn_event("mount-boot-gate", f"Mount & Run: {note}")
+                return {"errors": [], "typed": "", "note": note}
+            if boot_gate == "timeout":
+                note = (
+                    "cartridge startup/BASIC readiness timed out — LOAD not typed"
+                    if prompt_required else "machine not ready — LOAD not typed"
+                )
+                _warn_event("mount-boot-gate", f"Mount & Run: {note}")
+                return {"errors": [], "typed": "", "note": note}
+
+            if prompt_required:
+                detected_title = (
+                    "Fastload detected — continuing…"
+                    if prompt_kind == "physical_f7"
+                    else "BASIC detected — continuing…"
+                )
+                _mount_run_prompt_update(
+                    prompt_generation,
+                    phase="detected",
+                    title=detected_title,
+                    message="BASIC is ready. u64deck is preparing the LOAD command.",
+                    cancel_available=False,
+                )
+                _health_set_activity("Mount & Run", detected_title.rstrip("…"))
+                time.sleep(0.8)
+                _mount_run_prompt_finish(prompt_generation)
+                prompt_generation = 0
+
+            _health_set_activity("Mount & Run", "typing LOAD")
+            load_sent, load_delivery = _type_mount_run_load(
+                (load_line + "\r").encode()
+            )
+            if not load_sent:
+                note = f"LOAD not completed — {load_delivery}"
+                _warn_event("mount-load-delivery", f"Mount & Run: {note}")
+                return {"errors": [], "typed": "", "note": note}
+
+            if boot_gate == "unsupported":
+                time.sleep(0.4)
+                _health_set_activity("Mount & Run", "typing RUN")
+                delivered, delivery = _dispatch_run_after_gate()
+                if delivered:
+                    return {"errors": [], "typed": f"{load_line} + RUN"}
+                return {"errors": [], "typed": load_line, "note": delivery}
+
+            _health_set_activity("Mount & Run", "waiting for LOAD")
+            load_gate = _basic_ready_gate("load", grace=1.0)
+            if load_gate == "ready":
+                delivered, delivery = _dispatch_run_after_gate()
+                if delivered:
+                    return {"errors": [], "typed": f"{load_line} + RUN"}
+                return {"errors": [], "typed": load_line,
+                        "note": delivery}
+            if load_gate == "unsupported":
+                time.sleep(0.4)
+                delivered, delivery = _dispatch_run_after_gate()
+                if delivered:
+                    return {"errors": [], "typed": f"{load_line} + RUN"}
+                return {"errors": [], "typed": load_line, "note": delivery}
+
+            note = "load still running — RUN not sent"
+            _warn_event("mount-load-gate", f"Mount & Run: {note}")
+            return {"errors": [], "typed": load_line, "note": note}
+    finally:
+        if prompt_generation:
+            _mount_run_prompt_finish(prompt_generation)
 
 
 @app.put("/api/mount/run/device")
@@ -2723,15 +3645,12 @@ async def mount_run_upload(drive: str = Form("a"), mode: str = Form("readwrite")
 
 # --- runners ------------------------------------------------------------
 
-_CART_CAT = "C64 and Cartridge Settings"
-_CART_ITEM = "Cartridge"
-
-
 def _cart_configured() -> str:
-    """Currently configured cartridge (CRT path), or '' for none."""
+    """Currently configured cartridge (CRT path), or '' when unavailable/none."""
     try:
-        j = rest.get_json(f"/v1/configs/{_CART_CAT}")
-        return str((j.get(_CART_CAT) or {}).get(_CART_ITEM) or "")
+        return str(_refresh_cartridge_cache(
+            client=rest, source="cartridge-safe runner read"
+        ).get("value") or "")
     except Exception:
         return ""
 
@@ -2849,7 +3768,8 @@ def _bcd_byte(value: int) -> int:
     return ((value // 10) << 4) | (value % 10)
 
 
-def _sid_ssl_payload(data: bytes) -> bytes | None:
+def _sid_ssl_payload(data: bytes, *, songnr: int | None = None,
+                     extension_secs: float = 0.0) -> bytes | None:
     """Build the Ultimate player's compact per-SID ``.ssl`` length array.
 
     The firmware reads at most 512 bytes and expects two packed-BCD bytes per
@@ -2870,7 +3790,8 @@ def _sid_ssl_payload(data: bytes) -> bytes | None:
             payload.extend((0, 0))
             continue
         try:
-            total = max(0, int(float(times[index]) + 0.5))
+            extra = float(extension_secs) if songnr and index + 1 == int(songnr) else 0.0
+            total = max(0, int(float(times[index]) + max(0.0, extra) + 0.5))
         except (TypeError, ValueError, OverflowError):
             payload.extend((0, 0))
             continue
@@ -2960,10 +3881,16 @@ def _sid_runner_reboot_before_mount_run() -> bool:
     return True
 
 
-def _post_sid_upload(filename: str, data: bytes, songnr: int | None = None):
+def _post_sid_upload(filename: str, data: bytes, songnr: int | None = None,
+                     *, songlength_extension_secs: float = 0.0):
     """Upload a SID and remember that a later disk launch may need reboot."""
     params = {"songnr": int(songnr)} if songnr else {}
-    ssl_payload = _sid_ssl_payload(data)
+    if songlength_extension_secs > 0 and songnr:
+        ssl_payload = _sid_ssl_payload(
+            data, songnr=songnr, extension_secs=songlength_extension_secs
+        )
+    else:
+        ssl_payload = _sid_ssl_payload(data)
     ssl_name = Path(filename).with_suffix(".ssl").name
     active_rest = rest
     result = active_rest.post_sid(
@@ -2986,9 +3913,9 @@ def run_device(path: str = Query(...)):
                 lambda: rest.run_prg(name + ".prg", prg))
         runner = _runner_for(path)
         if runner == "run_crt":
-            return _run_direct_takeover(
+            return _run_temporary_crt(
                 lambda: rest.put(f"/v1/runners:{runner}", file=path),
-                "running cartridge",
+                "running cartridge", path,
             )
         return _run_cart_safe(lambda: rest.put(f"/v1/runners:{runner}", file=path))
     except ValueError as e:
@@ -3008,9 +3935,9 @@ async def run_upload(file: UploadFile = File(...)):
         runner = _runner_for(name)
         if runner == "run_crt":
             return await run_in_threadpool(
-                _run_direct_takeover,
+                _run_temporary_crt,
                 lambda: rest.post_file(f"/v1/runners:{runner}", name, data),
-                "running cartridge",
+                "running cartridge", name,
             )
         if runner == "sidplay":
             return await run_in_threadpool(
@@ -3027,7 +3954,7 @@ async def run_upload(file: UploadFile = File(...)):
 # --- keyboard -----------------------------------------------------------
 
 @app.post("/api/keys")
-def keys(payload: dict = Body(...)):
+def keys(request: Request, payload: dict = Body(...)):
     """{"text": "..."} for ASCII text, or {"petscii": [13, 65, ...]} raw codes."""
     data = b""
     if "text" in payload:
@@ -3038,9 +3965,34 @@ def keys(payload: dict = Body(...)):
         raise HTTPException(400, "nothing to type")
     if len(data) > 512:
         raise HTTPException(400, "too much text at once")
+
+    origin = str(request.headers.get("X-U64deck-Key-Origin") or "manual-api")[:40]
+    busy = _mount_run_busy_payload()
+    if busy:
+        message = "Mount & Run is in progress — Legacy keys were not queued"
+        _diag_event("warning", f"{message} (origin={origin})")
+        raise HTTPException(409, message)
+    if (origin == "screen-mirror" and 136 in data and
+            _cached_input_status(rest).get("available") is False):
+        message = "Physical F7 is required on Legacy KERNAL-buffer input"
+        _diag_event("warning", f"Legacy screen F7 suppressed: {message}")
+        raise HTTPException(409, message)
     try:
-        _legacy_type(data)
-        return {"errors": [], "sent": len(data)}
+        result = _legacy_type(
+            data,
+            max_wait_seconds=_MANUAL_INPUT_MAX_WAIT,
+            origin=origin,
+            log_codes=True,
+        )
+        return {
+            "errors": [],
+            "sent": len(data),
+            "wait_seconds": round(float((result or {}).get("wait_seconds", 0.0)), 3),
+        }
+    except OperationExpired as exc:
+        message = "Legacy key request expired before delivery — nothing was sent"
+        _diag_event("warning", f"{message} (origin={origin}): {exc}")
+        raise HTTPException(409, message) from exc
     except UltimateError as e:
         err(e)
 
@@ -3415,6 +4367,115 @@ async def _asm_fetch_binary(id: str, category: int, item: str) -> bytes:
             return b"".join(chunks)
 
 
+def _asm_manifest_rows(payload: dict) -> list[dict]:
+    """Validate the release-file manifest supplied by the Assembly64 UI."""
+    raw = payload.get("manifest") or []
+    if not isinstance(raw, list):
+        raise HTTPException(400, "Assembly64 manifest must be a list")
+    if len(raw) > 2000:
+        raise HTTPException(400, "Assembly64 manifest is unexpectedly large")
+    rows, seen = [], set()
+    for entry in raw:
+        if (not isinstance(entry, dict) or "item" not in entry
+                or entry.get("item") is None):
+            continue
+        item = str(entry.get("item"))
+        filename = str(entry.get("filename") or "").strip()
+        if not item or not filename or len(filename) > 1024:
+            continue
+        key = (item, filename.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({"item": item, "filename": filename})
+    return rows
+
+
+def _asm_related_manifest(filename: str, item: str, manifest: list[dict]) -> list[dict]:
+    """Return the conservatively matched disk family from one release manifest."""
+    selected = {"item": str(item), "filename": filename}
+    rows = list(manifest)
+    # The selected file is authoritative even when an older client omits the
+    # manifest or the service returned duplicate/stale metadata.
+    rows = [row for row in rows
+            if not (row["item"] == selected["item"] or
+                    row["filename"].casefold() == filename.casefold())]
+    rows.append(selected)
+    parent = filename.rsplit("/", 1)[0].casefold() if "/" in filename else ""
+    disk_rows = [row for row in rows
+                 if row["filename"].casefold().endswith(_SWAP_IMAGE_EXTENSIONS)
+                 and ((row["filename"].rsplit("/", 1)[0].casefold()
+                       if "/" in row["filename"] else "") == parent)]
+    # Match basenames within the selected release subfolder, then map the
+    # ordered result back to the service's original path and content ID.
+    basenames = [row["filename"].rsplit("/", 1)[-1] for row in disk_rows]
+    current_name = filename.rsplit("/", 1)[-1]
+    names = _swap_group_candidates(current_name, basenames)
+    lookup = {row["filename"].rsplit("/", 1)[-1].casefold(): row
+              for row in disk_rows}
+    related = [lookup[name.casefold()] for name in names if name.casefold() in lookup]
+    return related or [selected]
+
+
+async def _asm_fetch_disk_set(release_id: str, category: int, item: str,
+                              filename: str, payload: dict) -> list[dict]:
+    """Download only the selected file's confidently matched disk family."""
+    related = _asm_related_manifest(
+        filename, item, _asm_manifest_rows(payload)
+    )
+    if len(related) > MAX_SWAP_FILES:
+        raise HTTPException(413, f"swap sets are limited to {MAX_SWAP_FILES} files")
+    fetched, total = [], 0
+    for row in related:
+        data = await _asm_fetch_binary(release_id, category, row["item"])
+        total += len(data)
+        if total > MAX_SWAP_TOTAL:
+            raise HTTPException(413, "Assembly64 disk set exceeds the 96 MiB memory limit")
+        fetched.append({"label": row["filename"], "kind": "mem",
+                        "name": row["filename"], "data": data,
+                        "item": row["item"]})
+    return fetched
+
+
+def _asm_deploy_disk_set(filename: str, item: str, action: str,
+                         items: list[dict]):
+    """Arm the Assembly64 swap queue before mounting/running the selected disk."""
+    if not items:
+        raise ValueError("Assembly64 disk set is empty")
+    selected_index = next((index for index, row in enumerate(items)
+                           if row.get("item") == str(item)), -1)
+    if selected_index < 0:
+        selected_index = next((index for index, row in enumerate(items)
+                               if row["label"].casefold() == filename.casefold()), 0)
+    selected = items[selected_index]
+    drive = action[-1] if action in {"mount_a", "mount_b"} else "a"
+    mode = _mount_mode(None)
+    labels = [row["label"] for row in items]
+    decision = _swap_decision(filename, labels, "assembly64")
+    SWAP.update({"items": items, "index": selected_index, "drive": drive,
+                 "mode": mode, "source": "assembly64", "decision": decision})
+
+    if action in {"mount_a", "mount_b"}:
+        _matrix_release_all(silent=True, caller=f"assembly64-{action}")
+        out = rest.mount_attachment(drive, selected["name"], selected["data"], mode=mode)
+        _remember_mount(drive, mode, name=selected["name"])
+        return _swap_response(out)
+    if action == "mount_run":
+        return _swap_response(_mount_and_boot(
+            "a", mode, name=selected["name"], data=selected["data"]
+        ))
+
+    def mount_and_reset():
+        _matrix_release_all(silent=True, caller="assembly64-disk-run")
+        out = rest.mount_attachment("a", selected["name"], selected["data"], mode=mode)
+        _remember_mount("a", mode, name=selected["name"])
+        rest.put("/v1/machine:reset")
+        return out
+    return _swap_response(_run_direct_takeover(
+        mount_and_reset, "running Assembly64 disk"
+    ))
+
+
 def _asm_deploy_bytes(filename: str, action: str, data: bytes):
     """Synchronous device half of Assembly64 deploy (run in worker thread)."""
     low = filename.lower()
@@ -3440,9 +4501,9 @@ def _asm_deploy_bytes(filename: str, action: str, data: bytes):
             return out
         return _run_direct_takeover(mount_and_reset, "running Assembly64 disk")
     if low.endswith(".crt"):
-        return _run_direct_takeover(
+        return _run_temporary_crt(
             lambda: rest.post_file("/v1/runners:run_crt", filename, data),
-            "running Assembly64 cartridge",
+            "running Assembly64 cartridge", filename,
         )
     if low.endswith(".sid"):
         return _run_cart_safe(lambda: _post_sid_upload(filename, data))
@@ -3456,22 +4517,30 @@ def _asm_deploy_bytes(filename: str, action: str, data: bytes):
 async def asm64_deploy(payload: dict = Body(...)):
     """Download a file from Assembly64 and act on it.
 
-    payload: {id, category, item (contentEntry id or index), filename,
-              action: run|mount_run|mount_a|mount_b|inspect}
+    Disk actions may also include the release ``manifest``. u64deck applies the
+    existing conservative matcher to that manifest, downloads only a confident
+    family, and arms Disk Swap before the selected image is mounted.
     """
     for k in ("id", "category", "item", "filename", "action"):
         if k not in payload:
             raise HTTPException(400, f"missing {k}")
-    try:
-        data = await _asm_fetch_binary(str(payload["id"]), int(payload["category"]),
-                                       str(payload["item"]))
-    except httpx.HTTPError as e:
-        err(e)
+    release_id = str(payload["id"])
+    category = int(payload["category"])
+    item = str(payload["item"])
     filename = str(payload["filename"]) or "download.prg"
     action = payload["action"]
     if action not in {"run", "mount_run", "mount_a", "mount_b", "inspect"}:
         raise HTTPException(400, "unknown Assembly64 action")
     try:
+        if (filename.casefold().endswith(_SWAP_IMAGE_EXTENSIONS)
+                and action != "inspect"):
+            items = await _asm_fetch_disk_set(
+                release_id, category, item, filename, payload
+            )
+            return await run_in_threadpool(
+                _asm_deploy_disk_set, filename, item, action, items
+            )
+        data = await _asm_fetch_binary(release_id, category, item)
         return await run_in_threadpool(_asm_deploy_bytes, filename, action, data)
     except ValueError as e:
         err(e, 400)
@@ -4084,6 +5153,262 @@ def fs_index_status():
     return out
 
 
+def _disk_naming_report(*, include_all_sets: bool = False) -> dict:
+    store = _index_store()
+    rows = store.disk_image_files(DISK_NAMING_EXTENSIONS)
+    return analyse_disk_names(
+        rows,
+        _swap_signature,
+        rules=store.disk_group_rules(),
+        overrides=store.disk_group_overrides(),
+        include_all_sets=include_all_sets,
+    )
+
+
+def _ambiguous_exact_sets(report: dict) -> dict[str, dict]:
+    """Return all currently ambiguous exact sets keyed by stable set ID."""
+    result = {}
+    for bucket in report.get("ambiguous", []):
+        for item in bucket.get("all_sets", []):
+            set_id = str(item.get("set_id") or "")
+            if not set_id:
+                continue
+            result[set_id] = {
+                "set_id": set_id,
+                "parent": str(item.get("parent") or "/"),
+                "names": [str(name) for name in item.get("names", [])],
+                "pattern": str(bucket.get("pattern") or "ambiguous"),
+            }
+    return result
+
+
+def _disk_rule_match_count(rows: list[dict], rule: dict) -> int:
+    by_parent: dict[str, list[str]] = {}
+    for row in rows:
+        by_parent.setdefault(str(row.get("parent") or "/"), []).append(str(row.get("name") or ""))
+    count = 0
+    for parent, names in by_parent.items():
+        seen = set()
+        for name in names:
+            signature = _custom_swap_signature(name, rule, parent)
+            if not signature or signature[0] in seen:
+                continue
+            seen.add(signature[0])
+            if len(_group_with_custom_rule(name, names, rule, parent)) >= 2:
+                count += 1
+    return count
+
+
+@app.get("/api/fs/index/disk-naming")
+def fs_disk_naming_analysis():
+    """Analyse only filenames already present in the SQLite storage index."""
+    return _disk_naming_report()
+
+
+@app.post("/api/fs/index/disk-naming/rules")
+def fs_disk_naming_rule_approve(payload: dict = Body(...)):
+    pattern_key = str(payload.get("pattern_key") or "")
+    if not pattern_key:
+        raise HTTPException(400, "pattern_key is required")
+    report = _disk_naming_report()
+    candidate = candidate_by_key(report, pattern_key)
+    if not candidate:
+        raise HTTPException(409, "that pattern is no longer an unrecognised candidate; analyse again")
+    scope = str(payload.get("scope") or "/").strip() or "/"
+    if scope != "/" and not any(
+        str(example.get("parent") or "").casefold() == scope.rstrip("/").casefold()
+        for example in candidate.get("examples", [])
+    ):
+        raise HTTPException(400, "path-scoped approval must use a folder shown by the analysis")
+    try:
+        clean = validate_rule({
+            "kind": candidate["kind"],
+            "delimiter": candidate["delimiter"],
+            "tokens": candidate["tokens"],
+            "extensions": candidate["extensions"],
+            "scope": scope,
+        })
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    rule = {
+        **clean,
+        "pattern_key": rule_pattern_key(clean),
+        "label": candidate["pattern"],
+        "origin": "user-approved analyser candidate",
+        "examples": candidate.get("examples", [])[:8],
+    }
+    rows = _index_store().disk_image_files(DISK_NAMING_EXTENSIONS)
+    rule["last_match_count"] = _disk_rule_match_count(rows, rule)
+    saved = _index_store().add_disk_group_rule(rule)
+    _diag_event(
+        "info",
+        f"Approved disk-grouping pattern {saved['label']}",
+        operation="disk naming rule approval",
+        rule_id=saved["id"], scope=saved["scope"],
+        match_count=saved["last_match_count"],
+    )
+    return {"approved": saved, "analysis": _disk_naming_report()}
+
+
+@app.put("/api/fs/index/disk-naming/rules/{rule_id}")
+def fs_disk_naming_rule_update(rule_id: int, payload: dict = Body(...)):
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(400, "enabled must be true or false")
+    rule = _index_store().set_disk_group_rule_enabled(rule_id, enabled)
+    if not rule:
+        raise HTTPException(404, "disk-grouping rule not found")
+    _diag_event(
+        "info",
+        f"{'Enabled' if enabled else 'Disabled'} disk-grouping pattern {rule['label']}",
+        operation="disk naming rule state", rule_id=rule_id,
+    )
+    return {"rule": rule, "analysis": _disk_naming_report()}
+
+
+@app.delete("/api/fs/index/disk-naming/rules/{rule_id}")
+def fs_disk_naming_rule_delete(rule_id: int):
+    if not _index_store().delete_disk_group_rule(rule_id):
+        raise HTTPException(404, "disk-grouping rule not found")
+    _diag_event("info", "Removed an approved disk-grouping pattern",
+                operation="disk naming rule removal", rule_id=rule_id)
+    return {"removed": rule_id, "analysis": _disk_naming_report()}
+
+
+@app.post("/api/fs/index/disk-naming/overrides")
+def fs_disk_naming_override_approve(payload: dict = Body(...)):
+    parent = str(payload.get("parent") or "").rstrip("/") or "/"
+    names = [str(name) for name in (payload.get("names") or []) if str(name)]
+    if len({name.casefold() for name in names}) < 2:
+        raise HTTPException(400, "an exact disk set requires at least two unique filenames")
+    rows = _index_store().disk_image_files(DISK_NAMING_EXTENSIONS)
+    available = {row["name"].casefold(): row["name"] for row in rows
+                 if str(row.get("parent") or "/").casefold() == parent.casefold()}
+    if any(name.casefold() not in available for name in names):
+        raise HTTPException(409, "one or more filenames are no longer present in that indexed folder")
+    clean_names = [available[name.casefold()] for name in names]
+    try:
+        saved = _index_store().add_disk_group_override(
+            parent, clean_names, str(payload.get("label") or "approved exact disk set")
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    _diag_event(
+        "info",
+        f"Approved exact disk set with {len(saved['names'])} images",
+        operation="disk naming exact-set approval",
+        override_id=saved["id"], parent=parent,
+    )
+    return {"approved": saved, "analysis": _disk_naming_report()}
+
+
+@app.post("/api/fs/index/disk-naming/overrides/batch")
+def fs_disk_naming_override_batch_approve(payload: dict = Body(...)):
+    """Approve selected, folder-scoped or all ambiguous sets as exact overrides."""
+    raw_ids = payload.get("set_ids") or []
+    set_ids = [str(value) for value in raw_ids if str(value)]
+    raw_parent = str(payload.get("parent") or "").strip()
+    has_parent = bool(raw_parent)
+    parent = (raw_parent.rstrip("/") or "/") if has_parent else ""
+    all_ambiguous = payload.get("all_ambiguous") is True
+    if sum((bool(set_ids), has_parent, all_ambiguous)) != 1:
+        raise HTTPException(400, "supply set_ids, one parent folder or all_ambiguous")
+    if len(set(set_ids)) > 5000:
+        raise HTTPException(400, "too many ambiguous sets in one approval request")
+
+    report = _disk_naming_report(include_all_sets=True)
+    available = _ambiguous_exact_sets(report)
+    if all_ambiguous:
+        selected = list(available.values())
+    elif parent:
+        selected = [item for item in available.values()
+                    if item["parent"].casefold() == parent.casefold()]
+    else:
+        requested = list(dict.fromkeys(set_ids))
+        missing = [set_id for set_id in requested if set_id not in available]
+        if missing:
+            raise HTTPException(409, "one or more selected sets are no longer ambiguous; analyse again")
+        selected = [available[set_id] for set_id in requested]
+    if len(selected) > 5000:
+        raise HTTPException(400, "too many ambiguous sets in one approval request")
+    if not selected:
+        raise HTTPException(409, "no current ambiguous disk sets matched this approval")
+
+    try:
+        saved = _index_store().add_disk_group_overrides_batch([{
+            "parent": item["parent"],
+            "names": item["names"],
+            "label": f"approved ambiguous set ({item['pattern']})",
+        } for item in selected])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    files = sum(len(item["names"]) for item in selected)
+    folders = len({item["parent"].casefold() for item in selected})
+    _diag_event(
+        "info",
+        f"Approved {len(saved)} ambiguous disk sets as exact local overrides",
+        operation="disk naming batch exact-set approval",
+        sets=len(saved), files=files, folders=folders,
+    )
+    return {
+        "approved": saved,
+        "summary": {"sets": len(saved), "files": files, "folders": folders},
+        "analysis": _disk_naming_report(),
+    }
+
+
+@app.post("/api/fs/index/disk-naming/overrides/manage")
+def fs_disk_naming_override_batch_manage(payload: dict = Body(...)):
+    action = str(payload.get("action") or "")
+    ids = payload.get("ids") or []
+    try:
+        result = _index_store().manage_disk_group_overrides(ids, action)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except KeyError as exc:
+        raise HTTPException(409, str(exc).strip("'"))
+    _diag_event(
+        "info",
+        f"{result['action'].title()}d {result['count']} approved exact disk sets",
+        operation="disk naming batch exact-set management",
+        action=result["action"], count=result["count"],
+    )
+    return {"result": result, "analysis": _disk_naming_report()}
+
+
+@app.delete("/api/fs/index/disk-naming/approvals")
+def fs_disk_naming_remove_all_approvals():
+    removed = _index_store().remove_all_disk_group_approvals()
+    _diag_event(
+        "info",
+        f"Removed all local disk-grouping approvals ({removed['rules']} rules, "
+        f"{removed['overrides']} exact sets)",
+        operation="disk naming remove all local approvals",
+        **removed,
+    )
+    return {"removed": removed, "analysis": _disk_naming_report()}
+
+
+@app.put("/api/fs/index/disk-naming/overrides/{override_id}")
+def fs_disk_naming_override_update(override_id: int, payload: dict = Body(...)):
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(400, "enabled must be true or false")
+    item = _index_store().set_disk_group_override_enabled(override_id, enabled)
+    if not item:
+        raise HTTPException(404, "exact disk-set override not found")
+    return {"override": item, "analysis": _disk_naming_report()}
+
+
+@app.delete("/api/fs/index/disk-naming/overrides/{override_id}")
+def fs_disk_naming_override_delete(override_id: int):
+    if not _index_store().delete_disk_group_override(override_id):
+        raise HTTPException(404, "exact disk-set override not found")
+    _diag_event("info", "Removed an approved exact disk set",
+                operation="disk naming exact-set removal", override_id=override_id)
+    return {"removed": override_id, "analysis": _disk_naming_report()}
+
+
 @app.post("/api/fs/index/pause")
 def fs_index_pause(payload: dict = Body(...)):
     if not INDEXJOB["running"]:
@@ -4315,6 +5640,8 @@ def cache_stats():
             "image_entries": stats["image_entries"],
             "parse_failures": stats.get("parse_failures", 0),
             "sid_metadata": stats.get("sid_metadata", 0),
+            "disk_group_rules": stats.get("disk_group_rules", 0),
+            "disk_group_overrides": stats.get("disk_group_overrides", 0),
             "sid_index_runs": store.sid_index_runs(),
             "legacy_import": legacy_import,
             "local_imports": store.local_imports(),
@@ -4603,6 +5930,21 @@ def _swap_signature(filename: str):
             of_total.group("token") + " of " + of_total.group("total"),
         )
 
+    # Terminal hyphen-delimited A/B pairs such as title-a.d64 / title-b.d64.
+    # This is intentionally narrower than a generic trailing-letter rule: only
+    # the confirmed -a/-b convention is built in. Other conventions can be
+    # analysed and explicitly approved as constrained local rules.
+    terminal_letter = _re.fullmatch(
+        r"(?P<base>.+?)-(?P<token>[ab])",
+        stem,
+        flags=_re.IGNORECASE,
+    )
+    if terminal_letter:
+        title = _swap_normalize_title(terminal_letter.group("base"))
+        if title:
+            token = terminal_letter.group("token").casefold()
+            return (ext, "lettered-hyphen", title, "letter"), (1, token)
+
     # Generic numbered series such as Scratch-1.d64 / Scratch-2.d64 and
     # compound demo numbering such as EdgeOfDisgrace_1a.d64. A separator is
     # mandatory, so glued sequel-like names remain deliberately excluded.
@@ -4631,17 +5973,60 @@ def _swap_signature(filename: str):
     return None
 
 
-def _swap_group_candidates(current_name: str, sibling_names) -> list[str]:
+def _swap_approved_group_candidates(current_name: str, sibling_names, parent: str) -> list[str]:
+    """Apply only user-confirmed exact sets or constrained local rules."""
+    if not parent:
+        return [current_name]
+    try:
+        store = _index_store()
+        override = store.disk_group_override_for_member(parent, current_name)
+        if override:
+            available = {str(name).casefold(): str(name) for name in sibling_names}
+            available.setdefault(current_name.casefold(), current_name)
+            exact = [available[name.casefold()] for name in override.get("names", [])
+                     if name.casefold() in available]
+            if len(exact) >= 2:
+                return exact
+        for rule in store.disk_group_rules(enabled_only=True):
+            custom = _group_with_custom_rule(current_name, sibling_names, rule, parent)
+            if len(custom) >= 2:
+                return custom
+    except Exception as exc:
+        _warn_throttled(
+            "disk-group-rules",
+            f"could not apply approved disk-grouping rules: {exc}",
+        )
+    return [current_name]
+
+
+def _swap_group_candidates(current_name: str, sibling_names, parent: str = "") -> list[str]:
     """Return only siblings confidently belonging to the current disk set."""
     current_name = current_name.rsplit("/", 1)[-1]
+
+    # A confirmed exact-set override is explicit user intent and therefore
+    # precedes reusable built-in/custom pattern inference.
+    if parent:
+        try:
+            override = _index_store().disk_group_override_for_member(parent, current_name)
+        except Exception:
+            override = None
+        if override:
+            available = {str(name).casefold(): str(name) for name in sibling_names}
+            available.setdefault(current_name.casefold(), current_name)
+            exact = [available[name.casefold()] for name in override.get("names", [])
+                     if name.casefold() in available]
+            if len(exact) >= 2:
+                return exact
+
     current_signature = _swap_signature(current_name)
     if current_signature is None:
-        return [current_name]
+        return _swap_approved_group_candidates(current_name, sibling_names, parent)
     family, _current_token = current_signature
 
-    # Game.d64 beside Game(a).d64 / Game(b).d64 is an alternate-dump family,
-    # not a multi-disk set. The unsuffixed sibling veto keeps it solo.
-    if len(family) >= 3 and family[1] == "bare-wrapped":
+    # Game.d64 beside Game(a)/Game(b), or Game-a/Game-b, is an alternate
+    # family rather than confident swap media. The unsuffixed sibling veto is
+    # deliberately retained for both built-in terminal-letter forms.
+    if len(family) >= 3 and family[1] in {"bare-wrapped", "lettered-hyphen"}:
         ext, _kind, title = family[0], family[1], family[2]
         for name in list(sibling_names) + [current_name]:
             plain = name.rsplit("/", 1)[-1]
@@ -4667,10 +6052,10 @@ def _swap_group_candidates(current_name: str, sibling_names) -> list[str]:
     if current_name.casefold() not in seen:
         matches.append((_current_token, current_name))
 
-    # One apparent member is not evidence of a set.  Stay solo rather than
-    # guessing, while the manual Disk Swap Queue remains available.
+    # One apparent built-in member is not evidence of a set.  Stay solo unless
+    # an explicitly approved constrained local rule covers the family.
     if len(matches) < 2:
-        return [current_name]
+        return _swap_approved_group_candidates(current_name, sibling_names, parent)
     matches.sort(key=lambda item: (item[0], _natkey(item[1])))
     return [name for _token, name in matches]
 
@@ -4714,7 +6099,7 @@ def _swap_build_from_device(image_path: str, drive: str, mode: str,
         e["name"] for e in entries
         if not e.get("dir") and e["name"].casefold().endswith(_SWAP_IMAGE_EXTENSIONS)
     ]
-    names = _swap_group_candidates(current_name, sibling_names)
+    names = _swap_group_candidates(current_name, sibling_names, folder)
     items = [{"label": name, "kind": "device",
               "path": (folder.rstrip("/") + "/" + name)} for name in names]
     idx = next((i for i, it in enumerate(items)
@@ -4809,7 +6194,7 @@ def _reconcile_swap_from_drives(out: dict) -> dict | None:
 
     # An explicitly armed manual or uploaded queue is user intent.  Keep it
     # even when Arm Queue was used without mounting its first member yet.
-    if SWAP.get("source") in {"manual", "upload"} and SWAP.get("items"):
+    if SWAP.get("source") in {"manual", "upload", "assembly64"} and SWAP.get("items"):
         return None
 
     # Prefer drive A when both contain images, matching the normal mount/run
@@ -4921,7 +6306,10 @@ import threading as _threading
 
 JUKE = {"items": [], "index": -1, "playing": False, "shuffle": False,
         "radio": False, "song": 0, "timer": None, "folder": "", "loading": False,
-        "source": "", "generation": 0, "stop_after_current": False}
+        "source": "", "recommendation_seed_label": "", "generation": 0, "queue_revision": 0, "stop_after_current": False,
+        "playback_started_monotonic": 0.0, "playback_length_secs": 0.0,
+        "playback_auto_advance_secs": 0.0, "playback_duration_source": "",
+        "playback_fade_secs": 0.0, "playback_id": 0}
 JUKE_TIMER_LOCK = _threading.RLock()
 JUKE_PLAYED: set[str] = set()
 JUKE_RECENT_TRACKS = deque(maxlen=80)
@@ -5401,6 +6789,13 @@ def _juke_new_generation() -> int:
         return JUKE["generation"]
 
 
+def _juke_new_queue_revision() -> int:
+    """Record a queue edit without invalidating active playback timers."""
+    with JUKE_TIMER_LOCK:
+        JUKE["queue_revision"] = int(JUKE.get("queue_revision", 0)) + 1
+        return JUKE["queue_revision"]
+
+
 def _juke_reset_similarity_session(*, disable_radio: bool = True) -> None:
     JUKE_PLAYED.clear()
     JUKE_RECENT_TRACKS.clear()
@@ -5444,6 +6839,32 @@ def _juke_state():
                "path": it.get("path", ""), "similarity": it.get("similarity"),
                "length": _juke_length(it, JUKE["song"])}
     sidflow = SIDFLOW_STORE.status()
+    fade_config = {
+        "enabled": bool(CFG.get("sid_jukebox_browser_fade_enabled", True)),
+        "duration_secs": _juke_browser_fade_config_seconds(),
+        "browser_only": True,
+        "note": ("Fade affects audio heard or recorded through this browser only; "
+                 "Ultimate HDMI and analogue output remain at full volume until "
+                 "the extended native endpoint."),
+    }
+    fade_active = {"enabled": False, "playback_id": int(JUKE.get("playback_id") or 0)}
+    if JUKE.get("playing") and float(JUKE.get("playback_started_monotonic") or 0) > 0:
+        fade_secs = float(JUKE.get("playback_fade_secs") or 0)
+        source = str(JUKE.get("playback_duration_source") or "")
+        length = float(JUKE.get("playback_length_secs") or 0)
+        if fade_secs > 0 and source == "songlengths" and length > 0:
+            elapsed = max(0.0, time.monotonic() - float(JUKE["playback_started_monotonic"]))
+            fade_end = length + fade_secs
+            fade_active = {
+                "enabled": True,
+                "playback_id": int(JUKE.get("playback_id") or 0),
+                "duration_secs": round(fade_secs, 1),
+                "starts_in_secs": round(length - elapsed, 3),
+                "remaining_secs": round(max(0.0, fade_end - elapsed), 3),
+                "auto_advance_remaining_secs": round(max(0.0,
+                    float(JUKE.get("playback_auto_advance_secs") or 0) - elapsed), 3),
+                "native_extension_secs": round(fade_secs, 1),
+            }
     return {"items": [{"label": i["label"], "meta": i["meta"],
                        "path": i.get("path", ""),
                        "song": int(i.get("song") or i["meta"].get("start_song", 1) or 1),
@@ -5457,11 +6878,44 @@ def _juke_state():
             "now": now, "folder": JUKE["folder"],
             "loading": bool(JUKE.get("loading")),
             "source": JUKE.get("source", ""),
+            "recommendation_seed_label": JUKE.get("recommendation_seed_label", ""),
             "sidflow": {"available": bool(sidflow.get("available")),
                         "tracks": int(sidflow.get("tracks") or 0),
                         "release": sidflow.get("release_tag", ""),
                         "needs_update": bool(sidflow.get("needs_update"))},
-            "songlengths_loaded": len(SONGLENGTHS)}
+            "songlengths_loaded": len(SONGLENGTHS),
+            "playback_id": int(JUKE.get("playback_id") or 0),
+            "queue_revision": int(JUKE.get("queue_revision") or 0),
+            "browser_fade": fade_config,
+            "active_browser_fade": fade_active}
+
+
+@app.get("/api/juke/fade")
+def juke_fade_get():
+    return _juke_state()["browser_fade"]
+
+
+@app.post("/api/juke/fade")
+def juke_fade_set(payload: dict = Body(...)):
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(400, "enabled must be true or false")
+    try:
+        duration = float(payload.get("duration_secs", 2.5))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "duration_secs must be a number")
+    if not 0.5 <= duration <= 10.0:
+        raise HTTPException(400, "duration_secs must be between 0.5 and 10 seconds")
+    CFG["sid_jukebox_browser_fade_enabled"] = enabled
+    CFG["sid_jukebox_browser_fade_secs"] = round(duration, 1)
+    save_config()
+    result = _juke_state()["browser_fade"]
+    result["saved"] = True
+    result["applies_from_next_sid"] = True
+    _diag_event("info",
+                f"SID browser fade {'enabled' if enabled else 'disabled'}; "
+                f"duration={round(duration, 1)}s; applies from next SID")
+    return result
 
 
 def _juke_songlengths(it: dict):
@@ -5502,16 +6956,37 @@ def _juke_end_grace_seconds() -> float:
     return round(max(0.0, min(value, 30.0)), 1)
 
 
-def _juke_auto_advance_plan(it: dict, song: int) -> tuple[float, float, float, str]:
-    """Return base length, grace, timer delay and duration source.
+def _juke_browser_fade_config_seconds() -> float:
+    """Return the validated saved duration even while the feature is off."""
+    try:
+        value = float(CFG.get("sid_jukebox_browser_fade_secs", 2.5))
+    except (TypeError, ValueError):
+        value = 2.5
+    return round(max(0.5, min(value, 10.0)), 1)
 
-    Matched Songlengths entries use the configurable post-end grace. Unknown
-    tunes retain the established one-second fallback allowance so this release
-    does not alter sid_default_secs behaviour.
+
+def _juke_browser_fade_seconds() -> float:
+    """Return the active browser-stream fade duration, or zero when off."""
+    if not bool(CFG.get("sid_jukebox_browser_fade_enabled", True)):
+        return 0.0
+    return _juke_browser_fade_config_seconds()
+
+
+def _juke_auto_advance_plan(it: dict, song: int) -> tuple[float, float, float, str]:
+    """Return base length, post-length allowance, timer delay and source.
+
+    Matched Songlengths entries use the browser fade duration as the complete
+    post-length allowance while fade is enabled; the separate end-grace value
+    applies only when fade is disabled. Unknown tunes retain the established
+    one-second fallback allowance so sid_default_secs behaviour is unchanged.
     """
     length = _juke_length(it, song)
     if length is not None:
-        grace = _juke_end_grace_seconds()
+        # The browser fade starts at the documented endpoint and replaces the
+        # separate end-grace allowance. Combining both settings could leave a
+        # silent tail after the fade or reopen a transition window.
+        fade = _juke_browser_fade_seconds()
+        grace = fade if fade > 0 else _juke_end_grace_seconds()
         source = "songlengths"
     else:
         length = float(CFG.get("sid_default_secs", 180) or 0)
@@ -5588,39 +7063,70 @@ def _sidflow_track_context(path: str, song: int) -> tuple[dict | None, str]:
     return match, ""
 
 
-def _sidflow_present_paths() -> dict[str, str]:
-    """HVSC-relative lowercase path -> exact device path from the SID index."""
+def _sidflow_present_catalogue() -> tuple[dict[str, str], dict]:
+    """Return every indexed HVSC SID path plus source diagnostics.
+
+    The SID metadata catalogue is allowed to be partial.  Playing one SID can
+    add one metadata row before a full metadata refresh has ever run, so a
+    non-empty ``sid_metadata`` table is not proof that it contains the whole
+    collection.  Always union metadata paths with ordinary indexed ``.sid``
+    files before SIDFlow applies its local-presence filter.
+    """
     root = _configured_hvsc_root()
     if not root:
-        return {}
+        return {}, {"metadata_paths": 0, "file_index_paths": 0,
+                    "input_paths": 0, "mapped_paths": 0}
     store = _index_store()
-    try:
-        stat = store.path.stat()
-        metadata_count = int(store.sid_metadata_count(root))
-        signature = (root.casefold(), stat.st_mtime_ns, stat.st_size, metadata_count)
-    except Exception:
-        signature = (root.casefold(), 0, 0, 0)
-    if SIDFLOW_PRESENT_CACHE.get("signature") == signature:
-        return dict(SIDFLOW_PRESENT_CACHE.get("paths") or {})
-    paths = []
-    getter = getattr(store, "sid_metadata_paths", None)
-    if callable(getter):
+    metadata_paths: list[str] = []
+    file_paths: list[str] = []
+
+    catalogue_getter = getattr(store, "sid_presence_catalogue", None)
+    if callable(catalogue_getter):
         try:
-            paths = getter(root)
+            catalogue = catalogue_getter(root) or {}
+            metadata_paths = [str(path) for path in catalogue.get("metadata_paths", []) if path]
+            file_paths = [str(path) for path in catalogue.get("file_paths", []) if path]
         except Exception:
-            paths = []
-    if not paths:
-        try:
-            paths = [row["path"] for row in store.files_below(root, ".sid")]
-        except Exception:
-            paths = []
-    out = {}
-    for path in paths:
+            metadata_paths = []
+            file_paths = []
+    else:
+        metadata_getter = getattr(store, "sid_metadata_paths", None)
+        if callable(metadata_getter):
+            try:
+                metadata_paths = [str(path) for path in metadata_getter(root) if path]
+            except Exception:
+                metadata_paths = []
+        file_getter = getattr(store, "files_below", None)
+        if callable(file_getter):
+            try:
+                file_paths = [str(row.get("path") or "") for row in file_getter(root, ".sid")
+                              if row.get("path")]
+            except Exception:
+                file_paths = []
+
+    out: dict[str, str] = {}
+    input_paths = metadata_paths + file_paths
+    for path in input_paths:
         rel = normalise_hvsc_relative(path, root)
         if rel:
             out.setdefault(rel.casefold(), path)
-    SIDFLOW_PRESENT_CACHE.update({"signature": signature, "paths": dict(out)})
-    return out
+    stats = {
+        "metadata_paths": len(metadata_paths),
+        "file_index_paths": len(file_paths),
+        "input_paths": len(input_paths),
+        "mapped_paths": len(out),
+    }
+    # Retain the latest snapshot for Diagnostics/debug inspection, but do not
+    # use the old file-stat cache: WAL-backed index updates can leave the main
+    # SQLite file timestamp unchanged while the live catalogue has changed.
+    SIDFLOW_PRESENT_CACHE.update({"signature": None, "paths": dict(out),
+                                  "stats": dict(stats)})
+    return out, stats
+
+
+def _sidflow_present_paths() -> dict[str, str]:
+    """HVSC-relative lowercase path -> exact device path from the full index."""
+    return _sidflow_present_catalogue()[0]
 
 
 def _sidflow_item_track_id(item: dict, song: int | None = None) -> str | None:
@@ -5651,8 +7157,15 @@ def _sidflow_recommendations(path: str, song: int, limit: int = 20, *, radio: bo
     seed, reason = _sidflow_track_context(path, song)
     if not seed:
         raise HTTPException(404, reason)
-    present = _sidflow_present_paths()
+    present, presence_stats = _sidflow_present_catalogue()
     if not present:
+        _diag_event(
+            "warning",
+            "SIDFlow local catalogue empty: "
+            f"seed={seed['track_id']} metadata_paths={presence_stats['metadata_paths']} "
+            f"file_index_paths={presence_stats['file_index_paths']} "
+            f"mapped_paths={presence_stats['mapped_paths']}",
+        )
         raise HTTPException(409, "the SID index has no mapped HVSC tunes; refresh the SID index first")
     excluded = set(JUKE_PLAYED)
     excluded.update(JUKE_RECENT_TRACKS)
@@ -5693,6 +7206,24 @@ def _sidflow_recommendations(path: str, song: int, limit: int = 20, *, radio: bo
         item["sidflow_track_id"] = row["track_id"]
         item["recommendation_source"] = row.get("recommendation_source", "unknown")
         items.append(item)
+    source_counts: dict[str, int] = {}
+    for row in ranked:
+        source = str(row.get("recommendation_source") or "unknown")
+        source_counts[source] = source_counts.get(source, 0) + 1
+    level = "info" if items else "warning"
+    _diag_event(
+        level,
+        "SIDFlow candidate mapping: "
+        f"seed={seed['track_id']} mode={'radio' if radio else 'more-like-this'} "
+        f"metadata_paths={presence_stats['metadata_paths']} "
+        f"file_index_paths={presence_stats['file_index_paths']} "
+        f"input_paths={presence_stats['input_paths']} "
+        f"mapped_paths={presence_stats['mapped_paths']} "
+        f"played={len(JUKE_PLAYED)} recent={len(JUKE_RECENT_TRACKS)} "
+        f"queue={len(JUKE.get('items', []))} excluded_tracks={len(excluded)} "
+        f"ranked={len(ranked)} final={len(items)} "
+        + " ".join(f"{name}={count}" for name, count in sorted(source_counts.items())),
+    )
     return items, seed
 
 
@@ -5718,7 +7249,17 @@ def _sidflow_append(path: str, song: int, limit: int = 20, *, radio: bool = Fals
     if JUKE.get("folder") not in ("SIDFlow Radio", "SIDFlow recommendations"):
         JUKE["folder"] = "SIDFlow Radio" if radio else "SIDFlow recommendations"
     JUKE["source"] = "SIDFlow similarity"
-    _juke_new_generation()
+    if radio:
+        JUKE["recommendation_seed_label"] = ""
+    else:
+        seed_item = next((item for item in JUKE.get("items", [])
+                          if str(item.get("path") or "").casefold() == str(path).casefold()), None)
+        seed_meta = (seed_item or {}).get("meta") or {}
+        JUKE["recommendation_seed_label"] = str(
+            seed_meta.get("name") or (seed_item or {}).get("label") or
+            path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        )
+    _juke_new_queue_revision()
     source_counts = {}
     for item in items:
         source = str(item.get("recommendation_source") or "unknown")
@@ -5826,14 +7367,19 @@ def _juke_play(index: int, song: int = 0, *, expected_generation: int | None = N
             (time.monotonic() - stage) * 1000.0, 1
         )
         song = song or int(it.get("song") or it["meta"].get("start_song", 1) or 1)
+        length, grace, auto_delay, duration_source = _juke_auto_advance_plan(it, song)
+        fade_secs = (_juke_browser_fade_seconds()
+                     if duration_source == "songlengths" else 0.0)
         try:
             _run_cart_safe(lambda: _post_sid_upload(
-                it["label"], it["data"], songnr=song
+                it["label"], it["data"], songnr=song,
+                songlength_extension_secs=fade_secs
             ), preserve_jukebox=True, timings=play_timing)
         except (UltimateError, httpx.HTTPError) as e:
             err(e)
 
-        stage = time.monotonic()
+        playback_started = time.monotonic()
+        stage = playback_started
         with JUKE_TIMER_LOCK:
             if (expected_generation is not None and
                     int(JUKE.get("generation", 0)) != int(expected_generation)):
@@ -5847,12 +7393,21 @@ def _juke_play(index: int, song: int = 0, *, expected_generation: int | None = N
             _sidflow_radio_topup()
             _juke_cancel_timer()
             generation = _juke_new_generation()
-            length, grace, auto_delay, duration_source = _juke_auto_advance_plan(it, song)
+            JUKE.update({
+                "playback_started_monotonic": playback_started,
+                "playback_length_secs": length,
+                "playback_auto_advance_secs": auto_delay,
+                "playback_duration_source": duration_source,
+                "playback_fade_secs": fade_secs,
+                "playback_id": generation,
+            })
             play_timing.update({
                 "duration_source": duration_source,
                 "song_length_secs": length,
                 "end_grace_secs": grace,
                 "auto_advance_secs": auto_delay,
+                "browser_fade_secs": fade_secs,
+                "native_length_extension_secs": fade_secs,
             })
             if auto_delay > 0:
                 t = _threading.Timer(auto_delay, _juke_auto_next,
@@ -5875,6 +7430,7 @@ def _juke_play(index: int, song: int = 0, *, expected_generation: int | None = N
                 if key.endswith("_ms") or key in {
                     "duration_source", "song_length_secs",
                     "end_grace_secs", "auto_advance_secs",
+                    "browser_fade_secs", "native_length_extension_secs",
                 }
             ),
         )
@@ -5996,7 +7552,8 @@ def playlists_load_one(payload: dict = Body(...)):
     _juke_new_generation()
     _juke_reset_similarity_session()
     JUKE.update({"items": items, "index": -1, "playing": False, "song": 0,
-                 "folder": name, "loading": False, "source": "saved play queue"})
+                 "folder": name, "loading": False, "source": "saved play queue",
+                 "recommendation_seed_label": ""})
     out = _juke_state()
     out["skipped"] = 0
     return out
@@ -6035,7 +7592,8 @@ def juke_play_path(payload: dict = Body(...)):
                             "path": path}],
                  "index": -1, "playing": False, "song": 0,
                  "folder": path.rsplit("/", 1)[0] or "/",
-                 "loading": False, "source": "Ultimate storage"})
+                 "loading": False, "source": "Ultimate storage",
+                 "recommendation_seed_label": ""})
     try:
         _index_store().put_sid_metadata(path, len(data), "", meta,
                                         source="played SID")
@@ -6053,7 +7611,7 @@ def juke_add_path(payload: dict = Body(...)):
     name = path.rsplit("/", 1)[-1]
     if not name.lower().endswith(".sid"):
         raise HTTPException(400, "only .sid files can be added to the jukebox")
-    _juke_new_generation()
+    _juke_new_queue_revision()
     metadata = _sid_metadata_get(_index_store(), path)
     JUKE["items"].append(_juke_lazy_item(path, name, metadata))
     JUKE["stop_after_current"] = False
@@ -6073,7 +7631,9 @@ def juke_remove(payload: dict = Body(...)):
     if not (0 <= i < len(JUKE["items"])):
         raise HTTPException(400, "bad index")
     removing_current = (i == JUKE["index"])
-    _juke_new_generation()
+    _juke_new_queue_revision()
+    if removing_current:
+        _juke_new_generation()
     JUKE["items"].pop(i)
     if removing_current:
         _juke_cancel_timer()
@@ -6106,11 +7666,11 @@ def juke_clear():
     if current is not None:
         JUKE.update({"items": [current], "index": 0, "playing": True,
                      "folder": "Current tune", "loading": False,
-                     "stop_after_current": True})
+                     "recommendation_seed_label": "", "stop_after_current": True})
     else:
         JUKE.update({"items": [], "index": -1, "playing": False, "song": 0,
                      "folder": "", "loading": False, "source": "",
-                     "stop_after_current": False})
+                     "recommendation_seed_label": "", "stop_after_current": False})
     out = _juke_state()
     out.update({"cleared": removed, "kept_current": keep_current})
     return out
@@ -6167,7 +7727,7 @@ def juke_folder(payload: dict = Body(...)):
     JUKE.update({"items": items, "index": new_index,
                  "playing": bool(keep and new_index >= 0),
                  "folder": folder, "loading": False, "source": source,
-                 "stop_after_current": False})
+                 "recommendation_seed_label": "", "stop_after_current": False})
     out = _juke_state()
     out["skipped"] = 0
     out["lazy"] = True
@@ -6181,7 +7741,7 @@ async def juke_upload(files: list[UploadFile] = File(...)):
     _juke_reset_similarity_session()
     JUKE.update({"items": [], "index": -1, "playing": False, "song": 0,
                  "folder": "(local files)", "loading": False,
-                 "source": "local upload"})
+                 "source": "local upload", "recommendation_seed_label": ""})
     skipped, total = 0, 0
     for f in files:
         try:
@@ -6736,21 +8296,25 @@ def juke_hvsc_version():
 
 @app.get("/api/juke/search")
 def juke_search(q: str = Query(""), limit: int = Query(100),
-                chip: str = Query("all"), sid_format: str = Query("all", alias="format")):
+                chip: str = Query("all"), sid_format: str = Query("all", alias="format"),
+                year: str = Query("")):
     """Search the SID metadata catalogue, with Songlengths path fallback.
 
-    A text query may be omitted when a Chip or Format filter is selected.
-    Metadata-backed results include title, author, chip and PSID/RSID format;
+    A text query may be omitted when a Chip, Format or Year filter is selected.
+    Metadata-backed results include title, author, release year, chip and PSID/RSID format;
     older installs without a metadata scan retain the original path search.
     """
     q = q.strip().lower()
     chip = str(chip or "all").lower()
     sid_format = str(sid_format or "all").upper()
-    filtered = chip != "all" or sid_format != "ALL"
+    year = str(year or "").strip()
+    if year and not re.fullmatch(r"(?:19|20)\d{2}", year):
+        raise HTTPException(400, "year must be a four-digit value from 1900 to 2099")
+    filtered = chip != "all" or sid_format != "ALL" or bool(year)
     if q and len(q) < 2:
         raise HTTPException(400, "query needs at least 2 characters")
     if not q and not filtered:
-        raise HTTPException(400, "enter a search term or choose a Chip/Format filter")
+        raise HTTPException(400, "enter a search term or choose a Chip/Format/Year filter")
 
     limit = min(max(1, limit), 300)
     root = _configured_hvsc_root() or (CFG.get("hvsc_path") or "").rstrip("/") or "/"
@@ -6758,7 +8322,7 @@ def juke_search(q: str = Query(""), limit: int = Query(100),
     metadata_count = store.sid_metadata_count(root)
     if metadata_count:
         result = store.sid_metadata_search(
-            root, q, chip=chip, sid_format=sid_format, limit=limit
+            root, q, chip=chip, sid_format=sid_format, year=year, limit=limit
         )
         rows = []
         for row in result["results"]:
@@ -6771,14 +8335,14 @@ def juke_search(q: str = Query(""), limit: int = Query(100),
                 "path": path,
                 "meta": _sid_meta_from_row(row, row["name"]),
             })
-        return {"query": q, "chip": chip, "format": sid_format,
+        return {"query": q, "chip": chip, "format": sid_format, "year": year,
                 "total": result["total"], "results": rows,
                 "indexed": metadata_count, "backend": "SID metadata"}
 
     if filtered:
         raise HTTPException(
             409,
-            "Chip and Format filters require a SID metadata refresh. Build it "
+            "Chip, Format and Year filters require a SID metadata refresh. Build it "
             "from the local HVSC folder or refresh it from the Ultimate first.",
         )
     if not HVSC_INDEX:
@@ -6798,7 +8362,7 @@ def juke_search(q: str = Query(""), limit: int = Query(100),
             if len(hits) >= 3000:
                 break
     hits.sort(key=lambda h: (h[0], h[1]["rel"]))
-    return {"query": q, "chip": chip, "format": sid_format,
+    return {"query": q, "chip": chip, "format": sid_format, "year": year,
             "total": len(hits), "results": [h[1] for h in hits[:limit]],
             "indexed": len(HVSC_INDEX), "backend": "HVSC path index"}
 
@@ -6875,7 +8439,8 @@ def _juke_install_lazy_folder(folder: str, rows: list[dict], selected_path: str,
                           if str(it.get("path") or "").casefold() == selected_path.casefold()), -1)
     JUKE.update({"items": items, "index": current_index,
                  "playing": bool(JUKE.get("playing") and current_index >= 0),
-                 "folder": folder, "loading": False, "source": source})
+                 "folder": folder, "loading": False, "source": source,
+                 "recommendation_seed_label": ""})
 
 
 @app.post("/api/juke/random")
@@ -7246,9 +8811,9 @@ def library_run(name: str = Query(...), drive: str = Query("a")):
             return _run_cart_safe(lambda: rest.run_prg(name + ".prg", prg))
         runner = _runner_for(p.name)
         if runner == "run_crt":
-            return _run_direct_takeover(
+            return _run_temporary_crt(
                 lambda: rest.post_file(f"/v1/runners:{runner}", p.name, data),
-                "launching library cartridge",
+                "launching library cartridge", p.name,
             )
         if runner == "sidplay":
             return _run_cart_safe(lambda: _post_sid_upload(p.name, data))
@@ -7463,6 +9028,7 @@ def _health_coordinator_snapshot() -> dict:
             "background": snap.completed_background,
         },
         "cancelled": snap.cancelled,
+        "expired": snap.expired,
         "recent_operations": DEVICE_OP.recent_operations(20),
     }
 
@@ -7797,6 +9363,10 @@ def diagnostics_export(payload: dict = Body(default={})):
         "sid_index": juke_index_status(),
         "sidflow": _sidflow_public_status(),
         "cache": cache_stats(),
+        "cartridge": {
+            "configured": _cartridge_cache_snapshot(rest),
+            "temporary_runner": _temporary_crt_snapshot(rest),
+        },
         "events": list(DIAG_EVENTS),
     }
     buf = io.BytesIO()
@@ -7872,7 +9442,8 @@ def main():
     global _UVICORN_SERVER
     config = uvicorn.Config(
         app, host=CFG.get("http_host", "0.0.0.0"),
-        port=CFG["http_port"], log_level="warning", **ssl_kwargs)
+        port=CFG["http_port"], log_level="warning", proxy_headers=False,
+        **ssl_kwargs)
     _UVICORN_SERVER = uvicorn.Server(config)
     try:
         _UVICORN_SERVER.run()

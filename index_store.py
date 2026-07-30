@@ -8,6 +8,7 @@ reader/writer threads through WAL mode, and imports the legacy JSON files once.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -15,7 +16,16 @@ from pathlib import Path
 from typing import Iterable
 
 
-SCHEMA_VERSION = 4
+_RELEASE_YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
+
+
+def _release_year(value: object) -> str:
+    """Return the first standalone 19xx/20xx year in SID release metadata."""
+    match = _RELEASE_YEAR_RE.search(str(value or ""))
+    return match.group(1) if match else ""
+
+
+SCHEMA_VERSION = 5
 
 
 class IndexStore:
@@ -30,6 +40,7 @@ class IndexStore:
             isolation_level="DEFERRED",
         )
         self._conn.row_factory = sqlite3.Row
+        self._conn.create_function("u64_release_year", 1, _release_year, deterministic=True)
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
@@ -127,6 +138,37 @@ class IndexStore:
             CREATE INDEX IF NOT EXISTS idx_scan_seen
                 ON scan_seen(scan_id, kind);
 
+            CREATE TABLE IF NOT EXISTS disk_group_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pattern_key TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL,
+                delimiter TEXT NOT NULL,
+                tokens_json TEXT NOT NULL,
+                extensions_json TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT '/',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at REAL NOT NULL,
+                origin TEXT NOT NULL DEFAULT 'user-approved',
+                examples_json TEXT NOT NULL DEFAULT '[]',
+                last_match_count INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(pattern_key, scope)
+            );
+            CREATE INDEX IF NOT EXISTS idx_disk_group_rules_enabled
+                ON disk_group_rules(enabled, scope);
+            CREATE TABLE IF NOT EXISTS disk_group_overrides (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                parent TEXT NOT NULL COLLATE NOCASE,
+                names_json TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at REAL NOT NULL,
+                origin TEXT NOT NULL DEFAULT 'user-approved',
+                UNIQUE(parent, names_json)
+            );
+            CREATE INDEX IF NOT EXISTS idx_disk_group_overrides_parent
+                ON disk_group_overrides(parent, enabled);
+
             CREATE TABLE IF NOT EXISTS sid_metadata (
                 path TEXT PRIMARY KEY COLLATE NOCASE,
                 parent TEXT NOT NULL,
@@ -176,7 +218,7 @@ class IndexStore:
             );
             CREATE INDEX IF NOT EXISTS idx_sid_scan_seen ON sid_scan_seen(scan_id);
 
-            INSERT INTO metadata(key, value) VALUES('schema_version', '4')
+            INSERT INTO metadata(key, value) VALUES('schema_version', '5')
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value;
             COMMIT;
             """
@@ -646,6 +688,252 @@ class IndexStore:
             for r in rows
         ]
 
+    def disk_image_files(self, extensions: Iterable[str]) -> list[dict]:
+        """Return disk-image filename rows already present in the index."""
+        extensions = sorted({str(ext).casefold() for ext in extensions})
+        if not extensions:
+            return []
+        clauses = " OR ".join("name_lower LIKE ?" for _ in extensions)
+        params = tuple("%" + ext for ext in extensions)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT parent,path,name,size,mtime FROM fs_entries "
+                f"WHERE is_dir=0 AND ({clauses}) ORDER BY parent,name_lower",
+                params,
+            ).fetchall()
+        return [
+            {"parent": r["parent"], "path": r["path"], "name": r["name"],
+             "size": int(r["size"]), "mtime": r["mtime"]}
+            for r in rows
+        ]
+
+    @staticmethod
+    def _disk_rule_row(row: sqlite3.Row) -> dict:
+        return {
+            "id": int(row["id"]),
+            "pattern_key": row["pattern_key"],
+            "label": row["label"],
+            "kind": row["kind"],
+            "delimiter": row["delimiter"],
+            "tokens": json.loads(row["tokens_json"] or "[]"),
+            "extensions": json.loads(row["extensions_json"] or "[]"),
+            "scope": row["scope"],
+            "enabled": bool(row["enabled"]),
+            "created_at": float(row["created_at"]),
+            "origin": row["origin"],
+            "examples": json.loads(row["examples_json"] or "[]"),
+            "last_match_count": int(row["last_match_count"]),
+        }
+
+    def disk_group_rules(self, *, enabled_only: bool = False) -> list[dict]:
+        sql = "SELECT * FROM disk_group_rules"
+        if enabled_only:
+            sql += " WHERE enabled=1"
+        sql += " ORDER BY id"
+        with self._lock:
+            rows = self._conn.execute(sql).fetchall()
+        return [self._disk_rule_row(row) for row in rows]
+
+    def add_disk_group_rule(self, rule: dict) -> dict:
+        now = time.time()
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO disk_group_rules("
+                "pattern_key,label,kind,delimiter,tokens_json,extensions_json,"
+                "scope,enabled,created_at,origin,examples_json,last_match_count"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(pattern_key,scope) DO UPDATE SET "
+                "label=excluded.label, kind=excluded.kind, delimiter=excluded.delimiter, "
+                "tokens_json=excluded.tokens_json, extensions_json=excluded.extensions_json, "
+                "enabled=1, examples_json=excluded.examples_json, "
+                "last_match_count=excluded.last_match_count",
+                (rule["pattern_key"], rule.get("label", ""), rule["kind"],
+                 rule["delimiter"], json.dumps(rule["tokens"], separators=(",", ":")),
+                 json.dumps(rule["extensions"], separators=(",", ":")),
+                 rule.get("scope", "/"), 1, now, rule.get("origin", "user-approved"),
+                 json.dumps(rule.get("examples", []), ensure_ascii=False, separators=(",", ":")),
+                 int(rule.get("last_match_count", 0))),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM disk_group_rules WHERE pattern_key=? AND scope=?",
+                (rule["pattern_key"], rule.get("scope", "/")),
+            ).fetchone()
+        return self._disk_rule_row(row)
+
+    def set_disk_group_rule_enabled(self, rule_id: int, enabled: bool) -> dict | None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE disk_group_rules SET enabled=? WHERE id=?",
+                (1 if enabled else 0, int(rule_id)),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM disk_group_rules WHERE id=?", (int(rule_id),)
+            ).fetchone()
+        return self._disk_rule_row(row) if row else None
+
+    def delete_disk_group_rule(self, rule_id: int) -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM disk_group_rules WHERE id=?", (int(rule_id),)
+            )
+        return bool(cur.rowcount)
+
+    def update_disk_group_rule_match_count(self, rule_id: int, count: int) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE disk_group_rules SET last_match_count=? WHERE id=?",
+                (max(0, int(count)), int(rule_id)),
+            )
+
+    @staticmethod
+    def _disk_override_row(row: sqlite3.Row) -> dict:
+        return {
+            "id": int(row["id"]),
+            "parent": row["parent"],
+            "names": json.loads(row["names_json"] or "[]"),
+            "label": row["label"],
+            "enabled": bool(row["enabled"]),
+            "created_at": float(row["created_at"]),
+            "origin": row["origin"],
+        }
+
+    def disk_group_overrides(self, *, enabled_only: bool = False) -> list[dict]:
+        sql = "SELECT * FROM disk_group_overrides"
+        if enabled_only:
+            sql += " WHERE enabled=1"
+        sql += " ORDER BY id"
+        with self._lock:
+            rows = self._conn.execute(sql).fetchall()
+        return [self._disk_override_row(row) for row in rows]
+
+    def add_disk_group_override(self, parent: str, names: Iterable[str],
+                                label: str = "") -> dict:
+        return self.add_disk_group_overrides_batch([{
+            "parent": parent, "names": list(names), "label": label,
+        }])[0]
+
+    @staticmethod
+    def _normalise_disk_group_override(parent: str, names: Iterable[str],
+                                       label: str = "") -> tuple[str, list[str], str, str]:
+        parent = str(parent or "/").rstrip("/") or "/"
+        clean_names = []
+        seen_names = set()
+        for value in names:
+            name = str(value)
+            if not name or name.casefold() in seen_names:
+                continue
+            seen_names.add(name.casefold())
+            clean_names.append(name)
+        if len(clean_names) < 2:
+            raise ValueError("an exact disk set requires at least two filenames")
+        names_json = json.dumps(clean_names, ensure_ascii=False, separators=(",", ":"))
+        return parent, clean_names, names_json, str(label or "")
+
+    def add_disk_group_overrides_batch(self, items: Iterable[dict]) -> list[dict]:
+        """Add or re-enable exact-set approvals in one SQLite transaction."""
+        prepared = []
+        seen = set()
+        for item in items:
+            parent, _names, names_json, label = self._normalise_disk_group_override(
+                item.get("parent", "/"), item.get("names", ()), item.get("label", "")
+            )
+            key = (parent.casefold(), names_json.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            prepared.append((parent, names_json, label))
+        if not prepared:
+            raise ValueError("no exact disk sets were supplied")
+        now = time.time()
+        rows = []
+        with self._lock, self._conn:
+            for parent, names_json, label in prepared:
+                self._conn.execute(
+                    "INSERT INTO disk_group_overrides(parent,names_json,label,enabled,created_at,origin) "
+                    "VALUES(?,?,?,?,?,?) "
+                    "ON CONFLICT(parent,names_json) DO UPDATE SET "
+                    "label=excluded.label, enabled=1",
+                    (parent, names_json, label, 1, now, "user-approved"),
+                )
+                row = self._conn.execute(
+                    "SELECT * FROM disk_group_overrides WHERE parent=? AND names_json=?",
+                    (parent, names_json),
+                ).fetchone()
+                rows.append(self._disk_override_row(row))
+        return rows
+
+    def manage_disk_group_overrides(self, override_ids: Iterable[int], action: str) -> dict:
+        """Enable, disable or remove several exact-set approvals atomically."""
+        ids = sorted({int(value) for value in override_ids})
+        if not ids:
+            raise ValueError("at least one exact-set approval is required")
+        action = str(action or "").casefold()
+        if action not in {"enable", "disable", "remove"}:
+            raise ValueError("action must be enable, disable or remove")
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock, self._conn:
+            existing = self._conn.execute(
+                f"SELECT id FROM disk_group_overrides WHERE id IN ({placeholders})", tuple(ids)
+            ).fetchall()
+            found = {int(row["id"]) for row in existing}
+            if found != set(ids):
+                raise KeyError("one or more exact-set approvals no longer exist")
+            if action == "remove":
+                self._conn.execute(
+                    f"DELETE FROM disk_group_overrides WHERE id IN ({placeholders})", tuple(ids)
+                )
+            else:
+                self._conn.execute(
+                    f"UPDATE disk_group_overrides SET enabled=? WHERE id IN ({placeholders})",
+                    (1 if action == "enable" else 0, *ids),
+                )
+        return {"action": action, "count": len(ids), "ids": ids}
+
+    def remove_all_disk_group_approvals(self) -> dict:
+        """Remove reusable rules and exact sets in one rollback-safe transaction."""
+        with self._lock, self._conn:
+            rules = int(self._conn.execute(
+                "SELECT COUNT(*) FROM disk_group_rules"
+            ).fetchone()[0])
+            overrides = int(self._conn.execute(
+                "SELECT COUNT(*) FROM disk_group_overrides"
+            ).fetchone()[0])
+            self._conn.execute("DELETE FROM disk_group_rules")
+            self._conn.execute("DELETE FROM disk_group_overrides")
+        return {"rules": rules, "overrides": overrides, "total": rules + overrides}
+
+    def set_disk_group_override_enabled(self, override_id: int, enabled: bool) -> dict | None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE disk_group_overrides SET enabled=? WHERE id=?",
+                (1 if enabled else 0, int(override_id)),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM disk_group_overrides WHERE id=?", (int(override_id),)
+            ).fetchone()
+        return self._disk_override_row(row) if row else None
+
+    def delete_disk_group_override(self, override_id: int) -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM disk_group_overrides WHERE id=?", (int(override_id),)
+            )
+        return bool(cur.rowcount)
+
+    def disk_group_override_for_member(self, parent: str, name: str) -> dict | None:
+        parent = str(parent or "/").rstrip("/") or "/"
+        folded = str(name or "").casefold()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM disk_group_overrides WHERE parent=? COLLATE NOCASE "
+                "AND enabled=1 ORDER BY id DESC", (parent,)
+            ).fetchall()
+        for row in rows:
+            item = self._disk_override_row(row)
+            if any(str(member).casefold() == folded for member in item["names"]):
+                return item
+        return None
+
     @staticmethod
     def _sid_row(path: str, size: int, mtime: str, meta: dict,
                  source: str, scanned_at: float) -> tuple:
@@ -745,13 +1033,44 @@ class IndexStore:
         return True
 
     def sid_metadata_paths(self, root: str = "/") -> list[str]:
-        """Return indexed SID device paths beneath ``root``."""
+        """Return metadata-backed SID device paths beneath ``root``."""
         scope, args = self._scope_sql("path", root)
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT path FROM sid_metadata WHERE {scope} ORDER BY path", args
             ).fetchall()
         return [str(row["path"]) for row in rows]
+
+    def sid_presence_catalogue(self, root: str = "/") -> dict:
+        """Return the complete indexed SID presence catalogue beneath ``root``.
+
+        ``sid_metadata`` can legitimately be partial: playing an individual SID
+        stores one metadata row even when the full metadata refresh has never
+        been run.  SIDFlow presence filtering must therefore union metadata
+        paths with ordinary ``fs_entries`` SID paths rather than treating any
+        non-empty metadata table as a complete catalogue.
+        """
+        metadata_scope, metadata_args = self._scope_sql("path", root)
+        file_scope, file_args = self._scope_sql("path", root)
+        with self._lock:
+            metadata_rows = self._conn.execute(
+                f"SELECT path FROM sid_metadata WHERE {metadata_scope} ORDER BY path",
+                metadata_args,
+            ).fetchall()
+            file_rows = self._conn.execute(
+                "SELECT path FROM fs_entries "
+                f"WHERE {file_scope} AND is_dir=0 AND name_lower LIKE '%.sid' "
+                "ORDER BY path",
+                file_args,
+            ).fetchall()
+        metadata_paths = [str(row["path"]) for row in metadata_rows]
+        file_paths = [str(row["path"]) for row in file_rows]
+        return {
+            "metadata_paths": metadata_paths,
+            "file_paths": file_paths,
+            "metadata_count": len(metadata_paths),
+            "file_count": len(file_paths),
+        }
 
     def sid_metadata_count(self, root: str = "/") -> int:
         scope, args = self._scope_sql("path", root)
@@ -762,7 +1081,7 @@ class IndexStore:
 
     def sid_metadata_search(self, root: str, query: str = "", *,
                             chip: str = "all", sid_format: str = "all",
-                            limit: int = 100) -> dict:
+                            year: str = "", limit: int = 100) -> dict:
         scope, args = self._scope_sql("path", root)
         clauses = [scope]
         params: list[object] = list(args)
@@ -792,6 +1111,11 @@ class IndexStore:
             clauses.append("(sids>1 OR instr(chip,'+')>0)")
         elif chip == "unknown":
             clauses.append("(chip='' OR chip='?')")
+
+        year = str(year or "").strip()
+        if year:
+            clauses.append("u64_release_year(released)=?")
+            params.append(year)
 
         where = " AND ".join(f"({clause})" for clause in clauses)
         with self._lock:
@@ -916,6 +1240,12 @@ class IndexStore:
             sid_metadata_count = self._conn.execute(
                 "SELECT COUNT(*) AS n FROM sid_metadata"
             ).fetchone()["n"]
+            disk_group_rule_count = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM disk_group_rules"
+            ).fetchone()["n"]
+            disk_group_override_count = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM disk_group_overrides"
+            ).fetchone()["n"]
         disk_bytes = 0
         for suffix in ("", "-wal", "-shm"):
             try:
@@ -929,6 +1259,8 @@ class IndexStore:
             "image_entries": int(image_entry_count),
             "parse_failures": int(parse_failure_count),
             "sid_metadata": int(sid_metadata_count),
+            "disk_group_rules": int(disk_group_rule_count),
+            "disk_group_overrides": int(disk_group_override_count),
             "disk_bytes": int(disk_bytes),
         }
 
