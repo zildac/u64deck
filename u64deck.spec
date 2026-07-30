@@ -2,14 +2,9 @@
 #   pyinstaller u64deck.spec
 # On Windows this produces dist/u64deck.exe (no Python install needed to run).
 
+import sys
 from pathlib import Path
-
-import sys, os
-sys.path.insert(0, os.path.abspath(os.getcwd()))
-try:
-    sys.path.insert(0, os.path.dirname(os.path.abspath(SPECPATH)))
-except NameError:
-    pass
+sys.path.insert(0, str(Path(globals().get("SPECPATH", ".")).resolve()))
 from release import BUILD_STAMP_NAME, source_build_id
 
 source_root = Path(globals().get("SPECPATH", ".")).resolve()
