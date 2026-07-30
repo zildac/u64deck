@@ -4,6 +4,8 @@
 
 from pathlib import Path
 
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(SPECPATH)))
 from release import BUILD_STAMP_NAME, source_build_id
 
 source_root = Path(globals().get("SPECPATH", ".")).resolve()
