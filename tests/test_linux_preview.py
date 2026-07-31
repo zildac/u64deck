@@ -8,6 +8,13 @@ from pathlib import Path
 
 import pytest
 
+import sys
+
+pytestmark = pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Linux preview tests run on Linux only",
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
