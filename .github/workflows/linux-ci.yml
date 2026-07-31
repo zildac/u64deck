@@ -1,0 +1,47 @@
+name: Linux Preview CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux-preview:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: Core and Linux tests
+        run: python -m pytest -q
+      - name: Syntax checks
+        run: |
+          python -m compileall -q .
+          node --check static/app.js
+          for script in *.sh; do bash -n "$script"; done
+      - name: Clean installer and lifecycle smoke
+        env:
+          U64DECK_BROWSER_MODE: none
+        run: |
+          ./install.sh
+          ./u64deck.sh --no-browser --port 18064 > /tmp/u64deck-linux.log 2>&1 &
+          wrapper=$!
+          for i in $(seq 1 120); do
+            curl -fsS http://127.0.0.1:18064/api/app_config > /tmp/app-config.json && break
+            sleep .25
+          done
+          python - <<'PY'
+          import json
+          data=json.load(open('/tmp/app-config.json'))
+          assert data['version']=='1.9.0'
+          assert data['release_label']=='Linux Preview 4'
+          assert len(data['build'])==7
+          PY
+          curl -fsS -X POST http://127.0.0.1:18064/api/app/exit -H 'X-U64deck-Local-Exit: 1'
+          wait "$wrapper"

@@ -28,3 +28,12 @@ index-backups/
 
 .espressif-ouis-cache.json
 .espressif-ouis-cache.json.tmp-*
+
+# Linux Preview local environment and release staging
+.venv/
+artifacts/
+artifacts-*/
+linux-runtime/
+*.tar.gz
+*.sha256.txt
+*.manifest.txt

@@ -1,0 +1,59 @@
+name: Linux Preview source release
+
+on:
+  push:
+    tags:
+      - 'linux-preview-*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: Source tests and syntax
+        run: |
+          python -m pytest -q | tee /tmp/source-tests.txt
+          python -m compileall -q .
+          node --check static/app.js
+          for script in *.sh; do bash -n "$script"; done
+      - name: Build preliminary tarball
+        run: |
+          python -m linux.package_release --output-dir artifacts-preliminary \
+            --source-tests "$(tail -n 1 /tmp/source-tests.txt)" \
+            --archive-tests "pending" \
+            --update-validation "covered by Linux tests"
+      - name: Extract and retest
+        run: |
+          mkdir extracted
+          tar -xzf artifacts-preliminary/u64deck-v1.9.0-linux-preview.4.tar.gz -C extracted
+          cd extracted/u64deck
+          python -m pytest -q | tee /tmp/archive-tests.txt
+          python -m compileall -q .
+          node --check static/app.js
+          for script in *.sh; do bash -n "$script"; done
+      - name: Build final deterministic artifacts
+        run: |
+          rm -rf artifacts
+          python -m linux.package_release --output-dir artifacts \
+            --source-tests "$(tail -n 1 /tmp/source-tests.txt)" \
+            --archive-tests "$(tail -n 1 /tmp/archive-tests.txt)" \
+            --update-validation "passed"
+          (cd artifacts && sha256sum -c u64deck-v1.9.0-linux-preview.4.tar.gz.sha256.txt)
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: artifacts/u64deck-v1.9.0-linux-preview.4-release-notes.md
+          prerelease: true
+          files: |
+            artifacts/u64deck-v1.9.0-linux-preview.4.tar.gz
+            artifacts/u64deck-v1.9.0-linux-preview.4.tar.gz.sha256.txt
+            artifacts/u64deck-v1.9.0-linux-preview.4.tar.gz.manifest.txt
+            artifacts/u64deck-v1.9.0-linux-preview.4-release-notes.md
