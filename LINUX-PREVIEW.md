@@ -1,7 +1,7 @@
-# u64deck v1.9.0 — Linux Preview 4
+# u64deck v1.9.0 — Linux Preview 5
 
-Linux Preview 4 is the source-run Linux distribution of the reviewed Windows
-v1.9.0 RC44 core (`fc1e0fb`). It is published in the same `zildac/u64deck`
+Linux Preview 5 is the source-run Linux distribution of the reviewed Windows
+v1.9.0 RC45 core (`6feaede`). It is published in the same `zildac/u64deck`
 repository. No frozen ELF or AppImage is produced.
 
 Windows remains the stable, supported distribution. The Linux preview is

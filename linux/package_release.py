@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .build_id import BASE_BUILD, BASE_RELEASE, PREVIEW_LABEL, PREVIEW_VERSION, identity, linux_build_id
 
-ARCHIVE_NAME = "u64deck-v1.9.0-linux-preview.4.tar.gz"
+ARCHIVE_NAME = "u64deck-v1.9.0-linux-preview.5.tar.gz"
 EXECUTABLES = {
     "install.sh", "u64deck.sh", "update-linux.sh",
     "uninstall-linux.sh", "import-existing-data.sh",
@@ -105,23 +105,16 @@ def build_tarball(root: Path, output: Path) -> tuple[str, list[str]]:
 def release_notes(root: Path, digest: str, file_count: int,
                   source_tests: str, archive_tests: str, validation: str) -> str:
     build = linux_build_id(root)
-    return f"""# u64deck v1.9.0 — Linux Preview 4
+    return f"""# u64deck v1.9.0 — Linux Preview 5
 
-**Identity:** `u64deck v1.9.0 · Linux Preview 4 · build {build}`  
+**Identity:** `u64deck v1.9.0 · Linux Preview 5 · build {build}`  
 **Base lineage:** `{BASE_RELEASE} · build {BASE_BUILD}`
 
-Linux Preview 4 is a source-run preview published alongside the Windows release in the same repository. It is not a frozen ELF or AppImage. Windows remains the stable, supported distribution; this Linux preview is provided as-is for testing and issue reports.
+Linux Preview 5 is a source-run preview published alongside the Windows release in the same repository. It is not a frozen ELF or AppImage. Windows remains the stable, supported distribution; this Linux preview is provided as-is for testing and issue reports.
 
-## Hardware-tested Linux environment
+## Hardware status
 
-- Ubuntu 24.04.4 LTS
-- amd64 / x86-64
-- Linux kernel 6.8.0-136-generic
-- Ubuntu GNOME under Wayland
-- Python 3.12.3
-- Chromium 150.0.7871.128 from Canonical's stable Snap channel
-
-The maintainer hardware-tested installation and application-menu launch, Chromium app-window mode, Ultimate discovery and connection, screen mirror at approximately 50 fps, HDMI audio, fullscreen, recording, Legacy physical-F7 guidance, local SID/HVSC and storage indexing, SID Search, SIDFlow download/verify/import and recommendations, SID playback, Storage browsing, Mount & Run, upgrade-state retention and clean Exit.
+Linux Preview 4 was hardware-tested on Ubuntu 24.04.4 LTS x86-64 with GNOME/Wayland and Chromium Snap. Linux Preview 5 retains that distribution architecture but its final tarball has not yet been hardware-validated on the maintainer NUC. Do not treat the inherited Preview 4 result as a Preview 5 hardware pass.
 
 ## Storage and migration
 
@@ -138,7 +131,7 @@ The maintainer hardware-tested installation and application-menu launch, Chromiu
 - Python compile, JavaScript syntax and shell syntax: passed
 - Clean XDG install, API identity, config save and graceful Exit: passed
 - Owned Chromium-process cleanup: passed
-- Data import, backup and Windows-path warning checks: passed
+- Data import, backup, URL-scheme and genuine Windows-path warning checks: passed
 - Update and rollback smoke: {validation}
 - Archive hygiene and personal-path scan: passed
 - Archive entries: **{file_count} files**
@@ -171,7 +164,7 @@ def main() -> int:
         "\n".join(manifest) + "\n", encoding="utf-8")
     notes = release_notes(root, digest, len(manifest), args.source_tests,
                           args.archive_tests, args.update_validation)
-    (out / "u64deck-v1.9.0-linux-preview.4-release-notes.md").write_text(
+    (out / "u64deck-v1.9.0-linux-preview.5-release-notes.md").write_text(
         notes, encoding="utf-8")
     print(tarball)
     print(f"SHA-256 {digest}")

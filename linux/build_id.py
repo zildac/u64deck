@@ -5,9 +5,9 @@ import hashlib
 from pathlib import Path
 
 PREVIEW_VERSION = "1.9.0"
-PREVIEW_LABEL = "Linux Preview 4"
-BASE_RELEASE = "Windows v1.9.0 RC44"
-BASE_BUILD = "fc1e0fb"
+PREVIEW_LABEL = "Linux Preview 5"
+BASE_RELEASE = "Windows v1.9.0 RC45"
+BASE_BUILD = "6feaede"
 
 
 def _release_inputs(root: Path) -> list[Path]:

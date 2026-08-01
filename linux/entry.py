@@ -137,7 +137,7 @@ def main() -> int:
     if args.help:
         print("Linux options: --linux-print-paths, --linux-print-identity, "
               "--browser-mode auto|app|system|none, --no-browser")
-        print("Remaining options are passed to the RC44 server.")
+        print("Remaining options are passed to the RC45 server.")
         return 0
     if args.linux_print_paths:
         _print_paths()

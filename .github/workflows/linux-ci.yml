@@ -40,7 +40,7 @@ jobs:
           import json
           data=json.load(open('/tmp/app-config.json'))
           assert data['version']=='1.9.0'
-          assert data['release_label']=='Linux Preview 4'
+          assert data['release_label']=='Linux Preview 5'
           assert len(data['build'])==7
           PY
           curl -fsS -X POST http://127.0.0.1:18064/api/app/exit -H 'X-U64deck-Local-Exit: 1'

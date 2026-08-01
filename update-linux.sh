@@ -4,7 +4,6 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/u64deck"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/u64deck"
 META="$DATA_DIR/install-path"
-
 if [[ "${1:-}" == "--rollback" ]]; then
   [[ $# -eq 2 ]] || { echo "Usage: $0 --rollback /path/to/previous/u64deck" >&2; exit 2; }
   TARGET="$(cd -- "$2" && pwd -P)"
@@ -16,7 +15,6 @@ if [[ "${1:-}" == "--rollback" ]]; then
   echo "Linux launcher rolled back to: $TARGET"
   exit 0
 fi
-
 if [[ -f "$STATE_DIR/u64deck.pid" ]]; then
   pid="$(cat "$STATE_DIR/u64deck.pid" 2>/dev/null || true)"
   if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
@@ -24,7 +22,6 @@ if [[ -f "$STATE_DIR/u64deck.pid" ]]; then
     exit 1
   fi
 fi
-
 OLD=""
 [[ -f "$META" ]] && OLD="$(cat "$META" 2>/dev/null || true)"
 if [[ -n "$OLD" && "$OLD" != "$SCRIPT_DIR" && -d "$OLD" ]]; then
@@ -35,7 +32,6 @@ if [[ -n "$OLD" && "$OLD" != "$SCRIPT_DIR" && -d "$OLD" ]]; then
     "$SCRIPT_DIR/import-existing-data.sh" "$OLD"
   fi
 fi
-
 old_meta="$OLD"
 restore_meta() {
   if [[ -n "$old_meta" ]]; then
