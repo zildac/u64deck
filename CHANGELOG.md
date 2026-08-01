@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.9.0 — Release Candidate 45
+
+**Public release-candidate build:** `6feaede`
+
+- Replaces browser-native confirmation popups with one C64 boot-screen-themed modal shared across Windows Edge and other supported Chromium-family browsers.
+- Uses the established C64 screen blue, light-blue inset frame and severity accents within the existing palette: blue for normal confirmations, C64 yellow for important actions and muted C64 red only for destructive actions.
+- Preserves the existing confirmation wording and Confirm/Cancel outcomes, with keyboard support for Enter, Escape and trapped Tab focus.
+- Leaves red/green toast notifications unchanged.
+- Leaves backend confirmation requirements, local-only Exit enforcement and all Ultimate/device operations unchanged from RC44.
+- Published as a soak candidate alongside RC44. It does not replace RC44 as the established baseline and is not the final v1.9.0 release.
+
 ## 1.9.0 — Release Candidate 44
 
 **Public release-candidate build:** `fc1e0fb`

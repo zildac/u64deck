@@ -4,6 +4,50 @@ const $=s=>document.querySelector(s);
 const DISKNAMING={report:null,busy:false,overridePage:0,overrideOpen:false};
 function toast(msg,cls){const d=document.createElement("div");d.className="toast "+(cls||"");
   d.textContent=msg;$("#toasts").append(d);setTimeout(()=>d.remove(),5000)}
+
+let U64_CONFIRM_STATE=null;
+function u64ConfirmVariant(text,requested){
+  if(requested==="danger"||requested==="warning"||requested==="normal")return requested;
+  if(/(?:factory defaults|reset ALL settings|discard(?:s|ed|ing)? temporary writes|final confirmation|clear the entire local storage index|remove .+ from the library|delete)/i.test(text))return "danger";
+  if(/(?:power off|exit u64deck|\bremove\b|\bclear\b|\breplace\b|read\/write|index every attached|very long time|194 MB|1\.8 GiB|approve all)/i.test(text))return "warning";
+  return "normal";
+}
+function u64Confirm(message,options={}){
+  if(U64_CONFIRM_STATE)return Promise.resolve(false);
+  const text=String(message??""),variant=u64ConfirmVariant(text,options.variant);
+  const overlay=$("#confirmOverlay"),title=$("#confirmTitle"),body=$("#confirmMessage"),ok=$("#confirmOk");
+  if(!overlay||!title||!body||!ok){console.error("u64deck confirmation modal is unavailable");return Promise.resolve(false)}
+  return new Promise(resolve=>{
+    U64_CONFIRM_STATE={resolve,previous:document.activeElement};
+    title.textContent=options.title||(variant==="danger"?"DESTRUCTIVE ACTION":variant==="warning"?"CONFIRM ACTION":"PLEASE CONFIRM");
+    body.textContent=text;ok.textContent=options.confirmLabel||"OK";
+    overlay.classList.toggle("warning",variant==="warning");
+    overlay.classList.toggle("danger",variant==="danger");
+    ok.className=variant==="danger"?"confirm-danger":variant==="warning"?"confirm-warning":"primary";
+    overlay.hidden=false;
+    requestAnimationFrame(()=>(variant==="normal"?ok:$("#confirmCancel"))?.focus());
+  });
+}
+function u64ConfirmResolve(value){
+  const state=U64_CONFIRM_STATE;if(!state)return;U64_CONFIRM_STATE=null;
+  const overlay=$("#confirmOverlay");if(overlay){overlay.hidden=true;overlay.classList.remove("warning","danger")}
+  state.resolve(!!value);
+  requestAnimationFrame(()=>{try{if(state.previous?.isConnected)state.previous.focus()}catch(e){}});
+}
+document.addEventListener("keydown",e=>{
+  if(!U64_CONFIRM_STATE)return;
+  const cancel=$("#confirmCancel"),ok=$("#confirmOk");
+  if(e.key==="Escape"){e.preventDefault();e.stopImmediatePropagation();u64ConfirmResolve(false);return}
+  if(e.key==="Tab"){
+    e.preventDefault();e.stopImmediatePropagation();
+    (e.shiftKey?(document.activeElement===cancel?ok:cancel):(document.activeElement===ok?cancel:ok))?.focus();return;
+  }
+  if(e.key==="Enter"){
+    e.preventDefault();e.stopImmediatePropagation();u64ConfirmResolve(true);
+  }
+},true);
+async function confirmPowerOff(){if(await u64Confirm("Power off the Ultimate 64?",{variant:"warning"}))machine("poweroff")}
+async function confirmFactoryDefaults(){if(await u64Confirm("Reset ALL settings to factory defaults?",{variant:"danger"}))cfgAction("reset_to_default")}
 let DEVICE_REQUEST_TIMEOUT_MS=15000;
 const MOUNT_RUN_REQUEST_TIMEOUT_MS=300000;
 let LINK_STATUS={ip:"",link_type:"unknown",label:"Unknown",addresses:[],ethernet_ip:"",wifi_ip:"",control_ip:"",control_link_type:"unknown",rest_via_alternate:false,rest_route_label:"",streaming_available:true,rest_timeout:8};
@@ -42,7 +86,7 @@ function showAppStopped(){
   </div></main>`;
 }
 async function exitU64deck(){
-  if(!confirm("Exit u64deck?\n\nThis stops the local u64deck server and closes its dedicated application window. The connected Ultimate will continue running."))return;
+  if(!await u64Confirm("Exit u64deck?\n\nThis stops the local u64deck server and closes its dedicated application window. The connected Ultimate will continue running.",{variant:"warning"}))return;
   const btn=$("#btnAppExit");if(btn){btn.disabled=true;btn.textContent="Exiting…"}
   try{
     const result=await api("/api/app/exit",{method:"POST",headers:{"X-U64deck-Local-Exit":"1"},timeoutMs:5000});
@@ -170,7 +214,7 @@ function itemsRender(){
   $("#recentList").innerHTML=recents.length?recents.map(x=>itemCard(x,false)).join(""):'<span class="hint">Nothing used yet.</span>';
 }
 async function clearRecents(){
-  if(!ITEMS.recents.length||!confirm("Clear the recently used list?"))return;
+  if(!ITEMS.recents.length||!await u64Confirm("Clear the recently used list?"))return;
   try{await api("/api/user_items/recent",{method:"DELETE"});ITEMS.recents=[];itemsRender()}catch(e){toast(e.message,"err")}
 }
 async function queueSavedSid(item){
@@ -514,7 +558,7 @@ async function runDiscover(){
 }
 async function clearDiscoveredDevices(){
   const question="Clear all remembered Ultimate devices and addresses?\n\nThe current connection will be removed and a fresh network scan will begin. Other settings will not be changed.";
-  if(!confirm(question))return;
+  if(!await u64Confirm(question))return;
   const body=$("#discBody"),btn=$("#discGo"),clear=$("#discClear");
   if(btn)btn.disabled=true;if(clear)clear.disabled=true;DISCOVERY_SCAN_ACTIVE=true;
   body.innerHTML="Clearing discovery history and scanning… <span class='cursor'></span>";
@@ -1819,10 +1863,10 @@ async function localIndexToggle(){
     const root=$("#localIndexRoot").value.trim()||"/USB0";
     if(!source){toast("Choose a local USB drive or folder","err");return}
     const selected=LOCAL_VOLUMES[+$("#localVolume").value];
-    if(selected&&!selected.removable&&!confirm(
+    if(selected&&!selected.removable&&!await u64Confirm(
       `${selected.path} is reported as a ${selected.type} drive, not removable storage.\n\n`+
       `Index it as ${root}? u64deck only reads files, but make sure this is the USB content intended for the Ultimate.`))return;
-    if(!confirm(`Build the SQLite index from:\n\n${source}\n\nas ${root}?\n\nThe scan is read-only and does not copy or change files.`))return;
+    if(!await u64Confirm(`Build the SQLite index from:\n\n${source}\n\nas ${root}?\n\nThe scan is read-only and does not copy or change files.`))return;
     await api("/api/fs/index/local",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({source,root})});
     toast(`Indexing ${source} locally as ${root}…`,"ok");
@@ -1835,11 +1879,11 @@ async function idxToggle(){
     if(state.running){await api("/api/fs/index/stop",{method:"POST"});return}
     let confirmRoot=false;
     if(FS.path==="/"){
-      confirmRoot=confirm("Index every attached storage device?\n\nA scan from / can take a very long time. It is usually better to open USB0 or a specific collection folder first.");
+      confirmRoot=await u64Confirm("Index every attached storage device?\n\nA scan from / can take a very long time. It is usually better to open USB0 or a specific collection folder first.");
       if(!confirmRoot)return;
     }
     const expectedVerify=indexLocalCover(FS.path,state);
-    if(expectedVerify&&!confirm(
+    if(expectedVerify&&!await u64Confirm(
       `The local USB import already covers ${FS.path}.\n\n`+
       `A verification scan walks the entire subtree over the Ultimate's FTP service and may take a long time. Normal folder browsing already performs lightweight incremental refreshes.\n\nContinue?`))return;
     const started=await api("/api/fs/index",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -2014,7 +2058,7 @@ async function newDiskCreate(){
   }
   const name=$("#ndName").value.trim();
   if(!name){toast("Give the disk a file name","err");return}
-  if(!allowReplaceDrive("a"))return;
+  if(!await allowReplaceDrive("a"))return;
   const kind=$("#ndKind").value;
   const body={kind,folder:FS.path,name,diskname:$("#ndLabel").value.trim()||undefined};
   if($("#ndTracks").style.display!=="none")body.tracks=+$("#ndTracks").value;
@@ -2035,26 +2079,26 @@ async function newDiskCreate(){
     $("#ndName").value="";fsGo(FS.path);
   }catch(e){toast(e.message,"err")}
   finally{btn.disabled=false;btn.textContent=oldText}}
-function allowReplaceDrive(drive){
+async function allowReplaceDrive(drive){
   const state=DRIVE_STATE[drive]||{};
-  return state.mode!=="unlinked"||confirm(`Drive ${drive.toUpperCase()} currently has an UNLINKED image. Replacing it discards temporary writes. Continue?`);
+  return state.mode!=="unlinked"||await u64Confirm(`Drive ${drive.toUpperCase()} currently has an UNLINKED image. Replacing it discards temporary writes. Continue?`);
 }
 async function duplicateImage(path){
-  if(!confirm(`Create a timestamped copy of ${path.split("/").pop()} on Ultimate storage?`))return;
+  if(!await u64Confirm(`Create a timestamped copy of ${path.split("/").pop()} on Ultimate storage?`))return;
   toast("Copying image…","ok");
   try{const r=await api("/api/fs/duplicate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path})});
     toast(`Created ${r.destination} ✓`,"ok");fsGo(FS.path)}catch(e){toast(e.message,"err")}
 }
 async function backupMountRW(path,drive="a"){
-  if(!allowReplaceDrive(drive))return;
-  if(!confirm(`Create a timestamped backup, then mount the original READ/WRITE on drive ${drive.toUpperCase()}?`))return;
+  if(!await allowReplaceDrive(drive))return;
+  if(!await u64Confirm(`Create a timestamped backup, then mount the original READ/WRITE on drive ${drive.toUpperCase()}?`))return;
   toast("Backing up image before read/write mount…","ok");
   try{const r=await api("/api/mount/backup_then_rw",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path,drive})});
     toast(`Backup ${r.backup.destination.split("/").pop()} created · mounted RW ✓`,"ok");
     showSwapDecision(r.swap_decision);refreshDrives()}catch(e){toast(e.message,"err")}
 }
 async function mountRunDevice(path){
-  if(!allowReplaceDrive("a"))return;
+  if(!await allowReplaceDrive("a"))return;
   const mode=mountMode();
   toast("Mounting + booting…","ok");
   beginMountRunStatusWatch();
@@ -2066,7 +2110,7 @@ async function mountRunDevice(path){
   catch(e){toast(e.message,"err")}
   finally{finishMountRunStatusWatch()}}
 async function localMountRun(){
-  if(!allowReplaceDrive("a"))return;
+  if(!await allowReplaceDrive("a"))return;
   const f=$("#localfile").files[0];if(!f){toast("Choose a file first","err");return}
   if(!isImage(f.name)){toast("Mount & Run is for disk images (.d64/.d71/.d81)","err");return}
   const fd=new FormData();fd.append("file",f);fd.append("drive","a");
@@ -2078,7 +2122,7 @@ async function localMountRun(){
   catch(e){toast(e.message,"err")}
   finally{finishMountRunStatusWatch()}}
 async function mountDevice(path,drive){
-  if(!allowReplaceDrive(drive))return;
+  if(!await allowReplaceDrive(drive))return;
   const mode=mountMode();
   try{const r=await put(`/api/mount/device?drive=${drive}&mode=${mode}&image=${encodeURIComponent(path)}`);
     toast(`Mounted on ${drive.toUpperCase()} ✓`,"ok");
@@ -2182,7 +2226,7 @@ async function refreshDrives(){
   }finally{DRIVES_IN_FLIGHT=false}
 }
 async function driveAct(d,a){
-  if(a==="remove"&&DRIVE_STATE[d]?.mode==="unlinked"&&!confirm(`Drive ${d.toUpperCase()} is mounted UNLINKED. Removing it discards temporary writes. Continue?`))return;
+  if(a==="remove"&&DRIVE_STATE[d]?.mode==="unlinked"&&!await u64Confirm(`Drive ${d.toUpperCase()} is mounted UNLINKED. Removing it discards temporary writes. Continue?`))return;
   try{await put(`/api/drives/${d}/${a}`);refreshDrives()}catch(e){toast(e.message,"err")}
 }
 
@@ -2198,7 +2242,7 @@ async function localOpen(){
   try{const r=await api("/api/image/open/upload",{method:"POST",body:fd});showInspector(r)}
   catch(e){toast(e.message,"err")}}
 async function localMount(drive){
-  if(!allowReplaceDrive(drive))return;
+  if(!await allowReplaceDrive(drive))return;
   const f=$("#localfile").files[0];if(!f){toast("Choose a file first","err");return}
   const fd=new FormData();fd.append("file",f);fd.append("drive",drive);
   fd.append("mode",$("#localmode").value);
@@ -2410,13 +2454,13 @@ async function diskNamingAnalyse(){
 async function diskNamingApproveRule(index){
   const item=DISKNAMING.report?.candidates?.[index];if(!item)return;
   const examples=(item.examples||[]).map(x=>`${x.parent}: ${(x.names||[]).join(" | ")}`).slice(0,4).join("\n");
-  if(!confirm(`Approve this reusable disk-grouping pattern?\n\n${item.pattern}\n${item.sets} sets / ${item.files} files\nScope: all indexed folders\n\n${examples}\n\nThe constrained rule will persist across index rebuilds. No files will be renamed or modified.`))return;
+  if(!await u64Confirm(`Approve this reusable disk-grouping pattern?\n\n${item.pattern}\n${item.sets} sets / ${item.files} files\nScope: all indexed folders\n\n${examples}\n\nThe constrained rule will persist across index rebuilds. No files will be renamed or modified.`))return;
   try{const r=await api("/api/fs/index/disk-naming/rules",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pattern_key:item.pattern_key,scope:"/"}),timeoutMs:60000});diskNamingRender(r.analysis);toast("Disk-grouping pattern approved","ok")}
   catch(e){toast(e.message,"err")}
 }
 async function diskNamingApproveRuleForFolder(candidateIndex,exampleIndex){
   const candidate=DISKNAMING.report?.candidates?.[Number(candidateIndex)],item=candidate?.examples?.[Number(exampleIndex)];if(!candidate||!item)return;
-  if(!confirm(`Approve this disk-grouping pattern only for this folder?\n\n${candidate.pattern}\nScope: ${item.parent}\n\n${(item.names||[]).join("\n")}\n\nThe constrained rule persists across index rebuilds but applies only inside this folder. No files are modified.`))return;
+  if(!await u64Confirm(`Approve this disk-grouping pattern only for this folder?\n\n${candidate.pattern}\nScope: ${item.parent}\n\n${(item.names||[]).join("\n")}\n\nThe constrained rule persists across index rebuilds but applies only inside this folder. No files are modified.`))return;
   try{const r=await api("/api/fs/index/disk-naming/rules",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pattern_key:candidate.pattern_key,scope:item.parent}),timeoutMs:60000});diskNamingRender(r.analysis);toast("Folder-scoped disk-grouping pattern approved","ok")}
   catch(e){toast(e.message,"err")}
 }
@@ -2424,7 +2468,7 @@ async function diskNamingApproveExactByIndex(section,itemIndex,exampleIndex){
   const map={candidate:"candidates",ambiguous:"ambiguous",rejected:"rejected"},key=map[section];
   const item=key?DISKNAMING.report?.[key]?.[Number(itemIndex)]?.examples?.[Number(exampleIndex)]:null;if(!item)return;
   const warning=section==="rejected"?"\n\nThis set was rejected by a safety rule. Exact approval overrides that protection only for these filenames.":section==="ambiguous"?"\n\nThis set is ambiguous. Confirm only if these files are genuinely swap media.":"";
-  if(!confirm(`Approve this exact disk set only?\n\n${item.parent}\n${(item.names||[]).join("\n")}${warning}\n\nOnly these indexed filenames in this folder will be grouped. No reusable pattern is created and no files are modified.`))return;
+  if(!await u64Confirm(`Approve this exact disk set only?\n\n${item.parent}\n${(item.names||[]).join("\n")}${warning}\n\nOnly these indexed filenames in this folder will be grouped. No reusable pattern is created and no files are modified.`))return;
   try{
     const path=section==="ambiguous"&&item.set_id?"/api/fs/index/disk-naming/overrides/batch":"/api/fs/index/disk-naming/overrides";
     const body=section==="ambiguous"&&item.set_id?{set_ids:[item.set_id]}:{parent:item.parent,names:item.names,label:`approved ${section} set from disk naming analysis`};
@@ -2444,8 +2488,8 @@ async function diskNamingApproveAmbiguousBatch(mode){
   const files=all?(DISKNAMING.report?.ambiguous||[]).reduce((n,item)=>n+Number(item.files||0),0):items.reduce((n,item)=>n+Number(item.total_files||(item.names||[]).length),0);
   const examples=items.slice(0,5).map(item=>`${item.parent}: ${(item.names||[]).join(" | ")}`).join("\n");
   const scope=all?`every current ambiguous disk set, including sets not displayed as examples`:`the ${ids.length} selected examples`;
-  if(!confirm(`Approve ${totalSets.toLocaleString()} ambiguous disk sets?\n\n${files.toLocaleString()} files in ${folders.toLocaleString()} folders\nScope: ${scope}\n\n${examples}${items.length>5||all?"\n…":""}\n\nThis creates exact local set approvals only. It does not create a general filename pattern, rename files or modify the storage index.`))return;
-  if(all&&totalSets>250&&!confirm(`Final confirmation: approve all ${totalSets.toLocaleString()} current ambiguous disk sets as exact local sets?`))return;
+  if(!await u64Confirm(`Approve ${totalSets.toLocaleString()} ambiguous disk sets?\n\n${files.toLocaleString()} files in ${folders.toLocaleString()} folders\nScope: ${scope}\n\n${examples}${items.length>5||all?"\n…":""}\n\nThis creates exact local set approvals only. It does not create a general filename pattern, rename files or modify the storage index.`))return;
+  if(all&&totalSets>250&&!await u64Confirm(`Final confirmation: approve all ${totalSets.toLocaleString()} current ambiguous disk sets as exact local sets?`))return;
   try{
     DISKNAMING.busy=true;
     const r=await api("/api/fs/index/disk-naming/overrides/batch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(all?{all_ambiguous:true}:{set_ids:ids}),timeoutMs:120000});
@@ -2457,27 +2501,27 @@ async function diskNamingApproveAmbiguousFolder(parent){
   const stats=(DISKNAMING.report?.ambiguous_folders||[]).find(item=>(item.parent||"/").toLowerCase()===(parent||"/").toLowerCase());
   if(!stats){toast("That folder no longer has ambiguous sets in the current report","err");return}
   const examples=diskNamingAmbiguousShown().filter(item=>(item.parent||"/").toLowerCase()===(parent||"/").toLowerCase()).slice(0,4).map(item=>(item.names||[]).join(" | ")).join("\n");
-  if(!confirm(`Approve every ambiguous disk set in this folder?\n\n${stats.parent}\n${stats.sets} sets / ${stats.files} files\n\n${examples}\n\nThis creates exact local set approvals only. It does not create a reusable pattern or modify files.`))return;
+  if(!await u64Confirm(`Approve every ambiguous disk set in this folder?\n\n${stats.parent}\n${stats.sets} sets / ${stats.files} files\n\n${examples}\n\nThis creates exact local set approvals only. It does not create a reusable pattern or modify files.`))return;
   try{const r=await api("/api/fs/index/disk-naming/overrides/batch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({parent:stats.parent}),timeoutMs:60000});diskNamingRender(r.analysis);toast(`${r.summary.sets} folder sets approved`,"ok")}
   catch(e){toast(e.message,"err")}
 }
 
 async function diskNamingRuleToggle(id,enabled){try{const r=await api(`/api/fs/index/disk-naming/rules/${id}`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled})});diskNamingRender(r.analysis)}catch(e){toast(e.message,"err")}}
-async function diskNamingRuleRemove(id){if(!confirm("Remove this approved disk-grouping pattern?\n\nFiles and index entries are not changed."))return;try{const r=await api(`/api/fs/index/disk-naming/rules/${id}`,{method:"DELETE"});diskNamingRender(r.analysis);toast("Disk-grouping pattern removed","ok")}catch(e){toast(e.message,"err")}}
+async function diskNamingRuleRemove(id){if(!await u64Confirm("Remove this approved disk-grouping pattern?\n\nFiles and index entries are not changed."))return;try{const r=await api(`/api/fs/index/disk-naming/rules/${id}`,{method:"DELETE"});diskNamingRender(r.analysis);toast("Disk-grouping pattern removed","ok")}catch(e){toast(e.message,"err")}}
 async function diskNamingOverrideToggle(id,enabled){try{const r=await api(`/api/fs/index/disk-naming/overrides/${id}`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled})});diskNamingRender(r.analysis)}catch(e){toast(e.message,"err")}}
-async function diskNamingOverrideRemove(id){if(!confirm("Remove this approved exact disk set?\n\nFiles and index entries are not changed."))return;try{const r=await api(`/api/fs/index/disk-naming/overrides/${id}`,{method:"DELETE"});diskNamingRender(r.analysis);toast("Exact disk set removed","ok")}catch(e){toast(e.message,"err")}}
+async function diskNamingOverrideRemove(id){if(!await u64Confirm("Remove this approved exact disk set?\n\nFiles and index entries are not changed."))return;try{const r=await api(`/api/fs/index/disk-naming/overrides/${id}`,{method:"DELETE"});diskNamingRender(r.analysis);toast("Exact disk set removed","ok")}catch(e){toast(e.message,"err")}}
 async function diskNamingManageExactSelected(action){
   const ids=[...document.querySelectorAll(".disk-naming-approved-exact-check:checked")].map(box=>Number(box.dataset.id)).filter(Number.isInteger);
   if(!ids.length){toast("Select one or more approved exact sets","err");return}
   const verb={enable:"Enable",disable:"Disable",remove:"Remove"}[action];if(!verb)return;
-  if(!confirm(`${verb} ${ids.length} selected exact-set approvals?\n\nFiles and index entries are not changed.`))return;
+  if(!await u64Confirm(`${verb} ${ids.length} selected exact-set approvals?\n\nFiles and index entries are not changed.`))return;
   try{const r=await api("/api/fs/index/disk-naming/overrides/manage",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action,ids}),timeoutMs:60000});diskNamingRender(r.analysis);toast(`${r.result.count} exact-set approvals ${action}d`,"ok")}
   catch(e){toast(e.message,"err")}
 }
 async function diskNamingRemoveAllApprovals(){
   const rules=DISKNAMING.report?.rules?.length||0,overrides=DISKNAMING.report?.overrides?.length||0,total=rules+overrides;if(!total)return;
-  if(!confirm(`Remove all local disk-grouping approvals?\n\n${rules} reusable rules\n${overrides} exact sets\n\nFiles and index entries will not be changed. Built-in disk detection, including terminal -a/-b grouping, will continue to work.`))return;
-  if(!confirm("Final confirmation: remove every local reusable rule and exact-set approval now?"))return;
+  if(!await u64Confirm(`Remove all local disk-grouping approvals?\n\n${rules} reusable rules\n${overrides} exact sets\n\nFiles and index entries will not be changed. Built-in disk detection, including terminal -a/-b grouping, will continue to work.`))return;
+  if(!await u64Confirm("Final confirmation: remove every local reusable rule and exact-set approval now?"))return;
   try{const r=await api("/api/fs/index/disk-naming/approvals",{method:"DELETE",timeoutMs:60000});diskNamingRender(r.analysis);toast(`${r.removed.total} local approvals removed`,"ok")}
   catch(e){toast(e.message,"err")}
 }
@@ -2496,7 +2540,7 @@ async function cacheClearImages(){
     toast("Cleared "+r.cleared+" cached image dirs; completed roots will be refreshed","ok");cacheStatsLoad()}
   catch(e){toast(e.message,"err")}}
 async function cacheClearIndex(){
-  if(!confirm("Clear the entire local storage index?\n\nThis does not delete anything from the Ultimate. Approved disk-grouping rules and exact sets are preserved, but searches will use live FTP until you index again."))return;
+  if(!await u64Confirm("Clear the entire local storage index?\n\nThis does not delete anything from the Ultimate. Approved disk-grouping rules and exact sets are preserved, but searches will use live FTP until you index again."))return;
   try{await api("/api/cache/clear_index",{method:"POST"});
     toast("Local storage index cleared","ok");cacheStatsLoad()}
   catch(e){toast(e.message,"err")}}
@@ -3250,7 +3294,7 @@ async function jkSidIndexUltimate(){
     if(state.running){await api("/api/juke/index/stop",{method:"POST"});toast("Stopping SID metadata refresh…","ok");return}
     const root=$("#jkSidRoot").value.trim()||$("#jkPath").value.trim();
     if(!root){toast("Enter or detect the Ultimate HVSC path","err");return}
-    if(!confirm(`Refresh SID metadata from the Ultimate?\n\n${root}\n\nOnly SID headers are read. A complete collection may take a long time over FTP; the local option is faster.`))return;
+    if(!await u64Confirm(`Refresh SID metadata from the Ultimate?\n\n${root}\n\nOnly SID headers are read. A complete collection may take a long time over FTP; the local option is faster.`))return;
     await api("/api/juke/index/ultimate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({root,force:$("#jkSidForce").checked})});
     toast("SID metadata refresh started from Ultimate","ok");jkSidIndexPollStart();
   }catch(e){toast(e.message,"err")}
@@ -3261,7 +3305,7 @@ async function jkSidIndexLocal(){
     if(state.running){await api("/api/juke/index/stop",{method:"POST"});toast("Stopping SID metadata refresh…","ok");return}
     const source=$("#jkSidSource").value.trim(),root=$("#jkSidRoot").value.trim()||"/USB0/HVSC";
     if(!source){toast("Choose the local HVSC folder","err");return}
-    if(!confirm(`Build the SID metadata index from:\n\n${source}\n\nas ${root}?\n\nThe scan reads only SID headers and does not modify files.`))return;
+    if(!await u64Confirm(`Build the SID metadata index from:\n\n${source}\n\nas ${root}?\n\nThe scan reads only SID headers and does not modify files.`))return;
     await api("/api/juke/index/local",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({source,root,force:$("#jkSidForce").checked})});
     toast("Local SID metadata scan started","ok");jkSidIndexPollStart();
   }catch(e){toast(e.message,"err")}
@@ -3389,7 +3433,7 @@ async function jkClearQueue(){
   const keepCurrent=!!(s.playing&&s.index>=0&&s.index<items.length);
   const removeCount=Math.max(0,items.length-(keepCurrent?1:0));
   if(!removeCount&&!s.radio){toast(keepCurrent?"No queued tunes behind the current SID":"Play queue is already empty","ok");return}
-  if(removeCount>1&&!confirm(`Clear ${removeCount} queued tunes?\n\n${keepCurrent?"The current SID will continue playing and Radio will be turned off.":"Radio will be turned off."}`))return;
+  if(removeCount>1&&!await u64Confirm(`Clear ${removeCount} queued tunes?\n\n${keepCurrent?"The current SID will continue playing and Radio will be turned off.":"Radio will be turned off."}`))return;
   try{const out=await api("/api/juke/clear",{method:"POST"});jkRender(out);
     toast(out.cleared?
       (out.kept_current?`Cleared ${out.cleared} queued tunes — current SID will stop at its normal end`:`Play queue cleared (${out.cleared} tunes)`):
@@ -3472,12 +3516,12 @@ async function sidflowStatusLoad(){
     if($("#sidflowStatus"))$("#sidflowStatus").textContent="SIDFlow status unavailable: "+e.message;return null}
 }
 async function sidflowDownload(skipConfirm=false){
-  if(!skipConfirm&&!confirm("Download the pinned SIDFlow 0.8.0 similarity export?\n\nThe download is about 194 MB. It expands temporarily to about 982 MB and needs roughly 1.8 GiB free while u64deck verifies, imports and safely promotes the new database. Your current working SIDFlow database is kept unless the entire update succeeds."))return false;
+  if(!skipConfirm&&!await u64Confirm("Download the pinned SIDFlow 0.8.0 similarity export?\n\nThe download is about 194 MB. It expands temporarily to about 982 MB and needs roughly 1.8 GiB free while u64deck verifies, imports and safely promotes the new database. Your current working SIDFlow database is kept unless the entire update succeeds."))return false;
   try{const s=await api("/api/sidflow/download",{method:"POST",timeoutMs:10000});sidflowStatusRender(s);toast("SIDFlow similarity download started","ok");return true}
   catch(e){toast(e.message,"err");return false}
 }
 async function sidflowRemove(){
-  if(!confirm("Remove the local SIDFlow similarity database?\n\nThe SID Jukebox and your HVSC files are not affected."))return;
+  if(!await u64Confirm("Remove the local SIDFlow similarity database?\n\nThe SID Jukebox and your HVSC files are not affected."))return;
   try{const s=await api("/api/sidflow",{method:"DELETE"});sidflowStatusRender(s);toast("SIDFlow similarity data removed","ok")}
   catch(e){toast(e.message,"err")}
 }
@@ -3485,12 +3529,12 @@ async function sidflowEnsure(){
   const s=await sidflowStatusLoad();
   if(s?.available&&!s?.needs_update&&!s?.quality_warning)return true;
   if(s?.needs_update){
-    if(confirm(`SIDFlow ${s.supported_release||"0.8.0"} is required for the improved weighted recommendations.\n\nUpdate it now?`))await sidflowDownload(true);
+    if(await u64Confirm(`SIDFlow ${s.supported_release||"0.8.0"} is required for the improved weighted recommendations.\n\nUpdate it now?`))await sidflowDownload(true);
     tab("settings");return false
   }
   if(s?.quality_warning){toast(s.quality_warning,"err");tab("settings");return false}
   if(s?.job?.running){toast("SIDFlow similarity data is still being prepared","ok");tab("settings");return false}
-  if(confirm("More like this and Radio use SIDFlow similarity data by Chris Gleissner.\n\nDownload and prepare it now?")){
+  if(await u64Confirm("More like this and Radio use SIDFlow similarity data by Chris Gleissner.\n\nDownload and prepare it now?")){
     await sidflowDownload(true);tab("settings");
   }
   return false;
@@ -3540,7 +3584,7 @@ async function qlAdd(){
   catch(e){toast(e.message,"err")}
 }
 async function qlDel(name){
-  if(!confirm("Remove "+name+" from the library?"))return;
+  if(!await u64Confirm("Remove "+name+" from the library?"))return;
   try{await api("/api/library/delete?name="+encodeURIComponent(name),{method:"POST"});qlRefresh()}
   catch(e){toast(e.message,"err")}
 }

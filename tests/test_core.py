@@ -1880,7 +1880,7 @@ def test_frontend_is_split_without_a_build_tool():
 def test_release_metadata_is_centralised():
     import release
     assert server.VERSION == release.VERSION == "1.9.0"
-    assert release.RELEASE_LABEL == "Release Candidate 44"
+    assert release.RELEASE_LABEL == "Release Candidate 45"
     assert server.BUILD == release.build_id(server.ASSETS, Path(server.__file__).parent)
 
 
@@ -2843,7 +2843,7 @@ def test_release_help_and_now_playing_star_are_present():
     assert "jkToggleNowFavourite" in js
     assert ".u64deck-index.sqlite3" in help_js
     assert "star beside the playback controls" in help_js
-    assert "v1.9.0 — Release Candidate 44" in readme
+    assert "v1.9.0 — Release Candidate 45" in readme
     assert ".u64deck-index.sqlite3" in readme
     assert "Install every release into a **new, empty folder**" in readme
     assert "Do not copy `*-wal`" in readme
@@ -6768,9 +6768,9 @@ def test_rc32_documentation_identity_and_inherited_sidflow_contract():
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
     help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
     build = server.BUILD
-    assert f"v1.9.0 — Release Candidate 44 · build {build}" in readme
+    assert f"v1.9.0 — Release Candidate 45 · build {build}" in readme
     assert f"**Public release-candidate build:** `{build}`" in changelog
-    assert "git tag v1.9.0-rc.44 && git push --tags" in readme
+    assert "git tag v1.9.0-rc.45 && git push --tags" in readme
     assert "Analyse Disk-Image Names" in readme
     assert "terminal hyphen-delimited" in readme
     assert "SQLite schema v5" in changelog
@@ -7849,8 +7849,8 @@ def test_rc32_docs_describe_queue_contract_and_identity():
     root = Path(server.ROOT)
     readme = (root / "README.md").read_text(encoding="utf-8")
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert "Release Candidate 44" in readme
-    assert "Release Candidate 44" in changelog
+    assert "Release Candidate 45" in readme
+    assert "Release Candidate 45" in changelog
     assert "does not invalidate" in readme
 
 
@@ -9218,3 +9218,44 @@ def test_rc44_corrected_exit_button_is_hidden_until_local_config_confirms():
     js = (root / "static" / "app.js").read_text(encoding="utf-8")
     assert re.search(r'id="btnAppExit"[^>]*style="display:none"', html)
     assert 'exitBtn.style.display=c.local_exit_available!==false?"":"none"' in js
+
+
+# --- v1.9.0 Release Candidate 45: C64-themed confirmation modal ---
+
+def test_rc45_replaces_native_confirmation_popups_with_one_modal():
+    root = Path(server.ROOT)
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    css = (root / "static" / "app.css").read_text(encoding="utf-8")
+    assert 'id="confirmOverlay"' in html
+    assert 'role="dialog"' in html and 'aria-modal="true"' in html
+    assert 'id="confirmCancel"' in html and 'id="confirmOk"' in html
+    assert 'onclick="confirmPowerOff()"' in html
+    assert 'onclick="confirmFactoryDefaults()"' in html
+    assert not re.search(r"(?:window\.)?confirm\s*\(", js)
+    assert js.count("await u64Confirm(") == 33
+    assert "function u64Confirm(message,options={})" in js
+    assert "function u64ConfirmResolve(value)" in js
+    assert "U64_CONFIRM_STATE" in js
+    assert 'e.key==="Escape"' in js and 'e.key==="Tab"' in js and 'e.key==="Enter"' in js
+    assert 'if(e.key==="Enter"){' in js
+    assert 'document.activeElement!==cancel' not in js
+    assert ".confirm-overlay" in css and "var(--c64-screen)" in css and "var(--c64-border)" in css
+    assert "confirm-warning" in css and "var(--c64-yellow)" in css
+    assert "confirm-danger" in css and "var(--c64-light-red)" in css
+    assert 'classList.remove("warning","danger")' in js
+    assert 'variant:"warning"' in js
+    assert "border:5px solid" not in css
+
+
+def test_rc45_async_drive_confirmation_paths_are_awaited():
+    js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
+    assert "async function allowReplaceDrive(drive)" in js
+    assert "if(!allowReplaceDrive(" not in js
+    assert js.count("if(!await allowReplaceDrive(") == 6
+
+
+def test_rc45_keeps_existing_toast_status_colours():
+    css = (Path(server.ASSETS) / "static" / "app.css").read_text(encoding="utf-8")
+    assert ".toast.ok{border-left-color:var(--ok)}" in css
+    assert ".toast.err{border-left-color:var(--err)}" in css

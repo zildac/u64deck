@@ -1,7 +1,8 @@
 :root{
   --bg:#0d0e1a; --panel:#14162a; --raised:#1a1d36; --line:#272c4c;
   --txt:#ccd0ef; --dim:#7c82ac; --acc:#8b93ff; --acc2:#b9beff;
-  --c64-border:#7869C4; --c64-screen:#40318D;
+  --c64-border:#7869C4; --c64-screen:#40318D; --c64-text:#B9BEFF;
+  --c64-yellow:#B8C76F; --c64-orange:#8B5429; --c64-red:#883932; --c64-light-red:#CD5C5C;
   --ok:#79d99b; --warn:#ffb85c; --err:#ff8080;
   --mono:"IBM Plex Mono","Cascadia Mono","JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;
 }
@@ -280,6 +281,39 @@ pre.raw{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
 .mount-badge.readonly{color:var(--ok);border-color:var(--ok)}
 .mount-badge.readwrite{color:var(--warn);border-color:var(--warn)}
 .mount-badge.unlinked{color:var(--acc2);border-color:var(--acc2)}
+/* u64deck confirmation modal: C64 boot-screen styling across browser/OS */
+.confirm-overlay{position:fixed;inset:0;z-index:400;display:flex;align-items:center;justify-content:center;
+  padding:24px;background:rgba(5,6,15,.80);backdrop-filter:blur(2px)}
+.confirm-overlay[hidden]{display:none}
+.confirm-window{position:relative;width:min(560px,calc(100vw - 32px));max-height:min(78vh,640px);overflow:auto;
+  background:var(--c64-screen);border:2px solid var(--c64-border);border-radius:7px;padding:22px;
+  box-shadow:0 20px 70px rgba(0,0,0,.72),0 0 0 1px rgba(13,14,26,.9),
+    inset 0 0 0 1px rgba(185,190,255,.22)}
+.confirm-window::before{content:"";position:absolute;inset:7px;border:1px solid rgba(185,190,255,.30);
+  border-radius:3px;pointer-events:none}
+.confirm-title{position:relative;color:var(--c64-text);font-size:14px;font-weight:800;letter-spacing:.12em;
+  margin:0 0 14px;padding:0 0 10px;border-bottom:1px solid rgba(185,190,255,.34)}
+.confirm-title::before{content:"";display:inline-block;width:9px;height:9px;margin-right:9px;
+  background:var(--c64-border);box-shadow:0 0 0 1px rgba(13,14,26,.45)}
+.confirm-overlay.warning .confirm-title{color:var(--c64-yellow);border-bottom-color:rgba(184,199,111,.48)}
+.confirm-overlay.warning .confirm-title::before{background:var(--c64-yellow)}
+.confirm-overlay.danger .confirm-title{color:#F0B6B6;border-bottom-color:rgba(205,92,92,.56)}
+.confirm-overlay.danger .confirm-title::before{background:var(--c64-light-red)}
+.confirm-message{position:relative;white-space:pre-wrap;overflow-wrap:anywhere;color:#F0F1FF;line-height:1.58}
+.confirm-actions{position:relative;display:flex;justify-content:flex-end;gap:9px;margin-top:20px}
+.confirm-actions button{min-width:92px;background:#29205F;border-color:var(--c64-border);color:#E2E0FF;
+  border-radius:5px}
+.confirm-actions button:hover{border-color:var(--c64-text);color:#fff}
+.confirm-actions #confirmOk.primary{background:var(--c64-border);border-color:var(--c64-border);color:#17102F;font-weight:700}
+.confirm-actions #confirmOk.primary:hover{background:var(--c64-text);border-color:var(--c64-text);color:#17102F}
+.confirm-actions #confirmOk.confirm-warning{background:var(--c64-yellow);border-color:var(--c64-yellow);color:#24250F;font-weight:800}
+.confirm-actions #confirmOk.confirm-warning:hover{filter:brightness(1.10)}
+.confirm-actions #confirmOk.confirm-danger{background:var(--c64-light-red);border-color:var(--c64-light-red);color:#210B0B;font-weight:800}
+.confirm-actions #confirmOk.confirm-danger:hover{background:#DE7777;border-color:#DE7777;color:#210B0B}
+@media(max-width:560px){.confirm-overlay{padding:12px}.confirm-window{width:100%;padding:19px}.confirm-actions button{flex:1}}
+@media (prefers-reduced-motion:no-preference){.confirm-window{animation:confirm-in .11s ease-out}}
+@keyframes confirm-in{from{transform:translateY(5px) scale(.99);opacity:.72}to{transform:none;opacity:1}}
+
 .help-overlay{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.76);padding:4vh 4vw}
 .help-window{height:92vh;max-width:1260px;margin:auto;background:var(--panel);border:1px solid var(--line);
   border-radius:12px;box-shadow:0 20px 80px rgba(0,0,0,.65);display:flex;flex-direction:column;overflow:hidden}

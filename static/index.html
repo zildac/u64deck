@@ -27,7 +27,7 @@
     <button onclick="machine('pause')">Pause C64</button>
     <button onclick="machine('resume')">Resume C64</button>
     <button onclick="machine('menu_button')" title="Open the Ultimate menu on the C64 display">Ultimate Menu</button>
-    <button class="danger" onclick="if(confirm('Power off the Ultimate 64?'))machine('poweroff')">Power Off Ultimate</button>
+    <button class="danger" onclick="confirmPowerOff()">Power Off Ultimate</button>
   </div>
 </header>
 
@@ -602,7 +602,7 @@
       <button class="primary" onclick="saveDirty()" id="btnApply" disabled>Apply Changes</button>
       <button onclick="cfgAction('save_to_flash')">Save to Flash</button>
       <button onclick="cfgAction('load_from_flash')">Load from Flash</button>
-      <button class="danger" onclick="if(confirm('Reset ALL settings to factory defaults?'))cfgAction('reset_to_default')">Factory Defaults</button>
+      <button class="danger" onclick="confirmFactoryDefaults()">Factory Defaults</button>
       <span class="hint">Changes apply to the running config; “Save to flash” makes them stick.</span>
     </div>
     <div class="setgrid firmware-settings-grid">
@@ -787,6 +787,17 @@
   </div>
 </section>
 </main>
+
+<div id="confirmOverlay" class="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="confirmTitle" aria-describedby="confirmMessage" hidden>
+  <div class="confirm-window" role="document">
+    <div id="confirmTitle" class="confirm-title">PLEASE CONFIRM</div>
+    <div id="confirmMessage" class="confirm-message"></div>
+    <div class="confirm-actions">
+      <button id="confirmCancel" type="button" onclick="u64ConfirmResolve(false)">Cancel</button>
+      <button id="confirmOk" type="button" class="primary" onclick="u64ConfirmResolve(true)">OK</button>
+    </div>
+  </div>
+</div>
 
 <div id="globalTooltip" class="global-tooltip" role="tooltip" aria-hidden="true"></div>
 <div id="toasts"></div>

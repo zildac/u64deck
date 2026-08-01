@@ -30,7 +30,7 @@ when testing the Ethernet REST endpoint itself.
 
 # u64deck
 
-**v1.9.0 — Release Candidate 44 · build fc1e0fb**
+**v1.9.0 — Release Candidate 45 · build 6feaede**
 
 
 A lightweight, self-hosted control deck for the **Ultimate 64** (and, minus the
@@ -214,7 +214,7 @@ does not stop the server. The connected Ultimate continues running.
 
 ### Tier 3 — Anywhere else (or by hand)
 
-The original cross-platform source launch remains available:
+Anywhere else (or by hand):
 
 ```bash
 pip install -r requirements.txt
@@ -229,46 +229,7 @@ available keys (`u64_host`, the Ultimate network `password`, FTP credentials,
 `local_ip`, `stream_transport`, multicast groups and
 `assembly64.client_id`).
 
-#### Linux Preview 4 — source-run preview
-
-Linux Preview 4 is a preview rather than the stable supported build. It is
-provided as-is for testing on recent Debian/Ubuntu-derived desktops; expect
-rough edges and report Linux issues with the complete version/build string.
-Windows remains the stable distribution.
-
-Extract the `.tar.gz`, then run as a normal user:
-
-```bash
-chmod +x install.sh u64deck.sh
-./install.sh
-./u64deck.sh
-```
-
-`install.sh` creates a private `.venv` inside the extracted application folder,
-installs `requirements.txt` there, creates an application-menu entry and a
-`~/.local/bin/u64deck` launcher. It never invokes `sudo` or changes system
-Python. Chromium, Chrome or Edge app-window mode is used when available;
-otherwise u64deck opens the system browser or prints the local URL.
-
-### Persistent-file locations
-
-The two platforms deliberately use different storage conventions:
-
-| Data | Windows | Linux Preview |
-|---|---|---|
-| Settings | `config.json` beside `u64deck.exe` | `${XDG_CONFIG_HOME:-~/.config}/u64deck/config.json` |
-| Storage/SID index | `.u64deck-index.sqlite3` beside the EXE | `${XDG_DATA_HOME:-~/.local/share}/u64deck/.u64deck-index.sqlite3` |
-| SIDFlow database | `.sidflow-similarity.sqlite` beside the EXE | `${XDG_DATA_HOME:-~/.local/share}/u64deck/.sidflow-similarity.sqlite` |
-| Favourites/recents | `user_items.json` beside the EXE | `${XDG_DATA_HOME:-~/.local/share}/u64deck/user_items.json` |
-| SID playlists | `playlists.json` beside the EXE | `${XDG_DATA_HOME:-~/.local/share}/u64deck/playlists.json` |
-| Logs | console / application folder context | `${XDG_STATE_HOME:-~/.local/state}/u64deck/u64deck.log` |
-
-Linux does not read JSON or SQLite runtime files placed beside the `.sh`
-scripts. Print the active paths with `./u64deck.sh --linux-print-paths`.
-
 ### Updating an existing installation
-
-#### Windows
 
 Install every release into a **new, empty folder**. Stop the previous u64deck
 process completely before copying user data, and do not extract a new release
@@ -295,29 +256,6 @@ Always run u64deck as a normal user, and always the same way — mixing elevated
 ('Run as administrator') and normal launches leaves files with mismatched
 ownership and causes access-denied errors. If that has happened, use a fresh
 folder and copy only the supported persistent files listed above.
-
-#### Linux Preview
-
-Extract the new tarball into a new folder, use **Exit u64deck** in the old
-version, then run `./update-linux.sh` from the new folder. The updater installs
-the new private virtual environment, repoints the menu/command launchers and
-retains the XDG configuration and data directories. It leaves the previous
-application folder untouched. `./update-linux.sh --rollback /path/to/old/u64deck`
-repoints the launchers to a previous installed folder.
-
-For a Windows installation or an older Linux preview that stored persistent
-files beside its launcher, stop u64deck and run:
-
-```bash
-./import-existing-data.sh /path/to/old/u64deck
-```
-
-The importer copies supported settings, favourites, playlists, SIDFlow data and
-indexes into the Linux XDG locations, backs up anything it replaces, skips
-`-wal`/`-shm` files and leaves the source untouched. Windows filesystem paths
-inside `config.json`, favourites or an index are reported because Linux mount
-paths may need changing; a storage/SID index containing obsolete Windows paths
-may need to be rebuilt.
 
 ## Interface-aware Ultimate discovery
 
@@ -591,7 +529,7 @@ The repo includes a PyInstaller spec and a GitHub Actions workflow
 1. Push this folder to a GitHub repo.
 2. The **build-exe** action runs on every push — grab `u64deck.exe` from the
    workflow's artifacts (Actions tab → latest run → *u64deck-windows*).
-3. Tag a release (`git tag v1.9.0-rc.44 && git push --tags`) and the exe is attached
+3. Tag a release (`git tag v1.9.0-rc.45 && git push --tags`) and the exe is attached
    to the GitHub Release automatically.
 
 Double-click the exe: it starts the server, opens the dedicated Edge app, and
