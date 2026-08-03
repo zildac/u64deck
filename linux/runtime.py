@@ -1,4 +1,4 @@
-"""Build the ephemeral Linux/XDG runtime facade without modifying RC45 core files."""
+"""Build the ephemeral Linux/XDG runtime facade without modifying RC48 core files."""
 from __future__ import annotations
 
 import hashlib
@@ -70,10 +70,10 @@ def _atomic_write(path: Path, data: bytes, mode: int = 0o644) -> None:
 
 
 def _generated_release(build: str) -> str:
-    return f'''"""Generated Linux Preview release metadata; RC45 source remains unchanged."""
+    return f'''"""Generated Linux Preview release metadata; RC48 source remains unchanged."""
 VERSION = {PREVIEW_VERSION!r}
 RELEASE_LABEL = {PREVIEW_LABEL!r}
-BASE_RELEASE_LABEL = "Release Candidate 45"
+BASE_RELEASE_LABEL = "Release Candidate 48"
 BASE_BUILD = {BASE_BUILD!r}
 BUILD_STAMP_NAME = "u64deck-build-id.txt"
 
@@ -98,14 +98,14 @@ def _generated_server(source_root: Path, config_dir: Path, data_dir: Path) -> by
         'CONFIG_ROOT.mkdir(parents=True, exist_ok=True)\n'
     )
     if old not in text:
-        raise RuntimeError("RC45 ROOT declaration no longer matches the reviewed baseline")
+        raise RuntimeError("RC48 ROOT declaration no longer matches the reviewed baseline")
     text = text.replace(old, new, 1)
     text = text.replace('path = ROOT / "config.json"', 'path = CONFIG_ROOT / "config.json"', 1)
     text = text.replace('_write_json_atomic(ROOT / "config.json", CFG, indent=2)',
                         '_write_json_atomic(CONFIG_ROOT / "config.json", CFG, indent=2)', 1)
     text = text.replace(
         '"u64deck": {"version": VERSION, "release_label": RELEASE_LABEL,\n                    "build": BUILD, "frozen": FROZEN},',
-        '"u64deck": {"version": VERSION, "release_label": RELEASE_LABEL,\n                    "build": BUILD, "frozen": FROZEN,\n                    "base_release": "Windows v1.9.0 RC45",\n                    "base_build": "6feaede"},',
+        '"u64deck": {"version": VERSION, "release_label": RELEASE_LABEL,\n                    "build": BUILD, "frozen": FROZEN,\n                    "base_release": "Windows v1.9.0 RC48",\n                    "base_build": "c0d1fb0"},',
         1,
     )
     return text.encode("utf-8")
@@ -119,7 +119,7 @@ def _copy_static_overlay(source_root: Path, target: Path) -> None:
     index = target / "index.html"
     text = index.read_text(encoding="utf-8")
     text = text.replace("<title>u64deck</title>",
-                        "<title>u64deck v1.9.0 · Linux Preview 5</title>", 1)
+                        "<title>u64deck v1.9.0 · Linux Preview 7</title>", 1)
     text = text.replace("U64DECK HELP", "U64DECK LINUX PREVIEW HELP", 1)
     text = text.replace("close its dedicated Edge app window",
                         "close its dedicated Linux app window", 1)
@@ -130,7 +130,7 @@ def prepare_runtime(source_root: Path) -> tuple[Path, dict[str, Path], str]:
     source_root = Path(source_root).resolve()
     ok, failures = verify_core(source_root)
     if not ok:
-        raise RuntimeError("RC45 core-integrity check failed:\n  " + "\n  ".join(failures))
+        raise RuntimeError("RC48 core-integrity check failed:\n  " + "\n  ".join(failures))
     paths = ensure_xdg_paths()
     build = linux_build_id(source_root)
     runtime = paths["cache"] / f"runtime-{build}"

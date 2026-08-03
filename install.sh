@@ -61,7 +61,7 @@ chmod +x "$BIN_DIR/u64deck"
 cat > "$APP_DIR/u64deck.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=u64deck Linux Preview 5
+Name=u64deck Linux Preview 7
 Comment=Ultimate 64 control deck
 Exec="$SCRIPT_DIR/u64deck.sh"
 Icon=$SCRIPT_DIR/u64deck.ico
@@ -86,7 +86,7 @@ if ((${#runtime_files[@]})); then
   echo "  $SCRIPT_DIR/import-existing-data.sh '$SCRIPT_DIR'"
 fi
 echo
-echo "u64deck Linux Preview 5 installed in: $SCRIPT_DIR"
+echo "u64deck Linux Preview 7 installed in: $SCRIPT_DIR"
 echo "Launch with: $SCRIPT_DIR/u64deck.sh"
 echo "Configuration: $CONFIG_DIR/config.json"
 echo "Indexes, SIDFlow, favourites and playlists: $DATA_DIR"

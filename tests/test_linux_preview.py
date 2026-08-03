@@ -17,15 +17,15 @@ pytestmark = pytest.mark.skipif(
 
 ROOT = Path(__file__).resolve().parents[1]
 
-def test_linux_identity_is_separate_from_windows_rc45():
+def test_linux_identity_is_separate_from_windows_rc48():
     from linux.build_id import BASE_BUILD, PREVIEW_LABEL, identity, linux_build_id
     build = linux_build_id(ROOT)
-    assert PREVIEW_LABEL == "Linux Preview 5"
-    assert BASE_BUILD == "6feaede"
+    assert PREVIEW_LABEL == "Linux Preview 7"
+    assert BASE_BUILD == "c0d1fb0"
     assert len(build) == 7 and all(c in "0123456789abcdef" for c in build)
-    assert identity(ROOT) == f"u64deck v1.9.0 · Linux Preview 5 · build {build}"
+    assert identity(ROOT) == f"u64deck v1.9.0 · Linux Preview 7 · build {build}"
 
-def test_rc45_core_manifest_matches_reviewed_files():
+def test_rc48_core_manifest_matches_reviewed_files():
     from linux.runtime import verify_core
     ok, failures = verify_core(ROOT)
     assert ok, failures
@@ -55,7 +55,7 @@ def test_generated_runtime_redirects_config_and_data(monkeypatch, tmp_path):
     release = (runtime / "release.py").read_text(encoding="utf-8")
     assert 'U64DECK_DATA_DIR' in server
     assert 'CONFIG_ROOT / "config.json"' in server
-    assert "Linux Preview 5" in release and build in release
+    assert "Linux Preview 7" in release and build in release
     assert paths["config"].is_dir() and paths["data"].is_dir()
 
 def test_generated_static_overlay_is_linux_specific(monkeypatch, tmp_path):
@@ -67,7 +67,7 @@ def test_generated_static_overlay_is_linux_specific(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     runtime, _, _ = prepare_runtime(ROOT)
     html = (runtime / "static/index.html").read_text(encoding="utf-8")
-    assert "<title>u64deck v1.9.0 · Linux Preview 5</title>" in html
+    assert "<title>u64deck v1.9.0 · Linux Preview 7</title>" in html
     assert "U64DECK LINUX PREVIEW HELP" in html
     assert "dedicated Linux app window" in html
     assert (ROOT / "static/index.html").read_text(encoding="utf-8").startswith("<!DOCTYPE html>")
@@ -185,3 +185,33 @@ def test_no_personal_paths_or_identifiers_in_release_sources():
         text = path.read_text(encoding="utf-8", errors="ignore")
         assert forbidden_host not in text, path
         assert not any(pattern.search(text) for pattern in patterns), path
+
+
+def test_preview7_manifest_excludes_windows_only_files_and_has_lf_coverage():
+    manifest = (ROOT / "linux/core-manifest.sha256").read_text(encoding="utf-8")
+    attrs = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+    assert "Windows RC48 shared application core" in manifest
+    for rel in (".github/workflows/build-exe.yml", "u64deck.spec", "start.bat"):
+        assert rel not in manifest
+    assert "*.sh   text eol=lf" in attrs
+    assert "*.sha256 text eol=lf" in attrs
+    assert "*.txt  text eol=lf" in attrs
+
+
+def test_preview7_release_workflows_use_public_artifact_names():
+    ci = (ROOT / ".github/workflows/linux-ci.yml").read_text(encoding="utf-8")
+    release = (ROOT / ".github/workflows/linux-release.yml").read_text(encoding="utf-8")
+    assert "Linux Preview 7" in ci
+    assert "u64deck-v1.9.0-linux-preview.7.tar.gz" in release
+    assert "private" not in release.lower()
+
+
+def test_preview7_packager_preserves_every_shell_executable(tmp_path):
+    from linux.package_release import build_tarball
+    out = tmp_path / "preview7.tar.gz"
+    _, _ = build_tarball(ROOT, out)
+    with tarfile.open(out, "r:gz") as tf:
+        modes = {m.name: stat.S_IMODE(m.mode) for m in tf.getmembers() if m.isfile()}
+    for name in ("install.sh", "u64deck.sh", "update-linux.sh",
+                 "uninstall-linux.sh", "import-existing-data.sh"):
+        assert modes[f"u64deck/{name}"] == 0o755

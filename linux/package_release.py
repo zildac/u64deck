@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .build_id import BASE_BUILD, BASE_RELEASE, PREVIEW_LABEL, PREVIEW_VERSION, identity, linux_build_id
 
-ARCHIVE_NAME = "u64deck-v1.9.0-linux-preview.5.tar.gz"
+ARCHIVE_NAME = "u64deck-v1.9.0-linux-preview.7.tar.gz"
 EXECUTABLES = {
     "install.sh", "u64deck.sh", "update-linux.sh",
     "uninstall-linux.sh", "import-existing-data.sh",
@@ -105,16 +105,29 @@ def build_tarball(root: Path, output: Path) -> tuple[str, list[str]]:
 def release_notes(root: Path, digest: str, file_count: int,
                   source_tests: str, archive_tests: str, validation: str) -> str:
     build = linux_build_id(root)
-    return f"""# u64deck v1.9.0 — Linux Preview 5
+    return f"""# u64deck v1.9.0 — Linux Preview 7
 
-**Identity:** `u64deck v1.9.0 · Linux Preview 5 · build {build}`  
+**Identity:** `u64deck v1.9.0 · Linux Preview 7 · build {build}`  
 **Base lineage:** `{BASE_RELEASE} · build {BASE_BUILD}`
 
-Linux Preview 5 is a source-run preview published alongside the Windows release in the same repository. It is not a frozen ELF or AppImage. Windows remains the stable, supported distribution; this Linux preview is provided as-is for testing and issue reports.
+Linux Preview 7 is a source-run soak candidate published alongside Windows RC48 in the same repository. It is not a frozen ELF or AppImage. Both artefacts are soak candidates rather than Final releases.
 
 ## Hardware status
 
-Linux Preview 4 was hardware-tested on Ubuntu 24.04.4 LTS x86-64 with GNOME/Wayland and Chromium Snap. Linux Preview 5 retains that distribution architecture but its final tarball has not yet been hardware-validated on the maintainer NUC. Do not treat the inherited Preview 4 result as a Preview 5 hardware pass.
+Linux Preview 4 was hardware-tested on Ubuntu 24.04.4 LTS x86-64 with GNOME/Wayland and Chromium Snap. Linux Preview 7 retains that distribution architecture, but this final tarball has not yet been hardware-validated on the maintainer NUC. Do not treat the inherited Preview 4 result as a Preview 7 hardware pass.
+
+## Auto F7 Legacy correction
+
+- Auto F7 defaults to enabled for new installations and older configurations where `boot_prekey` is absent; an explicit disabled value remains disabled.
+- The checkbox remains selectable on Legacy KERNAL-buffer connections. Enabling it stores the preference and shows physical-F7 guidance only.
+- Legacy F7 injection remains hard-suppressed; confirmed Retro Replay on CIA1 retains automatic matrix F7.
+
+## Assembly64 update
+
+- Every Assembly64 search, preset, entry and binary-download request uses the activated dedicated `Client-Id: u64deck` application identifier.
+- The Assembly64 page contains the agreed non-commercial attribution and direct Ko-fi and PayPal support links.
+- README and in-app Help contain the same attribution and both official donation links.
+- No live Assembly64 request was made by the packaging sandbox unless explicitly recorded in the accompanying validation report.
 
 ## Storage and migration
 
@@ -136,7 +149,7 @@ Linux Preview 4 was hardware-tested on Ubuntu 24.04.4 LTS x86-64 with GNOME/Wayl
 - Archive hygiene and personal-path scan: passed
 - Archive entries: **{file_count} files**
 
-The dependency-download path was hardware-tested on the Ubuntu NUC. The packaging sandbox had no public package-index access, so its clean installer validation used the same installed dependency versions exposed to an isolated virtual environment.
+The dependency-download path was hardware-tested during the earlier Ubuntu NUC preview work. No Linux Preview 7 NUC hardware test was performed during this packaging run. The packaging sandbox had no public package-index access, so its clean installer validation used the same installed dependency versions exposed to an isolated virtual environment.
 
 ## Artifact
 
@@ -164,7 +177,7 @@ def main() -> int:
         "\n".join(manifest) + "\n", encoding="utf-8")
     notes = release_notes(root, digest, len(manifest), args.source_tests,
                           args.archive_tests, args.update_validation)
-    (out / "u64deck-v1.9.0-linux-preview.5-release-notes.md").write_text(
+    (out / "u64deck-v1.9.0-linux-preview.7-release-notes.md").write_text(
         notes, encoding="utf-8")
     print(tarball)
     print(f"SHA-256 {digest}")
