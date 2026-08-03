@@ -947,16 +947,18 @@ function renderAutoFastloadState(){
   const retro=BOOT_CARTRIDGE?.classification==="retro_replay";
   EFFECTIVE_AUTO_FASTLOAD=AUTO_FASTLOAD&&!legacy&&retro;
   box.checked=AUTO_FASTLOAD;
-  box.disabled=BOOT_OPTIONS_SAVING||legacy;
+  box.disabled=BOOT_OPTIONS_SAVING;
   if(hint){
     hint.style.display=legacy?"inline-flex":"none";
-    hint.textContent=retro?"Legacy: physical F7 for Retro Replay"
+    hint.textContent=retro?(AUTO_FASTLOAD
+        ?"Legacy: physical F7 guidance enabled"
+        :"Legacy: physical F7 guidance disabled")
       :BOOT_CARTRIDGE?.classification==="other"?"Legacy: manual cartridge startup"
-      :BOOT_CARTRIDGE?.classification==="none"?"Legacy: Auto F7 unavailable"
+      :BOOT_CARTRIDGE?.classification==="none"?"Legacy: saved for Retro Replay"
       :"Legacy: cartridge checked at launch";
   }
   if(label)label.title=legacy
-    ?"Retro Replay is configured, but automatic F7 is disabled with Legacy KERNAL-buffer input because an emulated F7 can open the Freeze Menu. Press physical F7 on the C64 instead. Your saved Auto F7 preference is retained for CIA1-capable devices."
+    ?"Legacy input: enabling this option shows physical-F7 guidance for Retro Replay. u64deck will not inject F7 through the Legacy KERNAL keyboard buffer."
     :"Automatically presses F7 after Reset, Reboot and Mount & Run when Retro Replay is configured. Disable this option to handle the Retro Replay startup menu manually.";
 }
 async function loadBootOptions(){
@@ -970,10 +972,6 @@ async function loadBootOptions(){
 }
 async function autoFastloadChanged(){
   const box=$("#autoFastload"),wanted=box.checked;
-  if(isLegacyInput()){
-    box.checked=AUTO_FASTLOAD;renderAutoFastloadState();
-    toast("Legacy input detected — physical F7 is required on the C64","err");return
-  }
   BOOT_OPTIONS_SAVING=true;renderAutoFastloadState();
   try{
     const r=await api("/api/boot_options",{method:"POST",
@@ -982,9 +980,13 @@ async function autoFastloadChanged(){
     AUTO_FASTLOAD=!!r.auto_fastload;
     BOOT_CARTRIDGE=r.cartridge||BOOT_CARTRIDGE;
     EFFECTIVE_AUTO_FASTLOAD=!!r.effective_auto_fastload;
-    toast(AUTO_FASTLOAD
-      ?"Retro Replay Fastload: F7 will be pressed after u64deck resets"
-      :"Automatic Retro Replay F7 disabled","ok");
+    toast(isLegacyInput()
+      ?(AUTO_FASTLOAD
+        ?"Legacy Auto F7 enabled — physical-F7 guidance will be shown; no F7 will be injected"
+        :"Legacy physical-F7 guidance disabled")
+      :(AUTO_FASTLOAD
+        ?"Retro Replay Fastload: F7 will be pressed after u64deck resets"
+        :"Automatic Retro Replay F7 disabled"),"ok");
   }catch(e){toast(e.message,"err")}
   finally{BOOT_OPTIONS_SAVING=false;renderAutoFastloadState()}
 }
@@ -2989,7 +2991,8 @@ function jkAudioSync(){
 function jkListSignature(s){
   return JSON.stringify([s.folder||"",s.source||"",!!s.loading,(s.items||[]).map(it=>[
     it.path||"",it.label||"",it.lazy?1:0,it.meta?.name||"",it.meta?.author||"",
-    it.meta?.chip||"",it.meta?.songs||1,it.song||1,it.similarity??null,it.length??null])]);
+    it.meta?.chip||"",it.meta?.songs||1,it.song||1,it.similarity??null,
+    it.recommendation_subsong_label||"",it.length??null])]);
 }
 function jkQueueContext(s){
   if(s.radio)return "SIDFlow Radio";
@@ -3103,10 +3106,12 @@ function jkRender(s){
     const rows=items.map((it,i)=>{
       const m=it.meta||{},author=String(m.author||""),released=String(m.released||"");
       const compactMeta=[singleAuthor?"":author,released].filter(Boolean).join(" · ");
+      const subsongMeta=String(it.recommendation_subsong_label||"")||(it.song&&m.songs>1?`song ${it.song}`:"");
+      const compactSubmeta=[compactMeta,subsongMeta].filter(Boolean).join(" · ");
       const authorCell=singleAuthor?"":`<div class="jkq-cell jkq-author" role="cell" title="${esc(author)}">${esc(author)}</div>`;
       return `<div class="jkq-row" role="row" data-juke-index="${i}" onclick="jkPlay(${i},${Number(it.song||0)})">
         <div class="jkq-cell jkq-index" role="cell"><span class="jkq-current-marker" aria-hidden="true">▶</span><span class="jkq-row-number">${i+1}</span></div>
-        <div class="jkq-cell jkq-title" role="cell" title="${esc(m.name||it.label)}">${esc(m.name||it.label)}${it.similarity!=null?` <span class="jkq-similarity" title="${it.recommendation_source==="u64deck-fallback"?"Fallback feature similarity from u64deck":"SIDFlow 0.8.0 weighted neighbour similarity"}">${Math.round(Number(it.similarity)*100)}% match</span>`:""}${it.lazy?' <span class="hint">· loads when played</span>':""}<div class="jkq-submeta">${esc(compactMeta)}${it.song&&m.songs>1?` · song ${it.song}`:""}</div></div>
+        <div class="jkq-cell jkq-title" role="cell" title="${esc(m.name||it.label)}">${esc(m.name||it.label)}${it.similarity!=null?` <span class="jkq-similarity" title="${it.recommendation_source==="u64deck-fallback"?"Fallback feature similarity from u64deck":"SIDFlow 0.8.0 weighted neighbour similarity"}">${Math.round(Number(it.similarity)*100)}% match</span>`:""}${it.lazy?' <span class="hint">· loads when played</span>':""}<div class="jkq-submeta">${esc(compactSubmeta)}</div></div>
         ${authorCell}<div class="jkq-cell jkq-chip" role="cell">${sidChipBadge(m)}</div>
         <div class="jkq-cell jkq-released hint" role="cell">${esc(released)}</div>
         <div class="jkq-cell jkq-length" role="cell">${fmtLen(it.length)}</div>

@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.9.0 — Release Candidate 48
+
+**Public soak candidate:** `c0d1fb0`
+
+- Fixes the Legacy Auto F7 usability trap found during RC47 soak testing. The Auto F7 checkbox remains selectable on Legacy KERNAL-buffer connections instead of being disabled.
+- Defaults Auto F7 to enabled for new installations and older configurations where `boot_prekey` is absent, while preserving an explicit user-disabled empty value.
+- On Legacy input, enabling Auto F7 stores the preference and enables physical-F7 guidance only. u64deck still never injects F7 through the Legacy keyboard buffer.
+- Keeps CIA1 automatic matrix F7 behaviour unchanged for confirmed Retro Replay cartridges.
+- Carries RC47 Assembly64 client identification/support attribution and the RC46 SIDFlow recommendation diversification unchanged. No unrelated backend, device-control, discovery, streaming, indexing, modal or packaging workflow behaviour is intentionally changed.
+
+## 1.9.0 — Release Candidate 47
+
+**Public soak candidate:** `45fbea8`
+
+- Registers every Assembly64 search, preset, entry, binary-download and raw-debug request with the activated dedicated `Client-Id: u64deck` application identifier.
+- Removes the obsolete configurable Assembly64 client-ID override and cleans it from existing configuration on startup; the service base URL remains configurable.
+- Adds a compact, on-brand Support Assembly64 panel with direct Ko-fi and PayPal donation links using safe external-link attributes.
+- Adds matching Assembly64 attribution and support information to in-app Help and README without implying endorsement, licensing or mandatory donation.
+- Carries the hardware-tested RC46 SIDFlow recommendation diversification unchanged. No discovery, device-control, Mount & Run, streaming, indexing, SIDFlow data import, confirmation-modal or Exit-security behaviour is intentionally changed.
+
+## 1.9.0 — Release Candidate 46
+
+**Private hardware-test build:** `e873eaa`
+
+- Diversifies SIDFlow **More like this** and Radio results at tune/file level instead of presenting every distinct SIDFlow track ID as an independent visible recommendation.
+- Keeps the highest-ranked representative from each SID file first and suppresses display-equivalent copies found at different paths.
+- Defers additional song indices from an already selected multi-subtune SID until distinct files cannot fill the requested queue.
+- Labels deliberately retained sibling subtunes as `song X/Y` (or `song X` when the indexed total is unavailable) so fallback entries remain distinguishable.
+- Requests a wider ordered SIDFlow candidate set before diversification, allowing a normal 20-tune queue to remain full when repeated variants occupy the highest raw ranks.
+- Adds Diagnostics counts for mapped candidates, distinct primary tunes, deferred subtunes, duplicate track IDs and equivalent tune rows suppressed.
+- Adds regression coverage for exact duplicate track IDs, multiple subtunes from one SID, equivalent metadata at different paths, fallback song labels and oversampled queue filling.
+- Carries the complete RC45 custom confirmation-modal implementation unchanged. No discovery, device-control, Mount & Run, streaming, indexing, SIDFlow data import or Exit-security behaviour is intentionally changed.
+
 ## 1.9.0 — Release Candidate 45
 
 **Public release-candidate build:** `6feaede`

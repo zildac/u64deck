@@ -7,11 +7,10 @@
   "ftp_user": "anonymous",
   "ftp_password": "",
   "assembly64": {
-    "base": "http://hackerswithstyle.se/leet",
-    "client_id": "Ultimate"
+    "base": "http://hackerswithstyle.se/leet"
   },
   "boot_wait": 2.8,
-  "boot_prekey": "",
+  "boot_prekey": "F7",
   "http_host": "0.0.0.0",
   "tls_certfile": "",
   "tls_keyfile": "",

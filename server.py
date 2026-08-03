@@ -208,7 +208,7 @@ DEFAULT_CONFIG = {
     # E.g. "F7" installs Fastload from a Retro
     # Replay boot menu deterministically instead of letting the LOAD characters
     # hit the menu. Tokens: F1..F8, RETURN, SPACE, or empty for none.
-    "boot_prekey": "",
+    "boot_prekey": "F7",
     # Preferred safety mode for existing disk images. Unlinked keeps drive
     # writes temporary; a newly-created blank image is mounted read/write by
     # the create workflow because writing to it is the reason it was created.
@@ -261,7 +261,6 @@ DEFAULT_CONFIG = {
     "active_device_identity": "",
     "assembly64": {
         "base": "http://hackerswithstyle.se/leet",
-        "client_id": "Ultimate",
     },
 }
 
@@ -281,10 +280,16 @@ def load_config() -> dict:
             cfg["assembly64"] = a64
         else:
             print("  warning: config.json must contain a JSON object; using defaults")
-    # migration: "u64deck" was the old shipped default Client-Id; the service
-    # expects the reference client's id ("Ultimate"), so upgrade it silently
-    if cfg["assembly64"].get("client_id") == "u64deck":
-        cfg["assembly64"]["client_id"] = "Ultimate"
+    # Assembly64 assigns one application identifier to each public client.
+    # The dedicated u64deck identifier is fixed in the request layer rather
+    # than configurable per installation. Remove obsolete persisted overrides.
+    if cfg["assembly64"].pop("client_id", None) is not None:
+        cfg["_config_migration_pending"] = True
+    # Auto F7 defaults on for new installations and older configurations that
+    # predate the setting. An explicit empty value remains an intentional opt-out.
+    if isinstance(user, dict) and "boot_prekey" not in user:
+        cfg["boot_prekey"] = "F7"
+        cfg["_config_migration_pending"] = True
     # Unlinked is the safe default for images opened from storage, search,
     # favourites or local files. Configs without the policy marker are
     # migrated once; subsequent user choices are preserved.
@@ -4243,9 +4248,11 @@ async def ws_audio(ws: WebSocket):
 # /leet/search/aql/presets, /leet/search/entries/{id}/{cat},
 # /leet/search/bin/{id}/{cat}/{itemIdOrIdx}.
 
+ASSEMBLY64_CLIENT_ID = "u64deck"
+
 def _asm_headers():
     return {"User-Agent": "Assembly Query",
-            "Client-Id": CFG["assembly64"].get("client_id", "u64deck"),
+            "Client-Id": ASSEMBLY64_CLIENT_ID,
             "Accept-Encoding": "identity"}
 
 
@@ -6870,6 +6877,7 @@ def _juke_state():
                        "song": int(i.get("song") or i["meta"].get("start_song", 1) or 1),
                        "similarity": i.get("similarity"),
                        "recommendation_source": i.get("recommendation_source", ""),
+                       "recommendation_subsong_label": i.get("recommendation_subsong_label", ""),
                        "lazy": i.get("data") is None,
                        "length": _juke_length(i, int(i.get("song") or i["meta"].get("start_song", 1) or 1))}
                       for i in JUKE["items"]],
@@ -7145,6 +7153,116 @@ def _sidflow_item_track_id(item: dict, song: int | None = None) -> str | None:
     return str(match.get("track_id")) if match else sidflow_track_id(rel, selected)
 
 
+def _sidflow_normalised_text(value) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _sidflow_recommendation_identity(item: dict) -> tuple | None:
+    """Return a conservative tune-level identity for queue diversification.
+
+    A SID digest is strongest when metadata contains one. Otherwise, only
+    collapse display-equivalent rows when both title and author are known; a
+    bare filename or generic placeholder is not enough evidence that two
+    different files are the same tune.
+    """
+    meta = item.get("meta") or {}
+    digest = _sidflow_normalised_text(meta.get("md5"))
+    if digest:
+        return ("md5", digest)
+    title = _sidflow_normalised_text(meta.get("name") or item.get("label"))
+    author = _sidflow_normalised_text(meta.get("author"))
+    released = _sidflow_normalised_text(meta.get("released"))
+    if title and author:
+        return ("metadata", title, author, released)
+    return None
+
+
+def _sidflow_diversify_recommendations(candidates: list[dict], limit: int) -> tuple[list[dict], dict]:
+    """Prefer distinct tunes/files, retaining sibling subtunes as fallback.
+
+    SIDFlow correctly ranks track IDs, so one multi-subtune SID or duplicated
+    HVSC variant can contribute several distinct rows. The queue is a tune-level
+    presentation: keep the highest-ranked representative for each file and
+    display-equivalent tune first, suppress equivalent copies on other paths,
+    then use genuinely different song indices from an already selected file
+    only when distinct files cannot fill the requested result set.
+    """
+    wanted = max(1, int(limit or 1))
+    primary: list[dict] = []
+    subsong_fallback: list[dict] = []
+    seen_tracks: set[str] = set()
+    selected_paths: set[str] = set()
+    blocked_equivalent_paths: set[str] = set()
+    seen_identities: set[tuple] = set()
+    songs_by_path: dict[str, set[int]] = {}
+    duplicate_tracks = 0
+    equivalent_tunes = 0
+    deferred_subsongs = 0
+
+    for item in candidates:
+        path = str(item.get("path") or "")
+        path_key = path.replace("\\", "/").casefold()
+        song = max(1, int(item.get("song") or item.get("meta", {}).get("start_song", 1) or 1))
+        track_key = str(item.get("sidflow_track_id") or f"{path_key}#{song}").casefold()
+        if track_key in seen_tracks:
+            duplicate_tracks += 1
+            continue
+        seen_tracks.add(track_key)
+
+        if path_key in blocked_equivalent_paths:
+            equivalent_tunes += 1
+            continue
+
+        if path_key in selected_paths:
+            used_songs = songs_by_path.setdefault(path_key, set())
+            if song in used_songs:
+                duplicate_tracks += 1
+                continue
+            used_songs.add(song)
+            subsong_fallback.append(item)
+            deferred_subsongs += 1
+            continue
+
+        identity = _sidflow_recommendation_identity(item)
+        if identity is not None and identity in seen_identities:
+            blocked_equivalent_paths.add(path_key)
+            equivalent_tunes += 1
+            continue
+
+        selected_paths.add(path_key)
+        songs_by_path[path_key] = {song}
+        if identity is not None:
+            seen_identities.add(identity)
+        primary.append(item)
+
+    selected = primary[:wanted]
+    if len(selected) < wanted:
+        selected.extend(subsong_fallback[:wanted - len(selected)])
+
+    path_counts: dict[str, int] = {}
+    for item in selected:
+        key = str(item.get("path") or "").replace("\\", "/").casefold()
+        path_counts[key] = path_counts.get(key, 0) + 1
+    for item in selected:
+        key = str(item.get("path") or "").replace("\\", "/").casefold()
+        if path_counts.get(key, 0) <= 1:
+            continue
+        song = max(1, int(item.get("song") or item.get("meta", {}).get("start_song", 1) or 1))
+        songs = max(1, int(item.get("meta", {}).get("songs", 1) or 1))
+        item["recommendation_subsong_label"] = (
+            f"song {song}/{songs}" if songs > 1 else f"song {song}"
+        )
+
+    return selected, {
+        "candidates": len(candidates),
+        "primary": len(primary),
+        "deferred_subsongs": deferred_subsongs,
+        "duplicate_tracks_suppressed": duplicate_tracks,
+        "equivalent_tunes_suppressed": equivalent_tunes,
+        "returned": len(selected),
+    }
+
+
 def _sidflow_recommendations(path: str, song: int, limit: int = 20, *, radio: bool = False) -> tuple[list[dict], dict]:
     status = SIDFLOW_STORE.status()
     if not status.get("available"):
@@ -7184,8 +7302,13 @@ def _sidflow_recommendations(path: str, song: int, limit: int = 20, *, radio: bo
             rel = normalise_hvsc_relative(item_path, _configured_hvsc_root())
             if rel:
                 excluded_paths.add(rel)
+    requested_limit = max(1, min(int(limit or 20), 100))
+    # Ask SIDFlow for a wider ordered candidate set. Diversification can then
+    # remove sibling subtunes and equivalent copies without shortening a normal
+    # 20-item queue merely because duplicates occupied the top ranks.
+    candidate_limit = min(100, max(requested_limit, requested_limit * 5))
     ranked = SIDFLOW_STORE.rank(
-        seed["track_id"], limit=max(1, min(int(limit or 20), 100)),
+        seed["track_id"], limit=candidate_limit,
         present_paths=set(present), exclude_track_ids=excluded,
         exclude_sid_paths=excluded_paths,
         same_file_policy="exclude" if radio else "prefer_other",
@@ -7193,7 +7316,7 @@ def _sidflow_recommendations(path: str, song: int, limit: int = 20, *, radio: bo
     device_paths = [present[row["sid_path"].casefold()] for row in ranked
                     if row["sid_path"].casefold() in present]
     metadata = _sid_metadata_for_paths(_index_store(), device_paths)
-    items = []
+    candidates = []
     for row in ranked:
         device_path = present.get(row["sid_path"].casefold())
         if not device_path:
@@ -7205,10 +7328,11 @@ def _sidflow_recommendations(path: str, song: int, limit: int = 20, *, radio: bo
         item["similarity"] = round(float(row["similarity"]), 4)
         item["sidflow_track_id"] = row["track_id"]
         item["recommendation_source"] = row.get("recommendation_source", "unknown")
-        items.append(item)
+        candidates.append(item)
+    items, diversity = _sidflow_diversify_recommendations(candidates, requested_limit)
     source_counts: dict[str, int] = {}
-    for row in ranked:
-        source = str(row.get("recommendation_source") or "unknown")
+    for item in items:
+        source = str(item.get("recommendation_source") or "unknown")
         source_counts[source] = source_counts.get(source, 0) + 1
     level = "info" if items else "warning"
     _diag_event(
@@ -7221,7 +7345,11 @@ def _sidflow_recommendations(path: str, song: int, limit: int = 20, *, radio: bo
         f"mapped_paths={presence_stats['mapped_paths']} "
         f"played={len(JUKE_PLAYED)} recent={len(JUKE_RECENT_TRACKS)} "
         f"queue={len(JUKE.get('items', []))} excluded_tracks={len(excluded)} "
-        f"ranked={len(ranked)} final={len(items)} "
+        f"ranked={len(ranked)} final={len(items)} mapped={len(candidates)} "
+        f"distinct_primary={diversity['primary']} "
+        f"deferred_subsongs={diversity['deferred_subsongs']} "
+        f"duplicate_tracks_suppressed={diversity['duplicate_tracks_suppressed']} "
+        f"equivalent_tunes_suppressed={diversity['equivalent_tunes_suppressed']} "
         + " ".join(f"{name}={count}" for name, count in sorted(source_counts.items())),
     )
     return items, seed

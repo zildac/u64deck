@@ -1880,7 +1880,7 @@ def test_frontend_is_split_without_a_build_tool():
 def test_release_metadata_is_centralised():
     import release
     assert server.VERSION == release.VERSION == "1.9.0"
-    assert release.RELEASE_LABEL == "Release Candidate 45"
+    assert release.RELEASE_LABEL == "Release Candidate 48"
     assert server.BUILD == release.build_id(server.ASSETS, Path(server.__file__).parent)
 
 
@@ -2843,7 +2843,7 @@ def test_release_help_and_now_playing_star_are_present():
     assert "jkToggleNowFavourite" in js
     assert ".u64deck-index.sqlite3" in help_js
     assert "star beside the playback controls" in help_js
-    assert "v1.9.0 — Release Candidate 45" in readme
+    assert "v1.9.0 — Release Candidate 48" in readme
     assert ".u64deck-index.sqlite3" in readme
     assert "Install every release into a **new, empty folder**" in readme
     assert "Do not copy `*-wal`" in readme
@@ -3281,6 +3281,123 @@ def test_sidflow_more_like_filters_to_device_and_radio_does_not_repeat(monkeypat
         # A second top-up sees both candidate track IDs in the current queue.
         assert server._sidflow_radio_topup() == 0
         assert len(server.JUKE["items"]) == 3
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous_juke)
+        server.JUKE_PLAYED.clear(); server.JUKE_PLAYED.update(previous_played)
+        server.JUKE_RECENT_TRACKS.clear(); server.JUKE_RECENT_TRACKS.extend(previous_recent)
+
+
+def test_sidflow_diversification_suppresses_duplicate_tracks_and_equivalent_paths():
+    def item(path, song, title, author, released="1988", track_id=None, songs=1):
+        return {
+            "path": path, "song": song,
+            "sidflow_track_id": track_id or f"{path}#{song}",
+            "meta": {"name": title, "author": author, "released": released,
+                     "songs": songs, "start_song": 1, "md5": ""},
+        }
+
+    candidates = [
+        item("/USB0/HVSC/Hawkeye.sid", 1, "Hawkeye (loader)", "Jeroen Tel", songs=2),
+        item("/USB0/HVSC/Hawkeye.sid", 1, "Hawkeye (loader)", "Jeroen Tel",
+             track_id="/USB0/HVSC/Hawkeye.sid#1", songs=2),
+        item("/USB0/HVSC/Hawkeye-copy.sid", 1, "  HAWKEYE   (loader) ",
+             "JEROEN TEL", songs=1),
+        item("/USB0/HVSC/Unique.sid", 1, "Unique", "Composer"),
+    ]
+    selected, stats = server._sidflow_diversify_recommendations(candidates, 20)
+    assert [row["path"] for row in selected] == [
+        "/USB0/HVSC/Hawkeye.sid", "/USB0/HVSC/Unique.sid"
+    ]
+    assert stats["duplicate_tracks_suppressed"] == 1
+    assert stats["equivalent_tunes_suppressed"] == 1
+
+
+def test_sidflow_diversification_uses_distinct_subsongs_only_as_fallback():
+    def item(path, song, title, author, songs):
+        return {
+            "path": path, "song": song, "sidflow_track_id": f"{path}#{song}",
+            "meta": {"name": title, "author": author, "released": "1988",
+                     "songs": songs, "start_song": 1, "md5": ""},
+        }
+
+    candidates = [
+        item("/USB0/HVSC/Multi.sid", 1, "Multi", "Composer", 3),
+        item("/USB0/HVSC/Multi.sid", 2, "Multi", "Composer", 3),
+        item("/USB0/HVSC/Other.sid", 1, "Other", "Another", 1),
+        item("/USB0/HVSC/Multi.sid", 3, "Multi", "Composer", 3),
+    ]
+    first_two, _ = server._sidflow_diversify_recommendations(candidates, 2)
+    assert [(row["path"], row["song"]) for row in first_two] == [
+        ("/USB0/HVSC/Multi.sid", 1), ("/USB0/HVSC/Other.sid", 1)
+    ]
+    assert all(not row.get("recommendation_subsong_label") for row in first_two)
+
+    all_four, stats = server._sidflow_diversify_recommendations(candidates, 4)
+    assert [(row["path"], row["song"]) for row in all_four] == [
+        ("/USB0/HVSC/Multi.sid", 1), ("/USB0/HVSC/Other.sid", 1),
+        ("/USB0/HVSC/Multi.sid", 2), ("/USB0/HVSC/Multi.sid", 3),
+    ]
+    assert [row.get("recommendation_subsong_label") for row in all_four] == [
+        "song 1/3", None, "song 2/3", "song 3/3"
+    ]
+    assert stats["deferred_subsongs"] == 2
+
+
+def test_sidflow_recommendations_oversample_then_diversify(monkeypatch):
+    class FakeStore:
+        requested_limit = 0
+        def status(self): return {"available": True, "needs_update": False, "quality_warning": ""}
+        def lookup(self, rel, song):
+            return {"track_id": f"{rel}#{song}", "sid_path": rel, "song_index": song}
+        def rank(self, seed, *, limit, present_paths, exclude_track_ids,
+                 exclude_sid_paths=(), same_file_policy="prefer_other"):
+            self.requested_limit = limit
+            return [
+                {"track_id": "Hawkeye.sid#1", "sid_path": "Hawkeye.sid", "song_index": 1,
+                 "similarity": .99, "recommendation_source": "sidflow-neighbors"},
+                {"track_id": "Hawkeye.sid#2", "sid_path": "Hawkeye.sid", "song_index": 2,
+                 "similarity": .98, "recommendation_source": "sidflow-neighbors"},
+                {"track_id": "Hawkeye-copy.sid#1", "sid_path": "Hawkeye-copy.sid", "song_index": 1,
+                 "similarity": .97, "recommendation_source": "sidflow-neighbors"},
+                {"track_id": "Unique.sid#1", "sid_path": "Unique.sid", "song_index": 1,
+                 "similarity": .96, "recommendation_source": "sidflow-neighbors"},
+            ]
+    class FakeIndex:
+        def sid_metadata_paths(self, root):
+            return [f"{root}/Seed.sid", f"{root}/Hawkeye.sid",
+                    f"{root}/Hawkeye-copy.sid", f"{root}/Unique.sid"]
+        def sid_metadata_for_paths(self, paths):
+            rows = {}
+            for path in paths:
+                name = path.rsplit("/", 1)[-1]
+                if name.startswith("Hawkeye"):
+                    meta = {"title": "Hawkeye (loader)", "author": "Jeroen Tel",
+                            "released": "1988 Thalamus", "songs": 2, "start_song": 1}
+                else:
+                    meta = {"title": "Unique", "author": "Composer",
+                            "released": "1990", "songs": 1, "start_song": 1}
+                rows[path.casefold()] = meta
+            return rows
+
+    store = FakeStore()
+    previous_juke = dict(server.JUKE)
+    previous_played = set(server.JUKE_PLAYED)
+    previous_recent = list(server.JUKE_RECENT_TRACKS)
+    monkeypatch.setattr(server, "SIDFLOW_STORE", store)
+    monkeypatch.setattr(server, "_configured_hvsc_root", lambda: "/USB0/HVSC")
+    monkeypatch.setattr(server, "_index_store", lambda: FakeIndex())
+    try:
+        server.JUKE_PLAYED.clear(); server.JUKE_RECENT_TRACKS.clear()
+        server.JUKE.clear(); server.JUKE.update({"items": [], "index": -1, "playing": False})
+        items, _seed = server._sidflow_recommendations(
+            "/USB0/HVSC/Seed.sid", 1, limit=3
+        )
+        assert store.requested_limit == 15
+        assert [(row["path"].rsplit("/", 1)[-1], row["song"]) for row in items] == [
+            ("Hawkeye.sid", 1), ("Unique.sid", 1), ("Hawkeye.sid", 2)
+        ]
+        assert items[0]["recommendation_subsong_label"] == "song 1/2"
+        assert items[2]["recommendation_subsong_label"] == "song 2/2"
     finally:
         server.JUKE.clear(); server.JUKE.update(previous_juke)
         server.JUKE_PLAYED.clear(); server.JUKE_PLAYED.update(previous_played)
@@ -6768,9 +6885,9 @@ def test_rc32_documentation_identity_and_inherited_sidflow_contract():
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
     help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
     build = server.BUILD
-    assert f"v1.9.0 — Release Candidate 45 · build {build}" in readme
-    assert f"**Public release-candidate build:** `{build}`" in changelog
-    assert "git tag v1.9.0-rc.45 && git push --tags" in readme
+    assert f"v1.9.0 — Release Candidate 48 · build {build}" in readme
+    assert f"**Public soak candidate:** `{build}`" in changelog
+    assert "git tag v1.9.0-rc.46 && git push --tags" in readme
     assert "Analyse Disk-Image Names" in readme
     assert "terminal hyphen-delimited" in readme
     assert "SQLite schema v5" in changelog
@@ -7849,8 +7966,8 @@ def test_rc32_docs_describe_queue_contract_and_identity():
     root = Path(server.ROOT)
     readme = (root / "README.md").read_text(encoding="utf-8")
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert "Release Candidate 45" in readme
-    assert "Release Candidate 45" in changelog
+    assert "Release Candidate 48" in readme
+    assert "Release Candidate 46" in changelog
     assert "does not invalidate" in readme
 
 
@@ -8429,7 +8546,7 @@ def test_rc39_basic_ready_gate_can_be_cancelled_before_read(monkeypatch):
     assert reads == []
 
 
-def test_rc39_frontend_has_persistent_legacy_f7_overlay_and_disables_auto_f7():
+def test_rc39_frontend_has_persistent_legacy_f7_overlay_and_safe_auto_f7_controls():
     root = Path(server.ROOT)
     html = (root / "static" / "index.html").read_text(encoding="utf-8")
     js = (root / "static" / "app.js").read_text(encoding="utf-8")
@@ -8462,7 +8579,7 @@ def test_rc39_help_and_readme_describe_physical_f7_compromise():
     help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
     for text in (
         "Physical F7 required",
-        "The saved preference is retained across device changes",
+        "an explicit user-disabled value remains disabled",
         "Remote Screen-Mirror F7 remains suppressed",
         "CIA1 matrix-input path is unaffected",
     ):
@@ -8470,7 +8587,7 @@ def test_rc39_help_and_readme_describe_physical_f7_compromise():
     for text in (
         "u64deck suppresses remote Legacy F7",
         "Cancel Mount &amp; Run",
-        "saved preference is retained",
+        "checkbox remains selectable",
         "no automatic F7 is injected",
     ):
         assert text in help_js
@@ -8697,7 +8814,7 @@ def test_rc40_ui_and_help_describe_cartridge_aware_scope():
     help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
     for text in (
         "Retro Replay not configured",
-        "Legacy: physical F7 for Retro Replay",
+        "Legacy: physical F7 guidance enabled",
         "Cartridge startup requires attention",
         "BOOT_CARTRIDGE",
     ):
@@ -8801,8 +8918,8 @@ def test_rc41_frontend_has_dismissible_nonblocking_notice_and_mode_tooltips():
     for text in (
         'id="legacyF7Dismiss"',
         "dismissStandaloneScreenNotice()",
-        "Automatically presses F7 after Reset, Reboot and Mount &amp; Run",
-        "automatic F7 is disabled because an emulated F7 can open the Freeze Menu",
+        "CIA1: automatically presses F7 for confirmed Retro Replay",
+        "enabling this option shows physical-F7 guidance",
     ):
         assert text in html
     for text in (
@@ -8811,7 +8928,7 @@ def test_rc41_frontend_has_dismissible_nonblocking_notice_and_mode_tooltips():
         "clearStandaloneScreenNotice",
         "informational:true",
         "u64deck_screen_notice",
-        "Your saved Auto F7 preference is retained for CIA1-capable devices",
+        "u64deck will not inject F7 through the Legacy KERNAL keyboard buffer",
         "Disable this option to handle the Retro Replay startup menu manually",
     ):
         assert text in js
@@ -9259,3 +9376,213 @@ def test_rc45_keeps_existing_toast_status_colours():
     css = (Path(server.ASSETS) / "static" / "app.css").read_text(encoding="utf-8")
     assert ".toast.ok{border-left-color:var(--ok)}" in css
     assert ".toast.err{border-left-color:var(--err)}" in css
+
+
+# --- v1.9.0 Release Candidate 47: registered Assembly64 client and support credit ---
+
+def test_rc47_assembly64_client_id_is_fixed_and_registered():
+    assert server.ASSEMBLY64_CLIENT_ID == "u64deck"
+    original = copy.deepcopy(server.CFG.get("assembly64", {}))
+    try:
+        server.CFG.setdefault("assembly64", {})["client_id"] = "legacy-client"
+        assert server._asm_headers()["Client-Id"] == "u64deck"
+    finally:
+        server.CFG["assembly64"] = original
+
+
+def test_rc47_all_assembly64_http_paths_use_shared_registered_headers():
+    source = (Path(server.ROOT) / "server.py").read_text(encoding="utf-8")
+    assembly = source[source.index("# --- Assembly64"):source.index("# --- SQLite directory/image index")]
+    assert 'ASSEMBLY64_CLIENT_ID = "u64deck"' in assembly
+    assert assembly.count("headers=_asm_headers()") == 5
+    assert 'get("client_id"' not in assembly
+    assert '"Client-Id": ASSEMBLY64_CLIENT_ID' in assembly
+
+
+def test_rc47_obsolete_assembly64_client_override_is_not_shipped():
+    root = Path(server.ROOT)
+    example = json.loads((root / "config.example.json").read_text(encoding="utf-8"))
+    assert "client_id" not in example["assembly64"]
+    source = (root / "server.py").read_text(encoding="utf-8")
+    assert '"client_id": "Ultimate"' not in source
+    assert 'get("client_id", "u64deck")' not in source
+
+
+def test_rc47_assembly64_support_panel_has_exact_safe_links():
+    root = Path(server.ROOT)
+    html = (root / "static/index.html").read_text(encoding="utf-8")
+    assert 'class="asm-support-panel"' in html
+    assert "Support Assembly64" in html
+    assert "Hosting and maintaining the service has ongoing costs" in html
+    assert "u64deck is a non-commercial Assembly64 client." in html
+    assert 'href="https://ko-fi.com/assembly64" target="_blank" rel="noopener noreferrer"' in html
+    assert ('href="https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&amp;'
+            'hosted_button_id=8D6YK9LXULYPE" target="_blank" rel="noopener noreferrer"') in html
+    assert "<iframe" not in html.lower()
+
+
+def test_rc47_assembly64_help_and_readme_credit_service_and_both_links():
+    root = Path(server.ROOT)
+    help_text = (root / "static/help_content.js").read_text(encoding="utf-8")
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    for text in (help_text, readme):
+        assert "https://ko-fi.com/assembly64" in text
+        assert "hosted_button_id=8D6YK9LXULYPE" in text
+        assert "non-commercial Assembly64 client" in text
+        assert "Hosting and maintaining the service has ongoing costs" in text
+    assert "not developed, endorsed or supported by" in readme
+    assert "not required" in readme
+
+
+def test_rc47_release_identity_and_windows_packaging_baseline():
+    import release
+    root = Path(server.ROOT)
+    assert release.VERSION == "1.9.0"
+    assert release.RELEASE_LABEL == "Release Candidate 48"
+    assert "Release Candidate 48" in (root / "README.md").read_text(encoding="utf-8")
+    assert (root / "u64deck.spec").is_file()
+    assert (root / ".github/workflows/build-exe.yml").is_file()
+
+
+def test_rc47_assembly64_search_keeps_aql_url_and_sends_registered_id(monkeypatch):
+    captured = {}
+
+    class Response:
+        text = "[]"
+        status_code = 200
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return [{"id": "ok"}]
+
+    class Client:
+        def __init__(self, **kwargs):
+            captured["client_kwargs"] = kwargs
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def get(self, url, headers):
+            captured["url"] = url
+            captured["headers"] = dict(headers)
+            return Response()
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", Client)
+    query = '(name:"Last Ninja") & (category:0)'
+    result = asyncio.run(server._asm_do_search(query, 5, 25))
+    assert result == {"query": query, "results": [{"id": "ok"}]}
+    assert captured["url"] == (
+        "http://hackerswithstyle.se/leet/search/aql/5/25?query="
+        + server._asm_urlencode(query)
+    )
+    assert captured["headers"] == {
+        "User-Agent": "Assembly Query",
+        "Client-Id": "u64deck",
+        "Accept-Encoding": "identity",
+    }
+    assert captured["client_kwargs"] == {"timeout": 30}
+
+
+def test_rc47_assembly64_binary_path_and_download_limits_are_unchanged(monkeypatch):
+    captured = {}
+
+    class Response:
+        headers = {"content-length": "3"}
+        def raise_for_status(self):
+            return None
+        async def aiter_bytes(self, chunk_size):
+            captured["chunk_size"] = chunk_size
+            yield b"abc"
+
+    class StreamContext:
+        async def __aenter__(self):
+            return Response()
+        async def __aexit__(self, *args):
+            return False
+
+    class Client:
+        def __init__(self, **kwargs):
+            captured["client_kwargs"] = kwargs
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        def stream(self, method, url, headers):
+            captured["method"] = method
+            captured["url"] = url
+            captured["headers"] = dict(headers)
+            return StreamContext()
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", Client)
+    data = asyncio.run(server._asm_fetch_binary("release-1", 18, "item-2"))
+    assert data == b"abc"
+    assert captured["method"] == "GET"
+    assert captured["url"] == (
+        "http://hackerswithstyle.se/leet/search/bin/release-1/18/item-2"
+    )
+    assert captured["headers"]["Client-Id"] == "u64deck"
+    assert captured["client_kwargs"] == {"timeout": 120, "follow_redirects": True}
+    assert captured["chunk_size"] == server.MIB
+
+
+# --- v1.9.0 Release Candidate 48: Legacy Auto F7 preference correction ---
+
+def test_rc48_auto_f7_defaults_on_when_key_is_absent_and_preserves_explicit_disable(tmp_path, monkeypatch):
+    original_root = server.ROOT
+    try:
+        monkeypatch.setattr(server, "ROOT", tmp_path)
+        (tmp_path / "config.json").write_text('{"u64_host":"192.0.2.64"}', encoding="utf-8")
+        migrated = server.load_config()
+        assert migrated["boot_prekey"] == "F7"
+        assert migrated["_config_migration_pending"] is True
+
+        (tmp_path / "config.json").write_text('{"boot_prekey":""}', encoding="utf-8")
+        opted_out = server.load_config()
+        assert opted_out["boot_prekey"] == ""
+    finally:
+        monkeypatch.setattr(server, "ROOT", original_root)
+
+
+def test_rc48_legacy_checkbox_is_selectable_and_explains_guidance_only():
+    root = Path(server.ROOT)
+    js = (root / "static/app.js").read_text(encoding="utf-8")
+    html = (root / "static/index.html").read_text(encoding="utf-8")
+    assert "box.disabled=BOOT_OPTIONS_SAVING;" in js
+    assert "box.disabled=BOOT_OPTIONS_SAVING||legacy" not in js
+    assert "if(isLegacyInput()){" not in js[js.index("async function autoFastloadChanged"):js.index("async function machine", js.index("async function autoFastloadChanged"))]
+    assert "Legacy Auto F7 enabled — physical-F7 guidance will be shown; no F7 will be injected" in js
+    assert "u64deck will not inject F7 through the Legacy KERNAL keyboard buffer" in js
+    assert "enabling this option shows physical-F7 guidance" in html
+
+
+def test_rc48_legacy_enabled_preference_never_uses_kernal_buffer_f7(monkeypatch):
+    previous = dict(server.CFG)
+    legacy_calls = []
+    matrix_calls = []
+    try:
+        server.CFG["boot_prekey"] = "F7"
+        monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(server, "_input_status", lambda *a, **k: {"available": False})
+        monkeypatch.setattr(server, "_legacy_type", lambda data, **kw: legacy_calls.append(bytes(data)))
+        monkeypatch.setattr(server, "_matrix_send", lambda events, **kw: matrix_calls.append(events))
+        result = server._send_boot_prekey(cartridge_state={"classification":"retro_replay","source":"test"})
+        assert result is None
+        assert legacy_calls == []
+        assert matrix_calls == []
+    finally:
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc48_cia1_enabled_preference_still_uses_matrix_f7(monkeypatch):
+    previous = dict(server.CFG)
+    matrix_calls = []
+    try:
+        server.CFG["boot_prekey"] = "F7"
+        monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(server, "_input_status", lambda *a, **k: {"available": True})
+        monkeypatch.setattr(server, "_legacy_type", lambda *a, **k: (_ for _ in ()).throw(AssertionError("legacy path used")))
+        monkeypatch.setattr(server, "_matrix_send", lambda events, **kw: matrix_calls.append(events))
+        assert server._send_boot_prekey(cartridge_state={"classification":"retro_replay","source":"test"}) == "F7"
+        assert matrix_calls == [[{"kind":"keyboard","inputs":["f7"],"transition":"tap"}]]
+    finally:
+        server.CFG.clear(); server.CFG.update(previous)

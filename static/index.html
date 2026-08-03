@@ -74,7 +74,7 @@
           <button id="btnRecord" class="tip" data-wifi-tip="Record video, audio, or both." data-tip="Record video, audio, or both. Auto prefers MP4 when the browser supports it and otherwise uses WebM." onclick="toggleRecording()"><span id="recordDot" class="record-dot" aria-hidden="true"></span><span id="recButtonLabel">Record</span></button>
           <span id="recStatus" class="badge" style="display:none">00:00</span>
           <span id="recSummary" class="hint rec-summary">Combined · Standard · Auto</span>
-          <label id="autoFastloadLabel" class="hint" title="Automatically presses F7 after Reset, Reboot and Mount &amp; Run when Retro Replay is configured and CIA1 matrix input is available. On Legacy KERNAL-buffer devices, automatic F7 is disabled because an emulated F7 can open the Freeze Menu; press physical F7 on the C64 instead. Your saved preference is retained and becomes active again on CIA1-capable devices.">
+          <label id="autoFastloadLabel" class="hint" title="CIA1: automatically presses F7 for confirmed Retro Replay. Legacy input: enabling this option shows physical-F7 guidance; u64deck will not inject F7 through the Legacy KERNAL keyboard buffer.">
             <input type="checkbox" id="autoFastload" onchange="autoFastloadChanged()"> Auto F7 Fastload
           </label>
           <span id="autoFastloadHint" class="badge buffer" style="display:none">Legacy: cartridge checked at launch</span>
@@ -624,6 +624,17 @@
     </div>
     <div id="asmForm" class="asm-search-form">
       <span class="hint">Loading search fields…</span>
+    </div>
+    <div class="asm-support-panel" aria-label="Support Assembly64">
+      <div class="asm-support-copy">
+        <strong>Support Assembly64</strong>
+        <span>Assembly64 search and download services are provided by the Assembly64 project. Hosting and maintaining the service has ongoing costs, so please consider making a donation to help keep Assembly64 available to the community.</span>
+        <small>u64deck is a non-commercial Assembly64 client.</small>
+      </div>
+      <div class="asm-support-actions">
+        <a href="https://ko-fi.com/assembly64" target="_blank" rel="noopener noreferrer">Donate via Ko-fi</a>
+        <a href="https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&amp;hosted_button_id=8D6YK9LXULYPE" target="_blank" rel="noopener noreferrer">Donate via PayPal</a>
+      </div>
     </div>
   </div>
 

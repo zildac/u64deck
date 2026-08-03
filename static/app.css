@@ -131,6 +131,15 @@ h2{font-size:13px;letter-spacing:.12em;color:var(--dim);font-weight:600;margin:0
 .asm-field>span{color:var(--dim);font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}
 .asm-field input,.asm-field select{width:100%;min-width:0}
 .asm-search-actions{display:flex;align-items:center;gap:6px;margin-left:auto}
+.asm-support-panel{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:10px;padding:9px 10px;border:1px solid rgba(139,147,255,.32);border-radius:8px;background:rgba(64,49,141,.12)}
+.asm-support-copy{display:flex;align-items:baseline;gap:8px;min-width:0;flex-wrap:wrap}
+.asm-support-copy strong{color:var(--acc2);white-space:nowrap}
+.asm-support-copy span{color:var(--txt);font-size:12px;line-height:1.4;flex:1 1 440px}
+.asm-support-copy small{color:var(--dim);white-space:nowrap}
+.asm-support-actions{display:flex;align-items:center;gap:6px;flex:0 0 auto}
+.asm-support-actions a{font:inherit;color:var(--txt);background:var(--raised);border:1px solid var(--line);border-radius:6px;padding:5px 10px;text-decoration:none;white-space:nowrap}
+.asm-support-actions a:hover,.asm-support-actions a:focus-visible{border-color:var(--acc);color:var(--acc2)}
+.asm-support-actions a:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
 .asm-workspace{display:grid;grid-template-columns:minmax(500px,1.35fr) minmax(390px,1fr);gap:14px;flex:1 1 auto;min-height:0}
 .asm-workspace-panel{display:flex;flex-direction:column;min-width:0;min-height:0;margin-bottom:0;overflow:hidden}
 .asm-pane-heading{flex:0 0 auto;padding-bottom:9px;border-bottom:1px solid rgba(39,44,76,.7)}
@@ -158,6 +167,8 @@ h2{font-size:13px;letter-spacing:.12em;color:var(--dim);font-weight:600;margin:0
   .asm-workspace{display:flex;flex-direction:column;min-height:680px}
   .asm-workspace-panel{min-height:320px}
   .asm-search-actions{margin-left:0}
+  .asm-support-panel{align-items:flex-start;flex-direction:column}
+  .asm-support-actions{flex-wrap:wrap}
 }
 
 .meter-group{display:inline-flex;align-items:center;gap:6px;white-space:nowrap;flex:0 0 auto}

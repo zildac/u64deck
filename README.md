@@ -30,7 +30,7 @@ when testing the Ethernet REST endpoint itself.
 
 # u64deck
 
-**v1.9.0 — Release Candidate 45 · build 6feaede**
+**v1.9.0 — Release Candidate 48 · build c0d1fb0**
 
 
 A lightweight, self-hosted control deck for the **Ultimate 64** (and, minus the
@@ -151,8 +151,20 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
   machine by running PRGs/CRTs, mounting disk images, using Mount & Run, or
   browsing inside a downloaded D64 and running one file from it. Speaks the same protocol
   as the firmware's built-in search (AQL `(field:"value")` queries,
-  `Assembly Query` user-agent, `Client-Id` header — reverse-engineered from
-  the firmware source, `client_id` configurable in `config.json`).
+  `Assembly Query` user-agent and the dedicated, non-configurable
+  `Client-Id: u64deck` application identifier).
+
+### Assembly64 service and support
+
+Assembly64 search and download services are provided by the Assembly64 project.
+Hosting and maintaining the service has ongoing costs, so please consider making
+a donation to help keep Assembly64 available to the community. u64deck is a
+non-commercial Assembly64 client and is not developed, endorsed or supported by
+the Assembly64 project. Donations go directly to Assembly64 and are not required
+to use the integration.
+
+- [Donate via Ko-fi](https://ko-fi.com/assembly64)
+- [Donate via PayPal](https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=8D6YK9LXULYPE)
 
 ## Screenshots
 
@@ -214,7 +226,7 @@ does not stop the server. The connected Ultimate continues running.
 
 ### Tier 3 — Anywhere else (or by hand)
 
-The original cross-platform source launch remains available:
+Anywhere else (or by hand):
 
 ```bash
 pip install -r requirements.txt
@@ -226,49 +238,11 @@ Settings (device, interface, transport and passwords) live in
 `config.json`, which u64deck **creates and updates by itself** and release
 archives deliberately do not include. `config.example.json` documents the
 available keys (`u64_host`, the Ultimate network `password`, FTP credentials,
-`local_ip`, `stream_transport`, multicast groups and
-`assembly64.client_id`).
-
-#### Linux Preview 5 — source-run preview
-
-Linux Preview 5 is a preview rather than the stable supported build. It is
-provided as-is for testing on recent Debian/Ubuntu-derived desktops; expect
-rough edges and report Linux issues with the complete version/build string.
-Windows remains the stable distribution.
-
-Extract the `.tar.gz`, then run as a normal user:
-
-```bash
-chmod +x install.sh u64deck.sh
-./install.sh
-./u64deck.sh
-```
-
-`install.sh` creates a private `.venv` inside the extracted application folder,
-installs `requirements.txt` there, creates an application-menu entry and a
-`~/.local/bin/u64deck` launcher. It never invokes `sudo` or changes system
-Python. Chromium, Chrome or Edge app-window mode is used when available;
-otherwise u64deck opens the system browser or prints the local URL.
-
-### Persistent-file locations
-
-The two platforms deliberately use different storage conventions:
-
-| Data | Windows | Linux Preview |
-|---|---|---|
-| Settings | `config.json` beside `u64deck.exe` | `${XDG_CONFIG_HOME:-~/.config}/u64deck/config.json` |
-| Storage/SID index | `.u64deck-index.sqlite3` beside the EXE | `${XDG_DATA_HOME:-~/.local/share}/u64deck/.u64deck-index.sqlite3` |
-| SIDFlow database | `.sidflow-similarity.sqlite` beside the EXE | `${XDG_DATA_HOME:-~/.local/share}/u64deck/.sidflow-similarity.sqlite` |
-| Favourites/recents | `user_items.json` beside the EXE | `${XDG_DATA_HOME:-~/.local/share}/u64deck/user_items.json` |
-| SID playlists | `playlists.json` beside the EXE | `${XDG_DATA_HOME:-~/.local/share}/u64deck/playlists.json` |
-| Logs | console / application folder context | `${XDG_STATE_HOME:-~/.local/state}/u64deck/u64deck.log` |
-
-Linux does not read JSON or SQLite runtime files placed beside the `.sh`
-scripts. Print the active paths with `./u64deck.sh --linux-print-paths`.
+`local_ip`, `stream_transport`, multicast groups and the Assembly64 service
+base URL). The Assembly64 application identifier is fixed as `u64deck` and is
+not a user setting.
 
 ### Updating an existing installation
-
-#### Windows
 
 Install every release into a **new, empty folder**. Stop the previous u64deck
 process completely before copying user data, and do not extract a new release
@@ -295,29 +269,6 @@ Always run u64deck as a normal user, and always the same way — mixing elevated
 ('Run as administrator') and normal launches leaves files with mismatched
 ownership and causes access-denied errors. If that has happened, use a fresh
 folder and copy only the supported persistent files listed above.
-
-#### Linux Preview
-
-Extract the new tarball into a new folder, use **Exit u64deck** in the old
-version, then run `./update-linux.sh` from the new folder. The updater installs
-the new private virtual environment, repoints the menu/command launchers and
-retains the XDG configuration and data directories. It leaves the previous
-application folder untouched. `./update-linux.sh --rollback /path/to/old/u64deck`
-repoints the launchers to a previous installed folder.
-
-For a Windows installation or an older Linux preview that stored persistent
-files beside its launcher, stop u64deck and run:
-
-```bash
-./import-existing-data.sh /path/to/old/u64deck
-```
-
-The importer copies supported settings, favourites, playlists, SIDFlow data and
-indexes into the Linux XDG locations, backs up anything it replaces, skips
-`-wal`/`-shm` files and leaves the source untouched. Windows filesystem paths
-inside `config.json`, favourites or an index are reported because Linux mount
-paths may need changing; a storage/SID index containing obsolete Windows paths
-may need to be rebuilt.
 
 ## Interface-aware Ultimate discovery
 
@@ -503,9 +454,13 @@ has been promoted successfully. A failed or interrupted download/import leaves
 the previous database untouched and removes temporary files where possible.
 
 The primary recommendation engine is SIDFlow's weighted-cosine ranking over its
-58-dimensional model. **♪ More like this** prefers results from different SID
-files and uses sibling subtunes only when needed to fill the result set.
-**Radio** excludes the current file, recently played files and files already in
+58-dimensional model. **♪ More like this** now diversifies SIDFlow's track-level neighbours into a
+tune-level queue: it keeps the highest-ranked representative for each SID file,
+suppresses display-equivalent copies found at different paths, and uses sibling
+subtunes only when distinct files cannot fill the result set. When sibling
+subtunes are deliberately retained as fallback, the queue labels them with their
+song number so they are visibly distinguishable. **Radio** applies the same
+diversification and also excludes the current file, recently played files and files already in
 the queue so one multi-subtune composition cannot dominate a station. SIDFlow's
 published graph is fixed at 25 neighbours per seed; when local-HVSC filtering or
 a long session exhausts it, u64deck can fill the remainder with its older local
@@ -591,7 +546,7 @@ The repo includes a PyInstaller spec and a GitHub Actions workflow
 1. Push this folder to a GitHub repo.
 2. The **build-exe** action runs on every push — grab `u64deck.exe` from the
    workflow's artifacts (Actions tab → latest run → *u64deck-windows*).
-3. Tag a release (`git tag v1.9.0-rc.45 && git push --tags`) and the exe is attached
+3. Tag a release (`git tag v1.9.0-rc.46 && git push --tags`) and the exe is attached
    to the GitHub Release automatically.
 
 Double-click the exe: it starts the server, opens the dedicated Edge app, and
@@ -781,18 +736,19 @@ offline device. Status is retried locally and refreshed immediately when the
 Mount & Run request completes; genuine connection failures outside that window
 continue to use the normal offline handling.
 
-The SCREEN tab has an **Auto F7 Fastload** checkbox.
-The saved preference is retained across device changes, but it becomes effective only when the current
-firmware Cartridge setting is confirmed as Retro Replay. On CIA1-capable devices
-u64deck then uses matrix F7 after its own Reset/Reboot and during Mount & Run or
-Mount & Load startup. On Legacy devices the control is visibly disabled as an
-effective capability and its tooltip explains that physical C64 F7 is required
-because an emulated F7 can open the Freeze Menu. Standalone Reset/Reboot displays
-an informational overlay; Mount & Run displays the active waiting overlay. With no
-configured cartridge, Auto F7 is skipped and Mount & Run proceeds normally.
-Switching back to a CIA1-capable device restores the saved preference. The
-option is disabled by default and cannot react to physical-device or
-software-triggered resets.
+The SCREEN tab has an **Auto F7 Fastload** checkbox. It defaults to enabled for
+new installations and older configurations that do not yet contain the setting;
+an explicit user-disabled value remains disabled. The preference is selectable
+and retained on both CIA1 and Legacy connections, but its effect depends on the
+active input path. On CIA1-capable devices, confirmed Retro Replay uses automatic
+matrix F7 after u64deck Reset/Reboot and during Mount & Run or Mount & Load
+startup. On Legacy KERNAL-buffer input, enabling Auto F7 shows the persistent
+physical-F7 guidance only. u64deck never injects F7 through the Legacy keyboard
+buffer because that path can enter the Retro Replay Freeze Menu. Standalone
+Reset/Reboot displays the informational overlay; Mount & Run displays the active
+waiting overlay. With no configured cartridge, Auto F7 is skipped and Mount & Run
+proceeds normally. The option cannot react to physical-device or software-triggered
+resets.
 
 The corresponding advanced `config.json` settings are:
 
@@ -1145,9 +1101,9 @@ The **browser → u64deck** hop, however, is ours to secure:
 - **Mount & Load timing** is a fixed ~2.8 s wait for BASIC after reset. If you
   run a fastloader kernal or odd cartridge config, adjust the sleep in
   `image_mount_load` in `server.py`.
-- **Assembly64 endpoints aren't officially documented**; the tab shows raw
-  responses so the templates in `config.json` can be adapted if the service
-  changes shape.
+- **Assembly64 endpoints are service-controlled**; the tab shows raw responses
+  under Developer Details so the configured base URL can be adapted if the
+  service changes shape. Every request uses the registered `u64deck` client ID.
 - **Legacy Retro Replay F7 requires the physical C64 keyboard.** Legacy Retro
   Replay control is best-effort on the tested C64 Ultimate combination. On the tested C64 Ultimate + Retro Replay combination,
   injected Legacy-buffer F7 can enter the Freeze Menu, so u64deck suppresses
@@ -1177,7 +1133,7 @@ sid_indexer.py     read-only local SID-header metadata scanner
 sidflow_similarity.py  SIDFlow 0.8.0 validation, decompression, import and recommendation ranking
 device_coordinator.py  priority scheduling for Ultimate operations
 static/index.html  the whole UI
-config.json        host + ports + Assembly64 endpoint templates
+config.json        host + ports + Assembly64 service base URL
 ```
 
 ### Building the initial index from a local USB stick
