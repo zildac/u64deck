@@ -1,26 +1,15 @@
 # Changelog
 
-## 1.9.0 — Linux Preview 9
+## 1.9.0
 
-**Private Linux source-run preview:** `cd9ed24`  
-**Matched Windows baseline:** `Release Candidate 51 · ea5a1b6`
+**Windows Final:** `579a5f8`
 
-- Adopts the hardware-accepted RC51 shared application core without Linux-only functional changes.
-- Retains the established XDG configuration/data layout, installer, updater, importer, Chromium app-window handling and graceful Exit lifecycle.
-- Restores the canonical empty `library/` directory and README in the Linux tarball.
-- Uses the matching compact u64deck PNG for the Linux desktop/application-menu icon.
-- Adds package-level checks for canonical library contents, icon presence, shared-core parity and extracted-tarball hygiene.
-
-## 1.9.0 — Release Candidate 51
-
-**Public final release candidate:** `ea5a1b6`
-
-- Promotes the hardware-accepted RC50 private reissue 6 application baseline without new functionality.
-- Restores the canonical empty `library/` directory containing only `library/README.txt`.
-- Replaces the Windows executable artwork with the compact redesigned u64deck icon and supplies verified 16, 24, 32, 48, 64, 128 and 256 pixel ICO frames.
-- Preserves the PyInstaller `sys.path.insert` packaging fix while adding generated PE VERSIONINFO for version, release label and source build ID.
-- Adds release gates for canonical library content, empty-library hygiene, icon frame coverage, binary asset parity, spec integrity and packaged Windows ZIP contents.
-- Linux Preview 9 uses the same accepted shared application baseline and matching compact desktop icon while retaining its established XDG, installer, updater, importer, Chromium and clean-Exit behaviour.
+- Promotes the hardware-tested RC51 application code unchanged apart from the release identity.
+- Retains the canonical empty `library/` directory containing only `library/README.txt`.
+- Retains the compact redesigned Windows icon with verified 16, 24, 32, 48, 64, 128 and 256 pixel ICO frames.
+- Retains the PyInstaller `sys.path.insert` packaging fix and generated PE VERSIONINFO for version and source build ID.
+- Retains release gates for canonical library content, empty-library hygiene, icon frame coverage, binary asset parity, spec integrity and packaged Windows ZIP contents.
+- This Final release is Windows-only. Linux remains at Preview 9 because its updater and upgrade experience are still partly manual; the Linux application baseline itself remains stable and is not rebuilt or re-identified here.
 
 ## 1.9.0 — Release Candidate 50
 

@@ -9896,7 +9896,8 @@ def main():
             SL_STATE["state"] = "error: " + str(e)[:80]
     _threading.Thread(target=_songlengths_bg, daemon=True,
                       name="songlengths").start()
-    print(f"  u64deck v{VERSION} · {RELEASE_LABEL} · build {BUILD}")
+    identity = f"u64deck v{VERSION}" + (f" · {RELEASE_LABEL}" if RELEASE_LABEL else "") + f" · build {BUILD}"
+    print(f"  {identity}")
     scheme = "https" if (CFG.get("tls_certfile") and CFG.get("tls_keyfile")) else "http"
     url = f"{scheme}://localhost:{CFG['http_port']}"
     print(f"\n  u64deck -> device {CFG['u64_host'] or '(none — use Select Ultimate\u2026 in the UI)'}")

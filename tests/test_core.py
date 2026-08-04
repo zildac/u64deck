@@ -1880,7 +1880,7 @@ def test_frontend_is_split_without_a_build_tool():
 def test_release_metadata_is_centralised():
     import release
     assert server.VERSION == release.VERSION == "1.9.0"
-    assert release.RELEASE_LABEL == "Release Candidate 51"
+    assert release.RELEASE_LABEL == ""
     assert server.BUILD == release.build_id(server.ASSETS, Path(server.__file__).parent)
 
 
@@ -2843,7 +2843,7 @@ def test_release_help_and_now_playing_star_are_present():
     assert "jkToggleNowFavourite" in js
     assert ".u64deck-index.sqlite3" in help_js
     assert "star beside the playback controls" in help_js
-    assert "v1.9.0 — Release Candidate 51" in readme
+    assert f"v1.9.0 · build {server.BUILD}" in readme
     assert ".u64deck-index.sqlite3" in readme
     assert "Install every release into a **new, empty folder**" in readme
     assert "Do not copy `*-wal`" in readme
@@ -6898,9 +6898,9 @@ def test_rc32_documentation_identity_and_inherited_sidflow_contract():
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
     help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
     build = server.BUILD
-    assert f"v1.9.0 — Release Candidate 51 · build {build}" in readme
-    assert f"**Public final release candidate:** `{build}`" in changelog
-    assert "final release candidate" in " ".join(readme.lower().split())
+    assert f"v1.9.0 · build {build}" in readme
+    assert f"**Windows Final:** `{build}`" in changelog
+    assert "**windows final.**" in readme.lower()
     assert "Analyse Disk-Image Names" in readme
     assert "terminal hyphen-delimited" in readme
     assert "SQLite schema v5" in changelog
@@ -7981,8 +7981,8 @@ def test_rc32_docs_describe_queue_contract_and_identity():
     root = Path(server.ROOT)
     readme = (root / "README.md").read_text(encoding="utf-8")
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert "Release Candidate 51" in readme
-    assert "Release Candidate 51" in changelog
+    assert "**v1.9.0 · build" in readme
+    assert "## 1.9.0\n" in changelog
     assert "UI Preview 5" in changelog
     assert "does not invalidate" in readme
 
@@ -9609,8 +9609,8 @@ def test_rc49_release_identity_and_windows_packaging_baseline():
     import release
     root = Path(server.ROOT)
     assert release.VERSION == "1.9.0"
-    assert release.RELEASE_LABEL == "Release Candidate 51"
-    assert "Release Candidate 51" in (root / "README.md").read_text(encoding="utf-8")
+    assert release.RELEASE_LABEL == ""
+    assert "**Windows Final.**" in (root / "README.md").read_text(encoding="utf-8")
     assert (root / "u64deck.spec").is_file()
     assert (root / ".github/workflows/build-exe.yml").is_file()
 
@@ -9910,13 +9910,13 @@ def test_rc50_release_identity_and_progressive_finder_documentation():
     readme = (root / "README.md").read_text(encoding="utf-8")
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
     help_js = (root / "static/help_content.js").read_text(encoding="utf-8")
-    assert release.RELEASE_LABEL == "Release Candidate 51"
-    assert f"v1.9.0 — Release Candidate 51 · build {server.BUILD}" in readme
+    assert release.RELEASE_LABEL == ""
+    assert f"v1.9.0 · build {server.BUILD}" in readme
     assert "Progressive single-pass discovery" in readme
     assert "a verified ultimate is displayed as soon" in " ".join(readme.replace(">", "").lower().split())
     assert "Progressive bounded subnet scan" in help_js
     assert "Cancel scan" in help_js
-    assert "Release Candidate 51" in changelog
+    assert "## 1.9.0\n" in changelog
 
 # --- v1.9.0 Release Candidate 50 private reissue: Dashboard Jukebox balance ---
 
@@ -10203,7 +10203,7 @@ def test_rc50_r6_local_sid_picker_replaces_native_file_control():
 
 
 
-# --- v1.9.0 Release Candidate 51: frozen baseline and packaging assets ---
+# --- v1.9.0 Final: frozen RC51 baseline and packaging assets ---
 
 def _ico_frame_sizes(path: Path) -> list[int]:
     import struct
@@ -10227,10 +10227,14 @@ def test_rc51_release_identity_and_frozen_baseline_wording():
     root = Path(server.ROOT)
     readme = (root / "README.md").read_text(encoding="utf-8")
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert release.RELEASE_LABEL == "Release Candidate 51"
-    assert f"v1.9.0 — Release Candidate 51 · build {server.BUILD}" in readme
-    assert "hardware-accepted RC50 private reissue 6 application baseline" in " ".join(readme.replace(">", "").split())
-    assert "## 1.9.0 — Release Candidate 51" in changelog
+    assert release.RELEASE_LABEL == ""
+    assert f"v1.9.0 · build {server.BUILD}" in readme
+    assert "hardware-tested RC51 application code promoted unchanged apart from the release identity" in " ".join(readme.replace(">", "").split())
+    assert "## 1.9.0\n" in changelog
+    notes = (root / "RELEASE-NOTES.md").read_text(encoding="utf-8")
+    assert "## About this release" in notes
+    assert "v1.9.0 Final is RC51's application code" in notes
+    assert "Linux remains at Preview 9" in notes
 
 
 def test_rc51_canonical_library_is_empty_except_readme():
@@ -10274,5 +10278,6 @@ def test_rc51_windows_workflow_checks_pe_metadata_and_library_package():
     assert "Verify PE VERSIONINFO" in workflow
     assert "ReleaseLabel" in workflow and "BuildId" in workflow
     assert "library/README.txt" in workflow
-    assert "u64deck-v1.9.0-rc.51-windows.zip" in workflow
+    assert "u64deck-v1.9.0-windows.zip" in workflow
+    assert "Final EXE startup banner still contains release-candidate wording" in workflow
     assert "Verify packaged library" in workflow

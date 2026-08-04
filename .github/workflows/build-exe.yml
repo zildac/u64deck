@@ -44,7 +44,11 @@ jobs:
           "U64DECK_EXPECTED_VERSION=$($parts[0])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "U64DECK_EXPECTED_RELEASE=$($parts[1])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "U64DECK_EXPECTED_BUILD=$($parts[2])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "Expected identity: v$($parts[0]) · $($parts[1]) · $($parts[2])"
+          if ([string]::IsNullOrEmpty($parts[1])) {
+            Write-Host "Expected identity: v$($parts[0]) · build $($parts[2])"
+          } else {
+            Write-Host "Expected identity: v$($parts[0]) · $($parts[1]) · build $($parts[2])"
+          }
 
       - name: Verify icon source frames
         shell: pwsh
@@ -168,7 +172,11 @@ jobs:
             if ($identity.build -ne $env:U64DECK_EXPECTED_BUILD) {
               throw "EXE API build '$($identity.build)' does not match documented source build '$env:U64DECK_EXPECTED_BUILD'"
             }
-            Write-Host "frozen API identity OK: v$($identity.version) · $($identity.release_label) · $($identity.build)"
+            if ([string]::IsNullOrEmpty($identity.release_label)) {
+              Write-Host "frozen API identity OK: v$($identity.version) · build $($identity.build)"
+            } else {
+              Write-Host "frozen API identity OK: v$($identity.version) · $($identity.release_label) · build $($identity.build)"
+            }
 
             $rejected = Invoke-WebRequest -Uri "http://127.0.0.1:8064/api/app/exit" `
               -Method Post -UseBasicParsing -TimeoutSec 5 -SkipHttpErrorCheck
@@ -200,14 +208,22 @@ jobs:
             # identity-bearing fields independently so encoding cannot weaken or
             # falsely fail the version/release/build guarantee.
             $expectedBannerVersion = "u64deck v$env:U64DECK_EXPECTED_VERSION"
-            $expectedBannerRelease = $env:U64DECK_EXPECTED_RELEASE
             $expectedBannerBuild = "build $env:U64DECK_EXPECTED_BUILD"
             if (-not $stdout.Contains($expectedBannerVersion) -or
-                -not $stdout.Contains($expectedBannerRelease) -or
                 -not $stdout.Contains($expectedBannerBuild)) {
-              throw "EXE startup banner did not report the documented version, release and build. Output: $stdout"
+              throw "EXE startup banner did not report the documented version and build. Output: $stdout"
             }
-            Write-Host "frozen banner identity OK: $expectedBannerVersion / $expectedBannerRelease / $expectedBannerBuild"
+            if ([string]::IsNullOrEmpty($env:U64DECK_EXPECTED_RELEASE)) {
+              if ($stdout.Contains("Release Candidate")) {
+                throw "Final EXE startup banner still contains release-candidate wording. Output: $stdout"
+              }
+              Write-Host "frozen Final banner identity OK: $expectedBannerVersion / $expectedBannerBuild"
+            } else {
+              if (-not $stdout.Contains($env:U64DECK_EXPECTED_RELEASE)) {
+                throw "EXE startup banner did not report release '$env:U64DECK_EXPECTED_RELEASE'. Output: $stdout"
+              }
+              Write-Host "frozen banner identity OK: $expectedBannerVersion / $env:U64DECK_EXPECTED_RELEASE / $expectedBannerBuild"
+            }
             Write-Host "normal Edge app, graceful cleanup, EXE exit and console retirement OK"
           } finally {
             $p.Refresh()
@@ -225,7 +241,7 @@ jobs:
           New-Item -ItemType Directory -Path "$packageRoot/library" -Force | Out-Null
           Copy-Item "dist/u64deck.exe" "$packageRoot/u64deck.exe"
           Copy-Item "library/README.txt" "$packageRoot/library/README.txt"
-          Compress-Archive -Path "$packageRoot/*" -DestinationPath "dist/u64deck-v1.9.0-rc.51-windows.zip" -Force
+          Compress-Archive -Path "$packageRoot/*" -DestinationPath "dist/u64deck-v1.9.0-windows.zip" -Force
 
       - name: Verify packaged library
         shell: pwsh
@@ -233,7 +249,7 @@ jobs:
           @'
           import zipfile
           from pathlib import Path
-          archive = Path("dist/u64deck-v1.9.0-rc.51-windows.zip")
+          archive = Path("dist/u64deck-v1.9.0-windows.zip")
           canonical = (
               "Drop .crt/.prg/.t64/.sid/.mod/.d64/.d71/.d81/.g64/.dnp files here.\n"
               "Each appears as a Quick Launch button in u64deck's SCREEN tab.\n"
@@ -251,7 +267,7 @@ jobs:
           name: u64deck-windows
           path: |
             dist/u64deck.exe
-            dist/u64deck-v1.9.0-rc.51-windows.zip
+            dist/u64deck-v1.9.0-windows.zip
           if-no-files-found: error
 
       - name: Attach to release
@@ -260,5 +276,5 @@ jobs:
         with:
           files: |
             dist/u64deck.exe
-            dist/u64deck-v1.9.0-rc.51-windows.zip
+            dist/u64deck-v1.9.0-windows.zip
           fail_on_unmatched_files: true
