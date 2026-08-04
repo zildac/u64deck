@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect x="24" y="24" width="976" height="976" rx="170" fill="#071427" stroke="#2d4a70" stroke-width="28"/>
+  <g transform="translate(112 350) skewX(-12)">
+    <rect x="0" y="0" width="190" height="42" rx="10" fill="#d83f43"/>
+    <rect x="0" y="45" width="190" height="42" rx="10" fill="#e88c36"/>
+    <rect x="0" y="90" width="190" height="42" rx="10" fill="#e3c547"/>
+    <rect x="0" y="135" width="190" height="42" rx="10" fill="#3aadad"/>
+    <rect x="0" y="180" width="190" height="42" rx="10" fill="#4b6dbc"/>
+  </g>
+  <text x="300" y="600" font-family="Arimo, Arial, sans-serif" font-size="220" font-weight="700" font-style="italic" fill="#f1efde">u64deck</text>
+</svg>

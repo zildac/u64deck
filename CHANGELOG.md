@@ -1,24 +1,112 @@
 # Changelog
 
-## 1.9.0 — Release Candidate 48
+## 1.9.0 — Release Candidate 51
 
-**Public soak candidate:** `c0d1fb0`
+**Public final release candidate:** `ea5a1b6`
 
-- Fixes the Legacy Auto F7 usability trap found during RC47 soak testing. The Auto F7 checkbox remains selectable on Legacy KERNAL-buffer connections instead of being disabled.
-- Defaults Auto F7 to enabled for new installations and older configurations where `boot_prekey` is absent, while preserving an explicit user-disabled empty value.
-- On Legacy input, enabling Auto F7 stores the preference and enables physical-F7 guidance only. u64deck still never injects F7 through the Legacy keyboard buffer.
-- Keeps CIA1 automatic matrix F7 behaviour unchanged for confirmed Retro Replay cartridges.
-- Carries RC47 Assembly64 client identification/support attribution and the RC46 SIDFlow recommendation diversification unchanged. No unrelated backend, device-control, discovery, streaming, indexing, modal or packaging workflow behaviour is intentionally changed.
+- Promotes the hardware-accepted RC50 private reissue 6 application baseline without new functionality.
+- Restores the canonical empty `library/` directory containing only `library/README.txt`.
+- Replaces the Windows executable artwork with the compact redesigned u64deck icon and supplies verified 16, 24, 32, 48, 64, 128 and 256 pixel ICO frames.
+- Preserves the PyInstaller `sys.path.insert` packaging fix while adding generated PE VERSIONINFO for version, release label and source build ID.
+- Adds release gates for canonical library content, empty-library hygiene, icon frame coverage, binary asset parity, spec integrity and packaged Windows ZIP contents.
+- Linux Preview 9 uses the same accepted shared application baseline and matching compact desktop icon while retaining its established XDG, installer, updater, importer, Chromium and clean-Exit behaviour.
 
-## 1.9.0 — Release Candidate 47
+## 1.9.0 — Release Candidate 50
 
-**Public soak candidate:** `45fbea8`
+**Private Windows test build:** `fce0b18`
 
-- Registers every Assembly64 search, preset, entry, binary-download and raw-debug request with the activated dedicated `Client-Id: u64deck` application identifier.
-- Removes the obsolete configurable Assembly64 client-ID override and cleans it from existing configuration on startup; the service base URL remains configurable.
-- Adds a compact, on-brand Support Assembly64 panel with direct Ko-fi and PayPal donation links using safe external-link attributes.
-- Adds matching Assembly64 attribution and support information to in-app Help and README without implying endorsement, licensing or mandatory donation.
-- Carries the hardware-tested RC46 SIDFlow recommendation diversification unchanged. No discovery, device-control, Mount & Run, streaming, indexing, SIDFlow data import, confirmation-modal or Exit-security behaviour is intentionally changed.
+- Private reissue 4: anchors the Jukebox playback clock to the completed SID runner request inside the cartridge-safe action, before any freezer-cartridge restoration delay, so browser fade and queue auto-advance remain aligned with the advertised Songlengths endpoint on hardware.
+- Locks in source-agnostic queue auto-advance: the next ordered tune plays regardless of whether it entered through Search, Favourites, saved queues, manual queue actions, More Like This or Radio. Queue replacement/install paths also clear stale stop-after-current state.
+- Private reissue 5: fixes Legacy Mount & Run command-buffer replacement by sending bounded chunks and confirming the KERNAL keyboard-buffer count at `$C6` has drained before transmitting the next chunk; firmware without `machine:readmem` uses a conservative character-at-a-time fallback.
+- Private reissue 6: replaces the browser-native local SID file control with a u64deck-styled **Choose SID files** button and a clear filename/selection-count status, preserving multi-file selection and the existing **Load Local SIDs** upload path.
+- Diagnostics now distinguish command-socket transmission from confirmed C64 buffer consumption, and ambiguous drain failures abort without sending remaining bytes or `RUN`.
+- Enlarges the Dashboard SID Jukebox Now Playing artwork proportionately to 208 px on standard desktop layouts (152 px on narrower layouts) while preserving the card size, dashboard grid, typography and action-button position.
+- Builds directly from the accepted RC49 redesigned-UI baseline.
+- Shows each verified Ultimate as soon as its `/v1/info` response completes while the rest of the selected local network continues scanning in the background.
+- Adds checked/remaining progress, time-to-first-verification reporting and a safe **Cancel scan** action.
+- Allows **Use now** on a verified device; remaining queued probes are cancelled and bounded in-flight requests settle before connection begins.
+- Keeps live-result rules strict: remembered addresses are never displayed unless they answer during the current scan, including after cancellation.
+- Preserves the RC48 production transport unchanged: 64 workers, 1.5-second TCP-connect budget, 3.25-second response budget after connection, one request per address, no preliminary port probe and no retry.
+- Adds progressive Finder job/status/cancel APIs and focused tests without changing Connect, REST routing, device control, Mount & Run, streaming, SID, indexing, Assembly64 or input behaviour.
+- Private validation build only; not approved for public GitHub promotion.
+
+## 1.9.0 — Release Candidate 49
+
+**Private Windows test build:** `972ae75`
+
+- Applies the accepted redesigned UI Preview 6 layout and typography to the RC48 functional baseline.
+- Makes the final Assembly64 clause, “u64deck is a non-commercial Assembly64 client.”, the same 14 px size and line height as the surrounding support copy; only its colour remains muted.
+- Retains the single-page Screen Mirror, internally scrolling control rail, playlist-only Jukebox scrolling, deterministic SID artwork, Dashboard connection states and C64-styled confirmation modals.
+- Adds only the read-only Jukebox elapsed-time field needed to resynchronise the smooth progress display.
+- Preserves RC48 discovery, connection routing, device control, Mount & Run, streaming, recording, indexing, Assembly64 requests, SIDFlow behaviour and Legacy/CIA1 input handling.
+- Finder/discovery changes are explicitly excluded and will be investigated in a separate reliability stream.
+- Private validation build only; not approved for public GitHub promotion.
+
+## 1.10.0 — UI Preview 6
+
+**Windows UI soak candidate:** `6ec28bf`
+
+- Rebases the accepted Windows UI Preview 5 connection-state design onto the complete RC48 functional baseline.
+- Retains the registered Assembly64 `Client-Id: u64deck` integration, compact support panel, exact Ko-fi and PayPal links, Help/README attribution and RC46 SIDFlow recommendation diversification.
+- Corrects Legacy Auto F7 usability: the option defaults on when absent, preserves an explicit opt-out and remains selectable on Legacy connections so physical-F7 guidance can be enabled.
+- Preserves the hard Legacy safeguard: u64deck never injects F7 through the Legacy KERNAL keyboard buffer; confirmed Retro Replay on CIA1 retains automatic matrix F7.
+- Increases the Assembly64 support heading, explanatory copy, non-commercial note and donation-link text to the accepted readable UI scale while keeping the panel compact and responsive.
+- Preserves the accepted single-page Screen Mirror, internally scrolling control rail, playlist-only Jukebox scrolling, deterministic artwork, smooth progress display, Dashboard connection states and C64-styled confirmation modals.
+- No discovery, device-control, Mount & Run sequencing, streaming, indexing, SIDFlow data-import, recording, modal or Exit-security behaviour is intentionally changed beyond the inherited RC48 Auto F7 correction.
+
+## 1.10.0 — UI Preview 5
+
+**Private Windows UI test build:** `80f3601`
+
+- Locks the accepted single-page Screen Mirror composition for 3440×1440 at 125% scaling: proportional central mirror, modest surrounding frame, complete right-side controls, mounted-drive strip and no desktop page/sidebar scrolling.
+- Corrected reissue: the Screen Mirror right-hand control rail now scrolls internally only when dynamic content such as Disk Swap, Quick Launch or expanded recording settings exceeds the available height; the mirror pane and footer remain fixed.
+- Connection-state reissue: the Dashboard Device badge and Screen Mirror footer now distinguish **Connecting…**, **Connected**, **Reconnecting…**, **Connection failed** and **Offline**, while preserving known device details during reconnect attempts. The badge is announced through an accessible polite live region and respects reduced-motion preferences.
+- Makes the SID playlist track list the Jukebox's only scrolling surface; player, artwork, browsing controls, metadata and queue tools remain fixed, with roughly 10–15 visible tracks at normal desktop heights.
+- Enlarges Now Playing artwork to 184×184 CSS pixels on standard desktop layouts and 224×224 on large ultrawide layouts, with compact short-window fallbacks.
+- Extends the deterministic offline SID-cover generator with synthwave, circuit, cosmic, pixel-city, demoscene, arcade-tunnel and chip-mosaic families selected from tune metadata and stable hashes.
+- Keeps title, artist and `SUBTUNE X/Y` embedded in every generated cover and preserves recognisable sibling-subtune families.
+- Replaces half-second progress-bar stepping with requestAnimationFrame interpolation and a small backend elapsed-time field for periodic clock resynchronisation.
+- Applies a unified readable sans-serif base type scale across Storage, Favourites, Health, Settings, Assembly64, Screen controls and other non-Dashboard working panels. Dashboard status values remain slightly larger.
+- Keeps the accepted Preview 4 Dashboard typography, header, navigation, destructive command buttons, Direct AUTO-interface handling, RC46 SIDFlow diversification and RC45 confirmation modals unchanged.
+
+## 1.10.0 — UI Preview 4
+
+**Private Windows UI test build:** `14fc3c9`
+
+- Keeps the accepted UI Preview 3 screen layout, navigation, header, card sizing, Screen Mirror and SID queue proportions unchanged.
+- Enlarges Dashboard metadata labels and values, descriptive copy and compact status badges, with stronger label contrast for improved readability at 3440×1440 with 125% Windows scaling and at 1920×1080.
+- Reworks the deterministic local SID artwork generator around multiple metadata-seeded geometric pattern families.
+- Always renders the SID title, artist and selected `SUBTUNE X/Y` directly into the artwork, and includes the same information in accessible SVG labels.
+- Keeps related subtunes visually connected by deriving their base composition from the SID metadata/path while varying the subtune-specific accent and label.
+- Uses no external artwork service, scraping, network request or copyrighted cover image.
+- Enlarges the normal Now Playing artwork from 124×124 to 160×160 CSS pixels, with a 124×124 short-window fallback, so the embedded title, artist and subtune remain legible without sacrificing the queue-led layout.
+
+## 1.10.0 — UI Preview 3
+
+**Private Windows UI test build:** `8d5faf7`
+
+- Restores the restrained red outline/text treatment for **Exit u64deck** and **Power Off Ultimate**.
+- Places the two destructive actions adjacent at the far right of the command bar without moving or recolouring the other machine controls.
+- Adds explicit 3440×1440 ultrawide layout validation alongside the existing standard-resolution checks.
+
+- Restores the Preview 1 sans-serif typography and spacing across the header, navigation and Dashboard while retaining the established monospaced C64/technical working views.
+- Restores the compact u64deck logo treatment, keeps the larger readable release identity beside it and retains the flashing **READY.** prompt on its own row.
+- Restores the clearer Dashboard heading hierarchy: **U64DECK UI NEXT**, **Dashboard**, then the concise workspace summary.
+- Refines sidebar width, item spacing, icon alignment, card rhythm and button typography at normal and reduced desktop widths.
+- Retains all UI Preview 2 functional and layout corrections unchanged: explicit Device details, separate drive rows, compact SID player, deterministic artwork, queue height, centred Screen Mirror and Direct AUTO-interface rebind.
+
+## 1.10.0 — UI Preview 2
+
+**Private Windows UI test build:** `692d7d8`
+
+- Refines the UI Preview header: larger release identity, a dedicated READY prompt row, and no duplicated connected-device sentence in the title bar.
+- Expands the Dashboard Device card with explicit connection state, hostname, IP address, interface, firmware, core, input method and REST health.
+- Presents Drive A and Drive B as separate readable rows, uses **No disk** for an enabled empty drive, and separates long filenames from mount-mode badges.
+- Compacts the artwork-led SID player, removes the duplicate Up Next presentation, restores useful queue height and aligns Shuffle and Radio as compact toggles.
+- Generates deterministic local SID artwork from tune metadata without external requests or copyrighted cover scraping.
+- Centres the proportional C64 Screen Mirror within the available stage; fixed scaling retains the selected size and Fit uses the largest aspect-correct size.
+- Re-resolves the AUTO local interface on every Direct-stream start and forces a best-effort firmware stream stop before restart so a stale pre-reboot destination is replaced. Multicast behaviour is unchanged.
+- Carries the accepted RC46 SIDFlow tune/file diversification and RC45 C64 confirmation modals unchanged.
 
 ## 1.9.0 — Release Candidate 46
 

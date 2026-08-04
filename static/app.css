@@ -131,13 +131,13 @@ h2{font-size:13px;letter-spacing:.12em;color:var(--dim);font-weight:600;margin:0
 .asm-field>span{color:var(--dim);font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}
 .asm-field input,.asm-field select{width:100%;min-width:0}
 .asm-search-actions{display:flex;align-items:center;gap:6px;margin-left:auto}
-.asm-support-panel{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:10px;padding:9px 10px;border:1px solid rgba(139,147,255,.32);border-radius:8px;background:rgba(64,49,141,.12)}
+.asm-support-panel{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:10px;padding:11px 12px;border:1px solid rgba(139,147,255,.32);border-radius:8px;background:rgba(64,49,141,.12)}
 .asm-support-copy{display:flex;align-items:baseline;gap:8px;min-width:0;flex-wrap:wrap}
-.asm-support-copy strong{color:var(--acc2);white-space:nowrap}
-.asm-support-copy span{color:var(--txt);font-size:12px;line-height:1.4;flex:1 1 440px}
-.asm-support-copy small{color:var(--dim);white-space:nowrap}
+.asm-support-copy strong{color:var(--acc2);font-size:14px;font-weight:700;line-height:1.35;white-space:nowrap}
+.asm-support-copy span{color:var(--txt);font-size:14px;line-height:1.5;flex:1 1 440px}
+.asm-support-copy small{color:var(--dim);font-size:14px;line-height:1.5;white-space:nowrap}
 .asm-support-actions{display:flex;align-items:center;gap:6px;flex:0 0 auto}
-.asm-support-actions a{font:inherit;color:var(--txt);background:var(--raised);border:1px solid var(--line);border-radius:6px;padding:5px 10px;text-decoration:none;white-space:nowrap}
+.asm-support-actions a{font:inherit;font-size:13px;font-weight:650;color:var(--txt);background:var(--raised);border:1px solid var(--line);border-radius:6px;padding:6px 11px;text-decoration:none;white-space:nowrap}
 .asm-support-actions a:hover,.asm-support-actions a:focus-visible{border-color:var(--acc);color:var(--acc2)}
 .asm-support-actions a:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
 .asm-workspace{display:grid;grid-template-columns:minmax(500px,1.35fr) minmax(390px,1fr);gap:14px;flex:1 1 auto;min-height:0}
@@ -444,3 +444,537 @@ pre.raw{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
 .health-history-row .health-event-state{font-size:10px;color:var(--dim);white-space:nowrap}
 .health-history-row .health-event-state.active{color:var(--warn)}
 .health-history-row .health-event-state.recovered{color:var(--ok)}
+
+/* ========================================================================== */
+/* v1.10.0 UI Preview 2                                                      */
+/* ========================================================================== */
+:root{
+  --bg:#07101f;--panel:#0e1a2d;--raised:#14243b;--line:#243755;
+  --txt:#f4edd9;--dim:#9eb4d6;--acc:#8f83ff;--acc2:#c5bdff;
+  --ok:#6ee7a3;--warn:#f4c76f;--err:#ef7777;
+  --shadow:0 18px 54px rgba(0,0,0,.28);
+}
+body{background:radial-gradient(circle at 35% -15%,rgba(116,91,219,.14),transparent 38%),linear-gradient(180deg,#07101f 0%,#08111f 100%);color:var(--txt)}
+button,input,select{border-radius:9px}
+button{background:#13233a;border-color:#29415f;color:var(--txt)}
+button:hover{border-color:var(--acc);background:#192b46;color:#fff}
+button.primary{background:linear-gradient(135deg,#8f83ff,#7668e4);color:#09101f;border-color:#a69dff}
+.panel{background:linear-gradient(145deg,rgba(18,31,52,.98),rgba(11,22,39,.98));border-color:#243755;border-radius:16px;box-shadow:0 7px 26px rgba(0,0,0,.12)}
+
+/* Header: retain the command area, align app identity, dedicate a row to READY. */
+.app-header{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;padding:12px 18px 10px;background:rgba(5,12,24,.96);border-bottom:1px solid #20324d;flex-wrap:nowrap}
+.header-brand-area{display:flex;flex-direction:column;gap:7px;min-width:340px}
+.header-mainline{display:flex;align-items:center;gap:16px;min-height:38px}
+.brand{display:flex;align-items:center;gap:18px}
+.brand-logo{display:block;width:121px;height:34px;object-fit:contain;object-position:left center}
+.brand-version{font-size:14px;font-weight:650;letter-spacing:.02em;color:#b8c7df;white-space:nowrap}
+.ready-line{font-size:12px;color:#8fa7cb;font-weight:750;letter-spacing:.09em;line-height:1}
+.header-command-area{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap;margin-left:auto}
+.header-actions,.machine{gap:7px}.machine{margin-left:0}#devinfo{display:none!important}
+@media(max-width:1240px){.app-header{flex-wrap:wrap}.header-command-area{width:100%;justify-content:flex-start}.header-brand-area{min-width:0}}
+@media(max-width:720px){.brand{align-items:flex-start;flex-direction:column;gap:7px}.header-brand-area{width:100%}.brand-version{white-space:normal}}
+
+/* Navigation shell. */
+.app-nav{width:150px;background:rgba(7,16,31,.82);border-right-color:#20324d;padding:16px 10px;gap:7px}
+.app-nav button{display:flex;align-items:center;gap:9px;padding:10px 11px;border-radius:10px;font-size:11px;font-weight:700;letter-spacing:.035em;color:#b7c7e1}
+.app-nav button.active{background:linear-gradient(135deg,rgba(124,105,231,.28),rgba(77,73,168,.20));border-color:#655ab8;color:#fff;box-shadow:inset 3px 0 0 #9788ff}
+.nav-icon{width:16px;text-align:center;color:#9b8cff}section{padding:20px 24px}
+
+/* Dashboard. */
+.dashboard-page{overflow:auto}.dashboard-intro{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:20px}
+.dashboard-intro h1{margin:5px 0 0;font-size:20px;font-weight:500;color:#b9d4f4}.eyebrow{font-size:10px;font-weight:850;letter-spacing:.14em;color:#9e8fff}
+.dashboard-grid{display:grid;grid-template-columns:repeat(3,minmax(260px,1fr));gap:16px;align-items:stretch}
+.dashboard-card{display:flex;flex-direction:column;min-height:255px;padding:20px 21px;border:1px solid #293c5a;border-radius:18px;background:linear-gradient(145deg,rgba(19,33,56,.98),rgba(10,21,38,.98));box-shadow:var(--shadow);min-width:0}
+.dashboard-card-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:20px}.dashboard-card-label{display:flex;align-items:center;gap:10px;color:#a8b9dc;font-size:12px;font-weight:800;letter-spacing:.09em}.card-icon{display:grid;place-items:center;width:36px;height:36px;border-radius:12px;background:rgba(124,105,231,.20);color:#aa9cff}
+.dashboard-card-body{flex:1;min-width:0}.dashboard-card h2{margin:0 0 7px;color:#fff0d3;font-size:22px;font-weight:800;letter-spacing:-.025em}.dashboard-subtitle{color:#91add3;font-size:13px;line-height:1.55;overflow-wrap:anywhere}.card-action{align-self:flex-start;margin-top:20px;padding:9px 16px;background:#12253f;border-color:#2c4d70;color:#fff3dc}
+.connection-badge{display:inline-flex;align-items:center;gap:8px;border:1px solid #245847;border-radius:999px;padding:7px 12px;color:#d7ffea;background:rgba(35,93,69,.16);font-size:12px;white-space:nowrap}.connection-badge.offline{border-color:#5e4650;color:#d7b6bf;background:rgba(95,52,65,.12)}.status-dot{width:9px;height:9px;border-radius:50%;background:currentColor;box-shadow:0 0 12px currentColor}
+.device-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px 18px;margin:20px 0 0}.device-facts div{min-width:0}.device-facts dt{color:#748fb8;font-size:10px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.device-facts dd{margin:3px 0 0;color:#e9eef8;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dashboard-media-summary{display:flex;gap:16px;align-items:center}.dash-artwork{flex:0 0 82px;width:82px;height:82px;border-radius:12px;background:#17253b;border:1px solid #314661;overflow:hidden;box-shadow:0 8px 20px rgba(0,0,0,.24)}.dash-artwork svg{display:block;width:100%;height:100%}.dashboard-media-copy{min-width:0}.dashboard-media-copy h2{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dashboard-inline-status{display:inline-flex;margin-top:12px;border:1px solid #354865;border-radius:999px;padding:4px 9px;color:#bccae1;font-size:11px}
+.dashboard-status-row{display:flex;flex-wrap:wrap;gap:7px;margin-top:16px}.mini-state{display:inline-flex;align-items:center;border:1px solid #31445f;border-radius:999px;padding:4px 9px;color:#aabbd5;background:rgba(22,37,60,.75);font-size:11px}.mini-state.on{color:#86efb2;border-color:#2f7457;background:rgba(40,104,76,.14)}.mini-state.warn{color:#f5cf7a;border-color:#745f2e}.mini-state.bad{color:#ff9494;border-color:#754050}
+.drive-card-row{display:grid;grid-template-columns:62px minmax(0,1fr) auto;align-items:start;gap:10px;padding:10px 0;border-bottom:1px solid rgba(58,78,110,.48)}.drive-card-row+.drive-card-row{margin-bottom:14px}.drive-card-label{color:#829dc3;font-size:11px;font-weight:800}.drive-card-name{color:#f6ead3;font-size:14px;font-weight:700;overflow-wrap:anywhere;min-width:0}.drive-card-row .mount-badge{margin:0}
+@media(max-width:1280px){.dashboard-grid{grid-template-columns:repeat(2,minmax(270px,1fr))}}@media(max-width:760px){.dashboard-grid{grid-template-columns:1fr}.dashboard-card{min-height:230px}.device-facts{grid-template-columns:1fr 1fr}}
+
+/* Screen Mirror: stage centres the real canvas; the bezel hugs the image. */
+#tab-screen.active{display:flex;flex-direction:column;overflow:auto}
+#tab-screen .crt-wrap{display:grid;grid-template-columns:minmax(0,1fr) minmax(300px,390px);gap:16px;align-items:start}
+#tab-screen .crt{display:flex;align-items:center;justify-content:center;width:100%;min-height:min(620px,calc(100vh - 180px));padding:18px;border-radius:18px;background:linear-gradient(145deg,#0b1425,#0b1729);border:1px solid #263c59;box-shadow:0 16px 44px rgba(0,0,0,.34);overflow:auto}
+#tab-screen .crt-inner{display:inline-flex;align-items:center;justify-content:center;width:max-content;height:max-content;max-width:100%;padding:10px;border:3px solid var(--bezel,var(--c64-border));border-radius:8px;background:var(--bezel,var(--c64-border));box-shadow:0 0 0 1px #31275d;overflow:hidden;flex:0 0 auto}
+#tab-screen canvas#screen{display:block;max-width:100%;max-height:calc(100vh - 225px);object-fit:contain;flex:0 0 auto;background:var(--c64-screen)}
+#tab-screen .screen-side{width:100%;max-width:none;min-width:0}#tab-screen .screen-side>.panel{margin-bottom:12px}
+#tab-screen.screen-fit .crt{overflow:hidden}#tab-screen.screen-fit .crt-inner{max-width:100%;max-height:calc(100vh - 205px)}#tab-screen.screen-fit canvas#screen{width:min(100%,calc((100vh - 245px)*384/272))!important;height:auto!important;max-height:calc(100vh - 245px)}
+#tab-screen .crt:fullscreen{min-height:0;border:0;border-radius:0;padding:0;background:#000;overflow:hidden}#tab-screen .crt:fullscreen .crt-inner{border:0;border-radius:0;padding:0;background:#000;max-width:100vw;max-height:100vh}
+@media(max-width:1120px){#tab-screen .crt-wrap{grid-template-columns:1fr}#tab-screen .crt{min-height:390px}#tab-screen .screen-side{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}#tab-screen .screen-side>.panel{margin:0}}
+@media(max-width:720px){#tab-screen .screen-side{grid-template-columns:1fr}#tab-screen .crt{min-height:300px;padding:10px}#tab-screen .crt-inner{padding:6px}}
+.drive-summary-strip{position:static;border-radius:14px;margin-bottom:12px;background:rgba(13,27,47,.96)}.drive-summary-content{display:flex;flex-direction:column;gap:3px}.drive-summary-item{max-width:100%;white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere}
+
+/* Compact artwork-led SID player; queue receives remaining height. */
+/* UI Preview 4 artwork-size refinement: larger readable cover without restoring the oversized hero. */
+#tab-sid.active{display:flex;flex-direction:column;overflow:hidden;padding-bottom:12px}.sid-player-hero{position:relative;display:grid;grid-template-columns:160px minmax(0,1fr);gap:20px;align-items:center;flex:0 0 auto;padding:14px 18px;margin-bottom:10px;min-height:188px;overflow:hidden}.sid-artwork{width:160px;height:160px;border-radius:15px;overflow:hidden;border:1px solid #3d5170;background:#14223a;box-shadow:0 12px 26px rgba(0,0,0,.34)}.sid-artwork svg{display:block;width:100%;height:100%}
+.sid-hero-main{min-width:0}.sid-hero-main h1{margin:4px 0 2px;color:#fff0d0;font-size:22px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.sid-hero-meta{color:#9eb4d6;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.sid-progress{height:5px;margin-top:11px;border-radius:99px;background:#2a3d5d;overflow:hidden}.sid-progress-fill{width:0;height:100%;border-radius:inherit;background:linear-gradient(90deg,#9b8cff,#f3d28f);transition:width .35s linear}.sid-time-row{display:flex;justify-content:space-between;color:#8099bc;font-size:10px;margin-top:4px;font-variant-numeric:tabular-nums}.sid-hero-controls{display:flex;align-items:center;gap:7px;margin-top:9px;flex-wrap:wrap}.transport-button{width:34px;height:34px;padding:0;display:grid;place-items:center;border-radius:50%}.hero-play{width:40px;height:40px}.sid-hero-badges{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}.artwork-expand{position:absolute;top:10px;right:10px;width:30px;height:30px;padding:0;border-radius:8px;background:rgba(6,14,27,.55)}.sid-player-hero.artwork-expanded{grid-template-columns:240px minmax(0,1fr);min-height:266px}.sid-player-hero.artwork-expanded .sid-artwork{width:240px;height:240px}
+.sid-jukebox-controls{padding:11px 13px;margin-bottom:10px;max-height:210px;overflow:auto;flex:0 0 auto}.sid-jukebox-controls>h2{margin-bottom:7px}.sid-jukebox-controls .row{row-gap:5px}.sid-toggle{display:inline-flex;align-items:center;gap:5px;border:0!important;border-radius:0!important;padding:0!important;background:none!important;color:var(--dim)}.sid-toggle:has(input:checked){color:#eeeaff}.sid-toggle input{accent-color:#8f83ff}.sid-queue-panel{min-height:280px;border-radius:14px}.sid-queue-tools{margin:2px 0 7px}.sid-queue-list{min-height:220px}.jkq-row{min-height:30px}
+@media(max-height:850px){.sid-player-hero{grid-template-columns:124px minmax(0,1fr);min-height:148px;padding:11px 14px;gap:16px}.sid-artwork{width:124px;height:124px}.sid-jukebox-controls{max-height:175px}.sid-queue-panel{min-height:240px}}
+@media(max-width:760px){#tab-sid.active{overflow:auto}.sid-player-hero{grid-template-columns:96px minmax(0,1fr);min-height:120px}.sid-artwork{width:96px;height:96px}.sid-jukebox-controls{max-height:none}.sid-queue-panel{min-height:420px}.artwork-expand{display:none}}
+.mount-badge{display:inline-flex;align-items:center;border:1px solid #796ed2;border-radius:999px;padding:2px 7px;color:#c7c0ff;background:rgba(110,92,210,.12);font-size:10px;font-weight:750;white-space:nowrap}.dashboard-card .mount-badge:empty{display:none}
+
+
+/* ========================================================================== */
+/* v1.10.0 UI Preview 3 — typography, rhythm and header polish               */
+/* ========================================================================== */
+:root{
+  --ui-sans:"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif;
+}
+
+/* Keep the established C64/technical face inside the working views, while
+   restoring the cleaner Preview 1 application shell and Dashboard typography. */
+.app-header,.app-nav,.dashboard-page,
+.app-header button,.app-nav button,.dashboard-page button{
+  font-family:var(--ui-sans);
+}
+
+/* Compact brand treatment: no clipping, no oversized dark logo block, and a
+   clear but secondary release identity. READY remains its own terminal row. */
+.app-header{
+  min-height:72px;
+  padding:10px 18px 9px;
+  align-items:center;
+  column-gap:18px;
+}
+.header-brand-area{
+  flex:0 0 auto;
+  min-width:0;
+  gap:4px;
+  overflow:visible;
+}
+.header-mainline{
+  min-height:30px;
+  gap:0;
+  overflow:visible;
+}
+.brand{
+  gap:12px;
+  align-items:center;
+  min-width:0;
+  overflow:visible;
+}
+.brand-logo{
+  display:block;
+  width:96px;
+  height:auto;
+  max-width:96px;
+  flex:0 0 96px;
+  object-fit:contain;
+  object-position:left center;
+  overflow:visible;
+}
+.brand-version{
+  font-family:var(--ui-sans);
+  font-size:14px;
+  line-height:1.2;
+  font-weight:600;
+  letter-spacing:.008em;
+  color:#b8c7df;
+  white-space:nowrap;
+}
+.ready-line{
+  font-family:var(--mono);
+  margin-left:1px;
+  font-size:12px;
+  line-height:1.15;
+  font-weight:700;
+  letter-spacing:.075em;
+}
+.header-command-area{
+  min-width:0;
+}
+.header-command-area button{
+  font-size:12px;
+  line-height:1.25;
+  padding:7px 11px;
+}
+/* Destructive application/device actions retain Preview 1's restrained red
+   treatment and sit together at the far right of the command bar. */
+.header-command-area button.danger{
+  color:#ef9a9a;
+  border-color:rgba(239,119,119,.58);
+  background:rgba(116,45,55,.13);
+}
+.header-command-area button.danger:hover{
+  color:#ffd0d0;
+  border-color:#ef7777;
+  background:rgba(133,48,59,.24);
+}
+.machine #btnAppExit{margin-left:3px}
+
+/* Preview 1 navigation typography and spacing. */
+.app-nav{
+  width:164px;
+  padding:15px 11px;
+  gap:5px;
+}
+.app-nav button{
+  gap:10px;
+  padding:10px 12px;
+  border-radius:10px;
+  font-size:12px;
+  line-height:1.2;
+  font-weight:650;
+  letter-spacing:.012em;
+  color:#b9c8df;
+}
+.app-nav button.active{
+  color:#fff;
+  box-shadow:inset 3px 0 0 #9788ff;
+}
+.nav-icon{
+  width:17px;
+  flex:0 0 17px;
+  font-family:var(--ui-sans);
+  font-size:12px;
+  font-weight:700;
+}
+
+/* Dashboard hierarchy and card rhythm, based on the better-balanced Preview 1
+   shell while retaining Preview 2's richer device and drive information. */
+.dashboard-page{
+  padding:20px 22px 22px;
+}
+.dashboard-intro{
+  align-items:flex-start;
+  margin-bottom:16px;
+}
+.dashboard-heading-copy h1{
+  margin:4px 0 1px;
+  color:#f7edd9;
+  font-size:27px;
+  line-height:1.15;
+  font-weight:700;
+  letter-spacing:-.025em;
+}
+.dashboard-heading-copy p{
+  margin:0;
+  color:#9eb4d6;
+  font-size:14px;
+  line-height:1.45;
+}
+.eyebrow{
+  font-family:var(--ui-sans);
+  font-size:10px;
+  line-height:1.2;
+  font-weight:800;
+  letter-spacing:.13em;
+}
+.dashboard-grid{
+  gap:14px;
+}
+.dashboard-card{
+  padding:18px 20px;
+  min-height:248px;
+}
+.dashboard-card-head{
+  margin-bottom:17px;
+}
+.dashboard-card-label{
+  font-family:var(--ui-sans);
+  font-size:11px;
+  line-height:1.2;
+  font-weight:750;
+  letter-spacing:.075em;
+}
+.dashboard-card h2{
+  font-family:var(--ui-sans);
+  margin-bottom:6px;
+  font-size:20px;
+  line-height:1.22;
+  font-weight:700;
+  letter-spacing:-.018em;
+}
+.dashboard-subtitle{
+  font-family:var(--ui-sans);
+  font-size:13px;
+  line-height:1.5;
+}
+.device-facts{
+  gap:10px 18px;
+  margin-top:17px;
+}
+.device-facts dt,.drive-card-label{
+  font-family:var(--ui-sans);
+  letter-spacing:.065em;
+}
+.device-facts dd,.drive-card-name,
+.connection-badge,.dashboard-inline-status,.mini-state,.mount-badge{
+  font-family:var(--ui-sans);
+}
+.card-action{
+  margin-top:17px;
+  padding:8px 15px;
+  font-weight:600;
+}
+
+@media(max-width:1240px){
+  .app-header{align-items:flex-start}
+  .header-command-area{padding-top:2px}
+}
+@media(max-width:760px){
+  .app-nav{width:150px}
+  .dashboard-page{padding:16px}
+  .dashboard-heading-copy h1{font-size:24px}
+}
+
+
+/* v1.10.0 UI Preview 4 — Dashboard readability and richer generated SID art. */
+.dashboard-card-label{
+  color:#bac7e6;
+  font-size:12px;
+}
+.dashboard-subtitle{
+  color:#a5bcdd;
+  font-size:14px;
+  line-height:1.52;
+}
+.device-facts{
+  gap:12px 20px;
+}
+.device-facts dt,.drive-card-label{
+  color:#a39cf0;
+  font-size:12px;
+  font-weight:800;
+  letter-spacing:.065em;
+}
+.device-facts dd{
+  margin-top:4px;
+  color:#f0f4fb;
+  font-size:14px;
+  font-weight:600;
+  line-height:1.35;
+}
+.drive-card-name{
+  font-size:15px;
+  line-height:1.35;
+}
+.connection-badge,.dashboard-inline-status,.mini-state,.mount-badge{
+  font-size:12px;
+}
+
+
+/* ========================================================================== */
+/* v1.10.0 UI Preview 5 — unified readability, one-page mirror and Jukebox   */
+/* ========================================================================== */
+
+/* One readable application type scale outside the deliberately larger
+   Dashboard status values. Technical logs/code retain the monospace face. */
+main section,
+main section button,
+main section input,
+main section select,
+main section textarea{
+  font-family:var(--ui-sans);
+  font-size:14px;
+}
+main section .hint{font-size:13px;line-height:1.45}
+main section h2{font-size:14px;line-height:1.25;font-weight:700}
+main section table{font-size:14px}
+main section button.mini,main section .jkq-actions .mini{font-size:13px}
+main section .badge{font-size:12px}
+main section pre,main section code,main section .diaglog,.ready-line{font-family:var(--mono)}
+
+/* Screen Mirror: a single desktop workspace. The mounted-drive strip, mirror
+   and footer stay fixed; the right control rail scrolls internally only when
+   dynamic panels exceed the available desktop height. */
+#tab-screen.active{
+  display:flex;
+  flex-direction:column;
+  min-height:0;
+  overflow:hidden;
+  padding-bottom:12px;
+}
+#tab-screen .drive-summary-strip{flex:0 0 auto;margin-bottom:10px}
+#tab-screen .crt-wrap{
+  display:grid;
+  grid-template-columns:minmax(0,1fr) minmax(350px,420px);
+  gap:14px;
+  align-items:stretch;
+  flex:1 1 auto;
+  min-height:0;
+  overflow:hidden;
+}
+#tab-screen .crt{
+  width:100%;
+  height:100%;
+  min-height:0;
+  padding:16px;
+  overflow:hidden;
+}
+#tab-screen .crt-inner{
+  max-width:100%;
+  max-height:100%;
+  width:max-content;
+  height:max-content;
+  flex:0 0 auto;
+}
+#tab-screen canvas#screen{
+  max-width:100%;
+  max-height:100%;
+  object-fit:contain;
+}
+#tab-screen.screen-fit .crt-inner{
+  width:min(100%,calc((100vh - 230px)*384/272));
+  height:auto;
+  max-width:100%;
+  max-height:100%;
+  aspect-ratio:384/272;
+}
+#tab-screen.screen-fit canvas#screen{
+  width:100%!important;
+  height:auto!important;
+  max-width:100%;
+  max-height:100%;
+}
+#tab-screen .screen-side{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+  width:100%;
+  max-width:none;
+  min-width:0;
+  min-height:0;
+  overflow-y:auto;
+  overflow-x:hidden;
+  overscroll-behavior:contain;
+  scrollbar-gutter:stable;
+  padding-right:4px;
+}
+#tab-screen .screen-side>.panel{margin:0;padding:12px 13px;border-radius:14px}
+#tab-screen .screen-side>.panel h2{margin-bottom:8px}
+#tab-screen .screen-side>.panel .row{gap:6px}
+#tab-screen .screen-side>.panel:first-child{flex:0 0 auto}
+
+#tab-screen .screen-status-bar{
+  display:flex;align-items:center;gap:18px;flex:0 0 36px;min-height:36px;
+  margin-top:10px;padding:0 14px;border:1px solid #20324d;border-radius:11px;
+  background:rgba(7,16,31,.92);color:#9eb4d6;font-size:13px;white-space:nowrap;
+}
+#tab-screen .screen-status-bar b{color:#e9edf7;font-weight:650}
+#tab-screen .screen-status-device{display:inline-flex;align-items:center;gap:8px;color:#e9edf7}
+#tab-screen .screen-status-device .status-dot{width:8px;height:8px;border-radius:50%;background:#667793}
+#tab-screen .screen-status-bar.connected .screen-status-device .status-dot{background:var(--ok);box-shadow:0 0 0 3px rgba(110,231,163,.1)}
+#tab-screen .screen-status-spacer{flex:1 1 auto}
+#tab-screen .record-options summary{font-size:13px}
+#tab-screen .keyboard-quick{margin-top:8px}
+#tab-screen #kbhelp{margin-top:6px!important}
+@media(max-width:1180px){
+  #tab-screen.active{overflow:auto}
+  #tab-screen .crt-wrap{grid-template-columns:1fr;overflow:visible}
+  #tab-screen .crt{min-height:430px}
+  #tab-screen .screen-side{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));overflow:visible;padding-right:0}
+}
+
+/* Jukebox: artwork/player, browser controls, metadata and queue tools stay
+   fixed. The playlist itself is the only scrolling surface. */
+#tab-sid.active{display:flex;flex-direction:column;min-height:0;overflow:hidden;padding-bottom:12px}
+.sid-player-hero{
+  grid-template-columns:184px minmax(0,1fr);
+  gap:22px;
+  min-height:212px;
+  padding:14px 18px;
+  flex:0 0 auto;
+}
+.sid-artwork{width:184px;height:184px}
+.sid-player-hero.artwork-expanded{grid-template-columns:280px minmax(0,1fr);min-height:306px}
+.sid-player-hero.artwork-expanded .sid-artwork{width:280px;height:280px}
+.sid-jukebox-controls{flex:0 0 auto;max-height:none;overflow:visible;padding:10px 12px;margin-bottom:9px}
+.sid-jukebox-controls button{padding:4px 9px}
+.sid-jukebox-controls input,.sid-jukebox-controls select{padding:4px 7px}
+.sid-jukebox-controls #jkPath{min-width:180px!important}
+.sid-jukebox-controls #jkSearch{width:150px!important}
+.sid-jukebox-controls #jkChip{max-width:150px}
+.sid-jukebox-controls .jk-local-picker{display:inline-flex;align-items:center;gap:8px;min-width:236px;max-width:300px}
+.sid-jukebox-controls .jk-file-button{flex:0 0 auto;white-space:nowrap}
+.sid-jukebox-controls .jk-file-status{min-width:0;max-width:142px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dim);font-size:13px;line-height:1.3}
+@media(max-width:760px){.sid-jukebox-controls .jk-local-picker{flex:1 1 250px;max-width:100%}.sid-jukebox-controls .jk-file-status{max-width:none}}
+.sid-queue-panel{flex:1 1 auto;min-height:0;max-height:548px;overflow:hidden;margin-bottom:0}
+.sid-queue-list{flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain}
+.jkq-row{min-height:32px}
+.sid-progress-fill{width:100%;transform:scaleX(0);transform-origin:left center;transition:none;will-change:transform}
+.sid-time-row{font-size:12px}.sid-hero-meta{font-size:14px}.sid-hero-main h1{font-size:24px}
+@media(min-width:2200px) and (min-height:950px){
+  .sid-player-hero{grid-template-columns:224px minmax(0,1fr);min-height:252px;gap:24px}
+  .sid-artwork{width:224px;height:224px}
+}
+@media(max-height:850px){
+  .sid-player-hero{grid-template-columns:144px minmax(0,1fr);min-height:168px;padding:11px 14px;gap:16px}
+  .sid-artwork{width:144px;height:144px}
+  .sid-queue-panel{min-height:220px}
+}
+@media(max-width:760px){
+  #tab-sid.active{overflow:hidden}
+  .sid-player-hero{grid-template-columns:112px minmax(0,1fr);min-height:136px}
+  .sid-artwork{width:112px;height:112px}
+  .sid-queue-panel{min-height:180px}
+  .artwork-expand{display:none}
+}
+
+
+/* UI Preview 5 connection-state reissue: transient Dashboard/device status. */
+.connection-badge.connected{border-color:#245847;color:#d7ffea;background:rgba(35,93,69,.16)}
+.connection-badge.connecting,.connection-badge.reconnecting{border-color:#6259a9;color:#cfc9ff;background:rgba(92,78,170,.16)}
+.connection-badge.failed{border-color:#824554;color:#ffb8c2;background:rgba(126,48,68,.16)}
+.connection-badge.connecting .status-dot,.connection-badge.reconnecting .status-dot{animation:u64deck-connection-pulse 1.1s ease-in-out infinite}
+.screen-status-bar.connecting .screen-status-device .status-dot{background:#a99cff;box-shadow:0 0 0 3px rgba(169,156,255,.12);animation:u64deck-connection-pulse 1.1s ease-in-out infinite}
+@keyframes u64deck-connection-pulse{0%,100%{opacity:.45;transform:scale(.78)}50%{opacity:1;transform:scale(1)}}
+@media(prefers-reduced-motion:reduce){.connection-badge.connecting .status-dot,.connection-badge.reconnecting .status-dot,.screen-status-bar.connecting .screen-status-device .status-dot{animation:none}}
+
+/* RC50 progressive Finder */
+.discovery-panel{width:min(760px,94vw);max-height:84vh;overflow:auto}
+.discovery-actions{margin-top:10px;align-items:center}
+.disc-progress{margin:10px 0 12px;padding:10px 12px;border:1px solid var(--line);border-radius:7px;background:rgba(64,49,141,.10)}
+.disc-progress.complete{border-color:color-mix(in srgb,var(--ok) 55%,var(--line))}
+.disc-progress.cancelled,.disc-progress.cancelling{border-color:color-mix(in srgb,var(--warn) 58%,var(--line))}
+.disc-progress-head{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:7px}
+.disc-progress-head span{color:var(--dim);font-size:12px;white-space:nowrap}
+.disc-progress-track{height:6px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden;margin-bottom:6px}
+.disc-progress-track>span{display:block;height:100%;background:var(--accent);transition:width .18s linear}
+.disc-progress.complete .disc-progress-track>span{background:var(--ok)}
+.disc-progress.cancelled .disc-progress-track>span,.disc-progress.cancelling .disc-progress-track>span{background:var(--warn)}
+.disc-empty{padding:8px 0;color:var(--dim)}
+@media(max-width:720px){.disc-progress-head{align-items:flex-start;flex-direction:column;gap:3px}.disc-progress-head span{white-space:normal}.disc-device-main{flex-direction:column}.discovery-actions{align-items:stretch}}
+
+/* RC50 private reissue 5 — proportionately enlarge Now Playing within the
+   accepted Dashboard card and grid footprint without overwhelming nearby cards. */
+.jukebox-card .dashboard-media-summary{
+  gap:24px;
+  align-items:center;
+}
+.jukebox-card .dash-artwork{
+  flex-basis:208px;
+  width:208px;
+  height:208px;
+  border-radius:15px;
+  box-shadow:0 13px 30px rgba(0,0,0,.31);
+}
+.jukebox-card .dashboard-media-copy{
+  flex:1 1 auto;
+}
+.jukebox-card .dashboard-media-copy h2{
+  margin-bottom:8px;
+  font-size:24px;
+  line-height:1.2;
+}
+.jukebox-card .dashboard-media-copy .dashboard-subtitle{
+  font-size:15px;
+  line-height:1.45;
+}
+.jukebox-card .dashboard-inline-status{
+  margin-top:14px;
+  padding:5px 10px;
+  font-size:13px;
+}
+@media(max-width:1000px){
+  .jukebox-card .dashboard-media-summary{gap:18px}
+  .jukebox-card .dash-artwork{
+    flex-basis:152px;
+    width:152px;
+    height:152px;
+  }
+  .jukebox-card .dashboard-media-copy h2{font-size:22px}
+}

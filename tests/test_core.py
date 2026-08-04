@@ -1090,7 +1090,7 @@ def test_release_version_is_consistent_in_code_ui_and_changelog():
     changelog = (Path(server.ROOT) / "CHANGELOG.md").read_text(encoding="utf-8")
     assert 'id="ver"' in html
     assert '"/api/app_config"' in js
-    assert "## 1.9.0 — Release Candidate 10" in changelog.split("## 1.9.0 — Release Candidate 5", 1)[0]
+    assert "## 1.9.0 — Release Candidate 10" in changelog.split("## 1.9.0 — Release Candidate 5\n", 1)[0]
 
 
 def test_built_in_help_contains_no_release_specific_versions():
@@ -1112,16 +1112,16 @@ def test_header_identity_and_device_details_share_an_aligned_status_block():
     static = Path(server.ASSETS) / "static"
     html = (static / "index.html").read_text(encoding="utf-8")
     css = (static / "app.css").read_text(encoding="utf-8")
-    assert 'class="header-status"' in html
+    assert 'class="app-header"' in html
     assert 'class="header-mainline"' in html
     assert 'class="brand-version" id="ver"' in html
     assert 'class="ready-line"' in html
-    assert ".header-mainline{display:flex;align-items:baseline" in css
-    assert ".brand-name{font-size:16px" in css
-    assert ".brand-version{color:var(--dim);font-size:15px;font-weight:600" in css
-    assert "#devinfo{color:var(--dim);font-size:15px;font-weight:600" in css
-    assert ".ready-line{color:var(--dim);font-size:13px" in css
-
+    assert 'class="header-command-area"' in html
+    assert 'class="brand-logo"' in html
+    assert ".header-mainline{display:flex;align-items:center" in css
+    assert ".brand-version{font-size:14px;font-weight:650" in css
+    assert "#devinfo{display:none!important}" in css
+    assert ".ready-line{font-size:12px" in css
 
 def test_mount_run_busy_status_is_local_and_does_not_touch_device(monkeypatch):
     calls = []
@@ -1778,7 +1778,7 @@ def test_rc24_juke_play_arms_the_planned_deadline_and_reports_it(monkeypatch):
 
         out = server._juke_play(0)
 
-        assert captured["interval"] == 120.5
+        assert captured["interval"] == pytest.approx(120.5, abs=0.02)
         assert captured["callback"] is server._juke_auto_next
         assert captured["args"] == (server.JUKE["generation"],)
         assert captured["started"] is True
@@ -1880,7 +1880,7 @@ def test_frontend_is_split_without_a_build_tool():
 def test_release_metadata_is_centralised():
     import release
     assert server.VERSION == release.VERSION == "1.9.0"
-    assert release.RELEASE_LABEL == "Release Candidate 48"
+    assert release.RELEASE_LABEL == "Release Candidate 51"
     assert server.BUILD == release.build_id(server.ASSETS, Path(server.__file__).parent)
 
 
@@ -2843,7 +2843,7 @@ def test_release_help_and_now_playing_star_are_present():
     assert "jkToggleNowFavourite" in js
     assert ".u64deck-index.sqlite3" in help_js
     assert "star beside the playback controls" in help_js
-    assert "v1.9.0 — Release Candidate 48" in readme
+    assert "v1.9.0 — Release Candidate 51" in readme
     assert ".u64deck-index.sqlite3" in readme
     assert "Install every release into a **new, empty folder**" in readme
     assert "Do not copy `*-wal`" in readme
@@ -4344,7 +4344,7 @@ def test_help_covers_finder_mount_state_quick_launch_and_major_workflows():
     help_js = (Path(server.ASSETS) / "static" / "help_content.js").read_text(encoding="utf-8")
     for text in (
         'title:"Find Ultimate Devices"',
-        "Previously verified addresses on the current local subnet are checked first",
+        "Previously verified addresses on the current local subnet are placed first",
         "an address must answer during this scan before it can be displayed",
         "updates as soon as the Ultimate confirms the mount",
         "confirmed filename remains visible with an amber loading note",
@@ -4502,6 +4502,7 @@ def _mount_boot_harness(monkeypatch, gate_results):
         def mount_path(self, *args, **kwargs): pass
         def mount_attachment(self, *args, **kwargs): pass
         def put(self, *args, **kwargs): pass
+        def read_memory(self, address, length): return None
 
     class FakeCmd:
         def type_petscii(self, data, **kwargs):
@@ -5286,6 +5287,8 @@ def test_rc4_mount_and_run_reboots_after_sid_before_mount(monkeypatch):
 
     class FakeRest:
         host = "192.0.2.66"
+        def read_memory(self, address, length):
+            return None
         def put(self, path, **kwargs):
             events.append(("put", path))
             return {"ok": True}
@@ -5428,6 +5431,8 @@ def test_rc4_mount_and_run_while_sid_is_playing_reboots_before_mount(monkeypatch
 
     class FakeRest:
         host = "192.0.2.69"
+        def read_memory(self, address, length):
+            return None
         def put(self, path, **kwargs):
             events.append(("put", path))
             return {"ok": True}
@@ -5943,12 +5948,17 @@ def test_discovery_scan_gate_rejects_overlap(monkeypatch):
         server.DISCOVERY_ACTIVE.clear()
 
 
-def test_discovery_frontend_pauses_polling_and_uses_bounded_window():
+def test_discovery_frontend_pauses_polling_and_uses_progressive_job_api():
     js = (Path(server.ASSETS) / "static" / "app.js").read_text(encoding="utf-8")
     assert "let DISCOVERY_SCAN_ACTIVE=false,DISCOVERY_DIALOG_OPEN=false;" in js
     assert "if(DISCOVERY_SCAN_ACTIVE||DISCOVERY_DIALOG_OPEN||uiInteractive()||INFO_IN_FLIGHT)return;" in js
-    assert 'api("/api/discover"+' in js and "{timeoutMs:30000}" in js
-    assert 'api("/api/discover/clear"+' in js and 'method:"POST",timeoutMs:30000' in js
+    assert '"/api/discover/start"' in js
+    assert '"/api/discover/clear/start"' in js
+    assert '"/api/discover/status?job_id="' in js
+    assert '"/api/discover/cancel?job_id="' in js
+    assert "checked_count" in js and "remaining_count" in js
+    assert "Use now" in js and "Cancel scan" in js
+    assert "discoveryControls(true)" in js and "discoveryControls(false)" in js
     assert 'let DEVICE_REQUEST_TIMEOUT_MS=15000;' in js
 
 
@@ -5957,7 +5967,7 @@ def test_rc8_discovery_documentation_covers_identity_and_rest_etiquette():
     help_js = (Path(server.ASSETS) / "static" / "help_content.js").read_text(encoding="utf-8")
     for text in (
         "Interface-aware Ultimate discovery",
-        "Prioritised single-pass discovery",
+        "Progressive single-pass discovery",
         "REST service etiquette",
         "U64 Manager",
         "Assembly64",
@@ -6415,19 +6425,22 @@ def test_rc15_matrix_load_failure_is_not_resent_through_legacy(monkeypatch):
     assert warnings and warnings[0][0] == "mount-load-delivery"
 
 
-def test_rc15_legacy_mount_run_load_retains_one_shot_buffer_path(monkeypatch):
+def test_rc15_legacy_mount_run_load_uses_guarded_legacy_delivery(monkeypatch):
     typed = []
     matrix_calls = []
     monkeypatch.setattr(server, "_input_status", lambda *args, **kwargs: {"available": False})
     monkeypatch.setattr(server, "_matrix_send", lambda *args, **kwargs: matrix_calls.append(args))
-    monkeypatch.setattr(server, "_legacy_type", lambda data, **kwargs: typed.append(bytes(data)))
-    monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        server, "_type_mount_run_legacy",
+        lambda data, *, command_name: (typed.append((bytes(data), command_name)) or
+                                       (True, "Legacy KERNAL buffer drain-confirmed")),
+    )
 
     ok, delivery = server._type_mount_run_load(b'LOAD"*",8,1\r')
 
     assert ok is True
-    assert delivery == "Legacy KERNAL buffer"
-    assert typed == [b'LOAD"*",8,1\r']
+    assert delivery == "Legacy KERNAL buffer drain-confirmed"
+    assert typed == [(b'LOAD"*",8,1\r', "LOAD")]
     assert matrix_calls == []
 
 
@@ -6665,14 +6678,14 @@ def test_rc18_executable_icon_and_launcher_exit_contract():
     data = icon.read_bytes()
     assert data[:4] == b"\x00\x00\x01\x00"
     count = int.from_bytes(data[4:6], "little")
-    assert count == 6
+    assert count == 7
     sizes = []
     for entry in range(count):
         offset = 6 + (entry * 16)
         width = data[offset] or 256
         height = data[offset + 1] or 256
         sizes.append((width, height))
-    assert sizes == [(16, 16), (32, 32), (48, 48),
+    assert sizes == [(16, 16), (24, 24), (32, 32), (48, 48),
                      (64, 64), (128, 128), (256, 256)]
 
     spec = (root / "u64deck.spec").read_text(encoding="utf-8")
@@ -6885,9 +6898,9 @@ def test_rc32_documentation_identity_and_inherited_sidflow_contract():
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
     help_js = (root / "static" / "help_content.js").read_text(encoding="utf-8")
     build = server.BUILD
-    assert f"v1.9.0 — Release Candidate 48 · build {build}" in readme
-    assert f"**Public soak candidate:** `{build}`" in changelog
-    assert "git tag v1.9.0-rc.46 && git push --tags" in readme
+    assert f"v1.9.0 — Release Candidate 51 · build {build}" in readme
+    assert f"**Public final release candidate:** `{build}`" in changelog
+    assert "final release candidate" in " ".join(readme.lower().split())
     assert "Analyse Disk-Image Names" in readme
     assert "terminal hyphen-delimited" in readme
     assert "SQLite schema v5" in changelog
@@ -7693,8 +7706,8 @@ def test_rc30_songlength_plan_uses_complete_fade_and_unknown_tunes_do_not(monkey
         server.CFG["sid_jukebox_browser_fade_secs"] = 2.5
         server.CFG["sid_jukebox_end_grace_secs"] = 5.0
         monkeypatch.setattr(server, "_juke_length", lambda item, song: 120.0)
-        # Fade replaces the separate grace instead of combining with it.
-        assert server._juke_auto_advance_plan({}, 1) == (120.0, 2.5, 122.5, "songlengths")
+        # Fade is a lead-in and completes at the documented endpoint.
+        assert server._juke_auto_advance_plan({}, 1) == (120.0, 0.0, 120.0, "songlengths")
         monkeypatch.setattr(server, "_juke_length", lambda item, song: None)
         server.CFG["sid_default_secs"] = 180
         assert server._juke_auto_advance_plan({}, 1) == (180.0, 1.0, 181.0, "fallback")
@@ -7739,14 +7752,16 @@ def test_rc30_active_fade_state_is_reconstructable(monkeypatch):
             "radio": False, "song": 1, "timer": None, "folder": "", "loading": False,
             "source": "test", "generation": 7, "stop_after_current": False,
             "playback_started_monotonic": 100.0, "playback_length_secs": 120.0,
-            "playback_auto_advance_secs": 122.5, "playback_duration_source": "songlengths",
+            "playback_auto_advance_secs": 120.0, "playback_duration_source": "songlengths",
             "playback_fade_secs": 2.5, "playback_id": 7,
         })
-        monkeypatch.setattr(server.time, "monotonic", lambda: 121.0)
+        monkeypatch.setattr(server.time, "monotonic", lambda: 216.5)
         state = server._juke_state()["active_browser_fade"]
         assert state["enabled"] is True and state["playback_id"] == 7
-        assert state["starts_in_secs"] == 99.0
-        assert state["remaining_secs"] == 101.5
+        assert state["starts_in_secs"] == 1.0
+        assert state["remaining_secs"] == 3.5
+        assert state["native_extension_secs"] == 0.0
+        assert state["completes_at_documented_endpoint"] is True
     finally:
         server.JUKE.clear(); server.JUKE.update(previous_juke)
         server.CFG.clear(); server.CFG.update(previous_cfg)
@@ -7791,15 +7806,15 @@ def test_rc30_play_timing_reports_fade_and_native_extension(monkeypatch):
             "shuffle":False,"radio":False,"song":0,"timer":None,"folder":"","loading":False,
             "source":"test","generation":0,"stop_after_current":False})
         monkeypatch.setattr(server, "_cart_configured", lambda: "")
-        monkeypatch.setattr(server, "_juke_auto_advance_plan", lambda item,song:(120.0,2.5,122.5,"songlengths"))
+        monkeypatch.setattr(server, "_juke_auto_advance_plan", lambda item,song:(120.0,0.0,120.0,"songlengths"))
         monkeypatch.setattr(server, "_post_sid_upload", lambda *a, **kw: captured.update(upload=kw) or {})
         monkeypatch.setattr(server._threading, "Timer", FakeTimer)
         monkeypatch.setattr(server, "_diag_event", lambda *a, **kw: None)
         out = server._juke_play(0)
-        assert captured["upload"]["songlength_extension_secs"] == 2.5
-        assert captured["interval"] == 122.5 and captured["started"] is True
+        assert "songlength_extension_secs" not in captured["upload"]
+        assert captured["interval"] == pytest.approx(120.0, abs=0.02) and captured["started"] is True
         assert out["play_timing"]["browser_fade_secs"] == 2.5
-        assert out["play_timing"]["native_length_extension_secs"] == 2.5
+        assert out["play_timing"]["native_length_extension_secs"] == 0.0
     finally:
         server.JUKE.clear(); server.JUKE.update(previous_juke)
         server.CFG.clear(); server.CFG.update(previous_cfg)
@@ -7966,8 +7981,9 @@ def test_rc32_docs_describe_queue_contract_and_identity():
     root = Path(server.ROOT)
     readme = (root / "README.md").read_text(encoding="utf-8")
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert "Release Candidate 48" in readme
-    assert "Release Candidate 46" in changelog
+    assert "Release Candidate 51" in readme
+    assert "Release Candidate 51" in changelog
+    assert "UI Preview 5" in changelog
     assert "does not invalidate" in readme
 
 
@@ -8116,12 +8132,11 @@ def test_rc35_header_labels_and_star_alignment():
     html = (root / "static" / "index.html").read_text(encoding="utf-8")
     css = (root / "static" / "app.css").read_text(encoding="utf-8")
     js = (root / "static" / "app.js").read_text(encoding="utf-8")
-    assert '<span class="brand-stars">****</span> u64deck <span class="brand-stars">****</span>' in html
-    assert ".brand-stars{display:inline-block;transform:translateY(1px)}" in css
+    assert '<img class="brand-logo" src="/static/u64deck-logo.png" alt="u64deck">' in html
+    assert ".brand-logo{display:block;width:121px;height:34px" in css
     assert "· FW ${esc(i.firmware_version||\"?\")}" in js
     assert "· Core ${esc(i.core_version)}" in js
     assert '· Input: ${matrix?"CIA1":"Legacy KERNAL buffer"}' in js
-
 
 def test_rc35_settings_index_precedes_collapsed_firmware_configuration():
     root = Path(__file__).resolve().parents[1]
@@ -8359,7 +8374,7 @@ def test_rc37_frontend_casing_manifest_and_large_approval_controls():
     root = Path(server.ROOT)
     html = (root / "static" / "index.html").read_text(encoding="utf-8")
     js = (root / "static" / "app.js").read_text(encoding="utf-8")
-    assert '<div id="devinfo">Connecting…</div>' in html
+    assert '<div id="devinfo" hidden></div>' in html
     assert "· Reconnecting…" in js
     assert "Copy Analysis Report" in html
     assert "Approve selected examples" in js
@@ -8461,6 +8476,7 @@ def test_rc39_legacy_mount_run_prompts_for_physical_f7_without_injecting_it(monk
         def mount_path(self, *args, **kwargs): pass
         def mount_attachment(self, *args, **kwargs): pass
         def put(self, *args, **kwargs): pass
+        def read_memory(self, address, length): return None
 
     try:
         server.CFG["boot_prekey"] = "F7"
@@ -8492,8 +8508,13 @@ def test_rc39_legacy_mount_run_prompts_for_physical_f7_without_injecting_it(monk
             return next(gates)
         monkeypatch.setattr(server, "_basic_ready_gate", fake_gate)
         monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
-        monkeypatch.setattr(server, "_legacy_type",
-                            lambda data, **kwargs: typed.append((bytes(data), kwargs.get("origin"))))
+        monkeypatch.setattr(
+            server, "_type_mount_run_legacy",
+            lambda data, *, command_name: (
+                typed.append((bytes(data), f"mount-run-{command_name.casefold()}")) or
+                (True, "Legacy KERNAL buffer drain-confirmed")
+            ),
+        )
 
         out = server._mount_and_boot("a", "unlinked", device_path="/Usb0/demo.d64")
 
@@ -8682,8 +8703,13 @@ def test_rc40_no_cartridge_mount_run_has_no_f7_or_overlay(monkeypatch):
         gates = iter(["ready", "ready"])
         monkeypatch.setattr(server, "_basic_ready_gate",
                             lambda stage, **kwargs: next(gates))
-        monkeypatch.setattr(server, "_legacy_type",
-                            lambda data, **kwargs: typed.append((bytes(data), kwargs.get("origin"))))
+        monkeypatch.setattr(
+            server, "_type_mount_run_legacy",
+            lambda data, *, command_name: (
+                typed.append((bytes(data), f"mount-run-{command_name.casefold()}")) or
+                (True, "Legacy KERNAL buffer drain-confirmed")
+            ),
+        )
 
         out = server._mount_and_boot("a", "unlinked", device_path="/Usb0/plain.d64")
 
@@ -9378,9 +9404,151 @@ def test_rc45_keeps_existing_toast_status_colours():
     assert ".toast.err{border-left-color:var(--err)}" in css
 
 
-# --- v1.9.0 Release Candidate 47: registered Assembly64 client and support credit ---
+# --- v1.10.0 UI Preview 3: Preview 2 behaviour plus typography/spacing regression ---
 
-def test_rc47_assembly64_client_id_is_fixed_and_registered():
+def test_ui_preview3_dashboard_header_storage_and_jukebox_contract():
+    root = Path(server.ROOT)
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    css = (root / "static" / "app.css").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    assert '<section id="tab-dashboard" class="active dashboard-page">' in html
+    assert '<section id="tab-screen">' in html
+    assert 'id="dashDeviceIp"' in html
+    assert 'id="dashDeviceInterface"' in html
+    assert 'id="dashDeviceRest"' in html
+    assert 'id="dashDriveAName" class="drive-card-name">No disk<' in html
+    assert 'id="dashDriveBName" class="drive-card-name">Off<' in html
+    assert html.count('class="hint sid-toggle"') == 2
+    assert 'sidflow-radio' not in html
+    assert 'id="jkArtwork"' in html and 'id="jkHeroProgress"' in html
+    assert 'PREVIEW2_ART_CACHE' in js and 'p2ArtworkSvg' in js
+    assert '#tab-screen .crt{display:flex;align-items:center;justify-content:center' in css
+    assert '#tab-screen.screen-fit canvas#screen' in css
+    assert '.sid-player-hero{position:relative;display:grid;grid-template-columns:160px' in css
+    assert '.sid-toggle{display:inline-flex' in css
+    assert 'U64DECK UI NEXT' in html and '<h1>Dashboard</h1>' in html
+    assert '--ui-sans:' in css
+    assert '.brand-logo{' in css and 'width:96px' in css and 'height:auto' in css
+    assert '.app-nav button{' in css and 'font-size:12px' in css
+    assert 'font-family:var(--ui-sans)' in css
+
+
+
+# --- v1.10.0 UI Preview 4: dashboard readability and metadata-led SID artwork ---
+
+def test_ui_preview4_dashboard_readability_and_artwork_contract():
+    root = Path(server.ROOT)
+    css = (root / "static" / "app.css").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    assert "UI Preview 4 — Dashboard readability" in css
+    assert ".device-facts dt,.drive-card-label{" in css
+    assert "color:#a39cf0" in css and "font-size:12px" in css
+    assert ".device-facts dd{" in css and "font-size:14px" in css and "font-weight:600" in css
+    assert ".dashboard-subtitle{" in css and "font-size:14px" in css
+    assert "function p2ArtworkLines(" in js
+    assert "function p2ArtworkScene(" in js
+    assert "SUBTUNE ${song}/${songs}" in js
+    assert "Generated SID artwork: ${rawTitle} by ${author}" in js
+    assert "${rawTitle} — ${author} — ${subtune}" in js
+    assert 'p2SetArtwork($("#jkArtwork"),m,n.path,n.label,Number(n.song||1),Number(m.songs||1));' in js
+    assert 'p2SetArtwork($("#dashArtwork"),m,n?.path,n?.label||"SID",Number(n?.song||1),Number(m.songs||1));' in js
+    assert "UI Preview 4 artwork-size refinement" in css
+    assert "grid-template-columns:160px minmax(0,1fr)" in css
+    assert ".sid-artwork{width:160px;height:160px" in css
+    assert "grid-template-columns:124px minmax(0,1fr)" in css
+
+# --- v1.10.0 UI Preview 5: single-page mirror, playlist-only scroll and smooth art/player ---
+
+def test_ui_preview5_layout_typography_art_and_progress_contract():
+    root = Path(server.ROOT)
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    css = (root / "static" / "app.css").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    assert "UI Preview 5 — unified readability" in css
+    assert "#tab-screen.active{" in css and "overflow:hidden" in css
+    assert "grid-template-columns:minmax(0,1fr) minmax(350px,420px)" in css
+    assert "overflow-y:auto;" in css and "scrollbar-gutter:stable;" in css
+    assert "overscroll-behavior:contain;" in css
+    assert 'class="screen-status-bar"' in html
+    assert 'id="screenStatusRest"' in html and 'id="screenStatusRam"' in html
+    assert '<option value="fit" selected>Fit pane</option>' in html
+    assert "only scrolling surface" in css
+    assert ".sid-jukebox-controls{flex:0 0 auto;max-height:none;overflow:visible" in css
+    assert ".sid-queue-list{flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden" in css
+    assert "grid-template-columns:184px minmax(0,1fr)" in css
+    assert ".sid-artwork{width:184px;height:184px}" in css
+    assert "grid-template-columns:224px minmax(0,1fr)" in css
+    for theme in ("synthwave", "circuit", "cosmic", "pixel-city", "demoscene", "arcade-tunnel", "chip-mosaic"):
+        assert f'data-art-theme="{theme}"' in js
+    assert "requestAnimationFrame(p2HeroClock)" in js
+    assert "fill.style.transform=`scaleX(${ratio})`" in js
+    assert "transition:none;will-change:transform" in css
+    assert "main section .hint{font-size:13px" in css
+    assert "main section table{font-size:14px}" in css
+
+
+def test_ui_preview5_jukebox_state_reports_elapsed_for_smooth_resync(monkeypatch):
+    previous = dict(server.JUKE)
+    try:
+        server.JUKE.update({
+            "items": [], "index": -1, "playing": True,
+            "playback_started_monotonic": 100.0, "playback_id": 77,
+        })
+        monkeypatch.setattr(server.time, "monotonic", lambda: 112.345)
+        state = server._juke_state()
+        assert state["playback_id"] == 77
+        assert state["playback_elapsed_secs"] == 12.345
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+def test_ui_preview3_destructive_header_actions_are_adjacent_red_and_last():
+    root = Path(server.ROOT)
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    css = (root / "static" / "app.css").read_text(encoding="utf-8")
+    reset = html.index('>Reset C64</button>')
+    menu = html.index('>Ultimate Menu</button>')
+    exit_action = html.index('>Exit u64deck</button>')
+    power = html.index('>Power Off Ultimate</button>')
+    assert reset < menu < exit_action < power
+    between = html[exit_action:power]
+    assert '<button' in between and 'class="danger"' in html[power-100:power]
+    assert '.header-command-area button.danger{' in css
+    assert 'border-color:rgba(239,119,119,.58)' in css
+    assert '.machine #btnAppExit{margin-left:3px}' in css
+
+
+# --- v1.10.0 UI Preview 5 connection-state reissue ---
+
+def test_ui_preview5_dashboard_connection_states_and_accessibility_contract():
+    root = Path(server.ROOT)
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    css = (root / "static" / "app.css").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'id="dashDeviceBadge"' in html
+    assert 'role="status" aria-live="polite" aria-atomic="true"' in html
+    assert 'let DASH_CONNECTION_STATE="offline"' in js
+    assert '"offline","connecting","connected","reconnecting","failed"' in js
+    for label in ("Connecting…", "Connected", "Reconnecting…", "Connection failed", "Offline"):
+        assert label in js
+    assert 'setDashboardConnectionState("connecting")' in js
+    assert 'setDashboardConnectionState("connected")' in js
+    assert 'setDashboardConnectionState("reconnecting")' in js
+    assert 'setDashboardConnectionState(unconfig?"offline":"failed")' in js
+    assert ".connection-badge.connecting,.connection-badge.reconnecting" in css
+    assert ".connection-badge.failed" in css
+    assert "@media(prefers-reduced-motion:reduce)" in css
+
+
+def test_ui_preview5_screen_status_uses_same_connection_state_labels():
+    js = (Path(server.ROOT) / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'set("#screenStatusConnection",badgeLabels[state]||badgeLabels.offline)' in js
+    assert 'statusBar.classList.toggle("connecting",state==="connecting"||state==="reconnecting")' in js
+
+
+# --- v1.9.0 Release Candidate 50: accepted UI and Assembly64 support ---
+
+def test_ui_preview6_assembly64_client_id_is_fixed_and_registered():
     assert server.ASSEMBLY64_CLIENT_ID == "u64deck"
     original = copy.deepcopy(server.CFG.get("assembly64", {}))
     try:
@@ -9390,7 +9558,7 @@ def test_rc47_assembly64_client_id_is_fixed_and_registered():
         server.CFG["assembly64"] = original
 
 
-def test_rc47_all_assembly64_http_paths_use_shared_registered_headers():
+def test_ui_preview6_all_assembly64_http_paths_use_shared_registered_headers():
     source = (Path(server.ROOT) / "server.py").read_text(encoding="utf-8")
     assembly = source[source.index("# --- Assembly64"):source.index("# --- SQLite directory/image index")]
     assert 'ASSEMBLY64_CLIENT_ID = "u64deck"' in assembly
@@ -9399,7 +9567,7 @@ def test_rc47_all_assembly64_http_paths_use_shared_registered_headers():
     assert '"Client-Id": ASSEMBLY64_CLIENT_ID' in assembly
 
 
-def test_rc47_obsolete_assembly64_client_override_is_not_shipped():
+def test_ui_preview6_obsolete_assembly64_client_override_is_not_shipped():
     root = Path(server.ROOT)
     example = json.loads((root / "config.example.json").read_text(encoding="utf-8"))
     assert "client_id" not in example["assembly64"]
@@ -9408,9 +9576,10 @@ def test_rc47_obsolete_assembly64_client_override_is_not_shipped():
     assert 'get("client_id", "u64deck")' not in source
 
 
-def test_rc47_assembly64_support_panel_has_exact_safe_links():
+def test_ui_preview6_assembly64_support_panel_has_exact_safe_links():
     root = Path(server.ROOT)
     html = (root / "static/index.html").read_text(encoding="utf-8")
+    css = (root / "static/app.css").read_text(encoding="utf-8")
     assert 'class="asm-support-panel"' in html
     assert "Support Assembly64" in html
     assert "Hosting and maintaining the service has ongoing costs" in html
@@ -9419,32 +9588,34 @@ def test_rc47_assembly64_support_panel_has_exact_safe_links():
     assert ('href="https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&amp;'
             'hosted_button_id=8D6YK9LXULYPE" target="_blank" rel="noopener noreferrer"') in html
     assert "<iframe" not in html.lower()
+    assert ".asm-support-panel{" in css
+    assert "background:rgba(64,49,141,.12)" in css
 
 
-def test_rc47_assembly64_help_and_readme_credit_service_and_both_links():
+def test_ui_preview6_assembly64_help_and_readme_credit_service_and_both_links():
     root = Path(server.ROOT)
     help_text = (root / "static/help_content.js").read_text(encoding="utf-8")
     readme = (root / "README.md").read_text(encoding="utf-8")
-    for text in (help_text, readme):
-        assert "https://ko-fi.com/assembly64" in text
-        assert "hosted_button_id=8D6YK9LXULYPE" in text
-        assert "non-commercial Assembly64 client" in text
-        assert "Hosting and maintaining the service has ongoing costs" in text
+    for body in (help_text, readme):
+        assert "https://ko-fi.com/assembly64" in body
+        assert "hosted_button_id=8D6YK9LXULYPE" in body
+        assert "non-commercial Assembly64 client" in body
+        assert "Hosting and maintaining the service has ongoing costs" in body
     assert "not developed, endorsed or supported by" in readme
     assert "not required" in readme
 
 
-def test_rc47_release_identity_and_windows_packaging_baseline():
+def test_rc49_release_identity_and_windows_packaging_baseline():
     import release
     root = Path(server.ROOT)
     assert release.VERSION == "1.9.0"
-    assert release.RELEASE_LABEL == "Release Candidate 48"
-    assert "Release Candidate 48" in (root / "README.md").read_text(encoding="utf-8")
+    assert release.RELEASE_LABEL == "Release Candidate 51"
+    assert "Release Candidate 51" in (root / "README.md").read_text(encoding="utf-8")
     assert (root / "u64deck.spec").is_file()
     assert (root / ".github/workflows/build-exe.yml").is_file()
 
 
-def test_rc47_assembly64_search_keeps_aql_url_and_sends_registered_id(monkeypatch):
+def test_ui_preview6_assembly64_search_keeps_aql_url_and_sends_registered_id(monkeypatch):
     captured = {}
 
     class Response:
@@ -9483,7 +9654,7 @@ def test_rc47_assembly64_search_keeps_aql_url_and_sends_registered_id(monkeypatc
     assert captured["client_kwargs"] == {"timeout": 30}
 
 
-def test_rc47_assembly64_binary_path_and_download_limits_are_unchanged(monkeypatch):
+def test_ui_preview6_assembly64_binary_path_and_download_limits_are_unchanged(monkeypatch):
     captured = {}
 
     class Response:
@@ -9525,9 +9696,9 @@ def test_rc47_assembly64_binary_path_and_download_limits_are_unchanged(monkeypat
     assert captured["chunk_size"] == server.MIB
 
 
-# --- v1.9.0 Release Candidate 48: Legacy Auto F7 preference correction ---
+# --- v1.9.0 Release Candidate 50: inherited RC48 Auto F7 and readable Assembly64 support ---
 
-def test_rc48_auto_f7_defaults_on_when_key_is_absent_and_preserves_explicit_disable(tmp_path, monkeypatch):
+def test_ui_preview6_rc48_auto_f7_defaults_on_when_key_is_absent_and_preserves_explicit_disable(tmp_path, monkeypatch):
     original_root = server.ROOT
     try:
         monkeypatch.setattr(server, "ROOT", tmp_path)
@@ -9543,19 +9714,20 @@ def test_rc48_auto_f7_defaults_on_when_key_is_absent_and_preserves_explicit_disa
         monkeypatch.setattr(server, "ROOT", original_root)
 
 
-def test_rc48_legacy_checkbox_is_selectable_and_explains_guidance_only():
+def test_ui_preview6_rc48_legacy_checkbox_is_selectable_and_explains_guidance_only():
     root = Path(server.ROOT)
     js = (root / "static/app.js").read_text(encoding="utf-8")
     html = (root / "static/index.html").read_text(encoding="utf-8")
     assert "box.disabled=BOOT_OPTIONS_SAVING;" in js
     assert "box.disabled=BOOT_OPTIONS_SAVING||legacy" not in js
-    assert "if(isLegacyInput()){" not in js[js.index("async function autoFastloadChanged"):js.index("async function machine", js.index("async function autoFastloadChanged"))]
+    handler = js[js.index("async function autoFastloadChanged"):js.index("async function machine", js.index("async function autoFastloadChanged"))]
+    assert "if(isLegacyInput()){" not in handler
     assert "Legacy Auto F7 enabled — physical-F7 guidance will be shown; no F7 will be injected" in js
     assert "u64deck will not inject F7 through the Legacy KERNAL keyboard buffer" in js
     assert "enabling this option shows physical-F7 guidance" in html
 
 
-def test_rc48_legacy_enabled_preference_never_uses_kernal_buffer_f7(monkeypatch):
+def test_ui_preview6_rc48_legacy_enabled_preference_never_uses_kernal_buffer_f7(monkeypatch):
     previous = dict(server.CFG)
     legacy_calls = []
     matrix_calls = []
@@ -9573,7 +9745,7 @@ def test_rc48_legacy_enabled_preference_never_uses_kernal_buffer_f7(monkeypatch)
         server.CFG.clear(); server.CFG.update(previous)
 
 
-def test_rc48_cia1_enabled_preference_still_uses_matrix_f7(monkeypatch):
+def test_ui_preview6_rc48_cia1_enabled_preference_still_uses_matrix_f7(monkeypatch):
     previous = dict(server.CFG)
     matrix_calls = []
     try:
@@ -9586,3 +9758,521 @@ def test_rc48_cia1_enabled_preference_still_uses_matrix_f7(monkeypatch):
         assert matrix_calls == [[{"kind":"keyboard","inputs":["f7"],"transition":"tap"}]]
     finally:
         server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc49_assembly64_support_panel_uses_equal_final_clause_type_scale():
+    css = (Path(server.ROOT) / "static/app.css").read_text(encoding="utf-8")
+    assert ".asm-support-copy strong{color:var(--acc2);font-size:14px" in css
+    assert ".asm-support-copy span{color:var(--txt);font-size:14px;line-height:1.5" in css
+    assert ".asm-support-copy small{color:var(--dim);font-size:14px;line-height:1.5" in css
+    assert "font-size:13px" not in css[css.index(".asm-support-copy small{"):css.index(".asm-support-actions", css.index(".asm-support-copy small{"))]
+    assert ".asm-support-actions a{font:inherit;font-size:13px;font-weight:650" in css
+
+# --- v1.9.0 Release Candidate 50: progressive Finder delivery ---
+
+def test_rc50_transport_reports_completed_rows_and_cancels_pending(monkeypatch):
+    import discovery_transport
+
+    cancel = threading.Event()
+    callbacks = []
+
+    def fake_get_info(ip, connect_timeout, response_timeout, overall_started, stage, port=80):
+        time.sleep(0.015)
+        return {
+            "ip": ip, "stage": stage, "status": "connect_timeout",
+            "elapsed_ms": 15.0,
+        }
+
+    def on_result(row):
+        callbacks.append(row["ip"])
+        cancel.set()
+
+    monkeypatch.setattr(discovery_transport, "get_info", fake_get_info)
+    rows = discovery_transport.scan_direct(
+        [f"192.0.2.{index}" for index in range(1, 9)],
+        1, 1.5, 3.25, time.perf_counter(), "direct-all", 80,
+        result_callback=on_result, cancel_event=cancel,
+    )
+
+    assert cancel.is_set()
+    assert 1 <= len(rows) < 8
+    assert callbacks == [row["ip"] for row in rows]
+
+
+def test_rc50_discovery_publishes_verified_device_before_full_completion(monkeypatch):
+    import discovery
+    import discovery_transport
+
+    monkeypatch.setattr(discovery, "local_subnets", lambda: [])
+
+    def fake_get_info(ip, connect_timeout, response_timeout, overall_started, stage, port=80):
+        if ip == "192.0.2.1":
+            time.sleep(0.005)
+            return {
+                "ip": ip, "stage": stage, "status": "ultimate",
+                "elapsed_ms": 5.0, "found_after_ms": 5.0,
+                "payload": {
+                    "product": "Ultimate 64", "firmware_version": "3.15",
+                    "hostname": "Ultimate-64-F06606", "unique_id": "101090",
+                },
+            }
+        time.sleep(0.04)
+        return {"ip": ip, "stage": stage, "status": "connect_timeout", "elapsed_ms": 40.0}
+
+    monkeypatch.setattr(discovery_transport, "get_info", fake_get_info)
+    detector = _MappedLinkDetector({
+        "192.0.2.1": ("ethernet", "02:15:41:F0:66:06", "wired-prefix"),
+    })
+    snapshots = []
+    result = asyncio.run(discovery.discover(
+        extra_subnets=["192.0.2.0/30"], detector=detector,
+        candidate_ips=["192.0.2.1"], progress_callback=lambda row: snapshots.append(copy.deepcopy(row))))
+
+    assert result["complete"] is True
+    assert result["candidate_count"] == result["checked_count"] == 2
+    assert result["verified_count"] == 1
+    assert result["time_to_first_verified_ms"] == 5.0
+    partial = [row for row in snapshots if not row["complete"] and row.get("devices")]
+    assert partial
+    assert partial[0]["checked_count"] < partial[0]["candidate_count"]
+    assert partial[0]["devices"][0]["preferred_ip"] == "192.0.2.1"
+    assert snapshots[-1]["complete"] is True
+
+
+def test_rc50_progressive_job_records_partial_then_final_result(monkeypatch):
+    partial = {
+        "devices": [], "candidate_count": 254, "checked_count": 16,
+        "remaining_count": 238, "verified_count": 0,
+        "complete": False, "cancelled": False, "phase": "scanning",
+    }
+    final = {
+        "devices": [], "candidate_count": 254, "checked_count": 254,
+        "remaining_count": 0, "verified_count": 0,
+        "complete": True, "cancelled": False, "phase": "complete",
+        "diagnostics": [],
+    }
+
+    async def fake_discover(*args, progress_callback=None, **kwargs):
+        await progress_callback(copy.deepcopy(partial))
+        await asyncio.sleep(0.02)
+        await progress_callback(copy.deepcopy(final))
+        return copy.deepcopy(final)
+
+    monkeypatch.setattr(server.discovery, "discover", fake_discover)
+    monkeypatch.setattr(server, "save_config", lambda: None)
+    monkeypatch.setattr(server, "_record_discovery_diagnostics", lambda result: None)
+
+    async def scenario():
+        with server.DISCOVERY_JOB_LOCK:
+            server.DISCOVERY_JOB.clear()
+        assert not server.DISCOVERY_SCAN_LOCK.locked()
+        started = server._start_discovery_job("192.0.2.0/24", 80)
+        job_id = started["job_id"]
+        await asyncio.sleep(0.005)
+        interim = server._discovery_job_snapshot(job_id)
+        assert interim["state"] == "running"
+        assert interim["result"]["checked_count"] == 16
+        task = server.DISCOVERY_JOB_TASK
+        assert task is not None
+        await task
+        completed = server._discovery_job_snapshot(job_id)
+        assert completed["state"] == "complete"
+        assert completed["result"]["checked_count"] == 254
+        assert not server.DISCOVERY_SCAN_LOCK.locked()
+
+    asyncio.run(scenario())
+
+
+def test_rc50_cancel_endpoint_sets_current_job_event():
+    event = threading.Event()
+    previous_job = copy.deepcopy(server.DISCOVERY_JOB)
+    previous_cancel = server.DISCOVERY_JOB_CANCEL
+    try:
+        with server.DISCOVERY_JOB_LOCK:
+            server.DISCOVERY_JOB.clear()
+            server.DISCOVERY_JOB.update({
+                "job_id": "finder-test", "state": "running", "message": "Scanning",
+                "result": None, "error": "", "updated_at": "",
+            })
+            server.DISCOVERY_JOB_CANCEL = event
+        result = asyncio.run(server.api_discover_cancel("finder-test"))
+        assert event.is_set()
+        assert result["state"] == "cancelling"
+    finally:
+        with server.DISCOVERY_JOB_LOCK:
+            server.DISCOVERY_JOB.clear(); server.DISCOVERY_JOB.update(previous_job)
+            server.DISCOVERY_JOB_CANCEL = previous_cancel
+
+
+def test_rc50_release_identity_and_progressive_finder_documentation():
+    import release
+    root = Path(server.ROOT)
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    help_js = (root / "static/help_content.js").read_text(encoding="utf-8")
+    assert release.RELEASE_LABEL == "Release Candidate 51"
+    assert f"v1.9.0 — Release Candidate 51 · build {server.BUILD}" in readme
+    assert "Progressive single-pass discovery" in readme
+    assert "a verified ultimate is displayed as soon" in " ".join(readme.replace(">", "").lower().split())
+    assert "Progressive bounded subnet scan" in help_js
+    assert "Cancel scan" in help_js
+    assert "Release Candidate 51" in changelog
+
+# --- v1.9.0 Release Candidate 50 private reissue: Dashboard Jukebox balance ---
+
+def test_rc50_dashboard_jukebox_card_uses_available_space():
+    root = Path(server.ROOT)
+    css = (root / "static/app.css").read_text(encoding="utf-8")
+    html = (root / "static/index.html").read_text(encoding="utf-8")
+    assert '<article class="dashboard-card jukebox-card">' in html
+    assert ".jukebox-card .dash-artwork" in css
+    assert "flex-basis:208px" in css
+    assert "width:208px" in css
+    assert "height:208px" in css
+    assert ".jukebox-card .dashboard-media-copy h2" in css
+    assert "font-size:24px" in css
+    assert ".jukebox-card .dashboard-media-copy .dashboard-subtitle" in css
+    assert "font-size:15px" in css
+
+
+# --- v1.9.0 Release Candidate 50 private reissue: fade endpoint and queue invariant ---
+
+def test_rc50_fade_is_capped_to_short_documented_tune(monkeypatch):
+    previous = dict(server.CFG)
+    try:
+        server.CFG["sid_jukebox_browser_fade_enabled"] = True
+        server.CFG["sid_jukebox_browser_fade_secs"] = 5.0
+        monkeypatch.setattr(server, "_juke_length", lambda item, song: 2.0)
+        assert server._juke_auto_advance_plan({}, 1) == (2.0, 0.0, 2.0, "songlengths")
+    finally:
+        server.CFG.clear(); server.CFG.update(previous)
+
+
+def test_rc50_auto_advance_ignores_queue_item_origin(monkeypatch):
+    previous = dict(server.JUKE)
+    origins = (
+        "SID Search", "Favourites", "saved play queue", "manual queue",
+        "SIDFlow More Like This", "SIDFlow Radio",
+    )
+    calls = []
+    try:
+        items = [{
+            "label": f"{origin}.sid", "path": f"/HVSC/{i}.sid", "data": b"sid",
+            "meta": {"name": origin, "songs": 1, "start_song": 1},
+            "queue_origin": origin,
+            "recommendation_source": "sidflow-neighbors" if "SIDFlow" in origin else "",
+        } for i, origin in enumerate(("current",) + origins)]
+        server.JUKE.clear(); server.JUKE.update(_rc32_juke_state(items, index=0, generation=77))
+        monkeypatch.setattr(server, "_juke_play",
+                            lambda index, **kwargs: calls.append((index, kwargs)))
+        for expected in range(1, len(items)):
+            server.JUKE["index"] = expected - 1
+            server.JUKE["generation"] = 77
+            server._juke_auto_next(77)
+        assert calls == [
+            (i, {"expected_generation": 77}) for i in range(1, len(items))
+        ]
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+def test_rc50_saved_queue_load_clears_stale_stop_after_current(monkeypatch):
+    previous = dict(server.JUKE)
+    try:
+        server.JUKE["stop_after_current"] = True
+        monkeypatch.setattr(server, "_playlists_load", lambda: {
+            "Mixed": {"tunes": ["/HVSC/A.sid", "/HVSC/B.sid"]}
+        })
+        monkeypatch.setattr(server, "_index_store", lambda: object())
+        monkeypatch.setattr(server, "_sid_metadata_for_paths", lambda store, paths: {})
+        out = server.playlists_load_one({"name": "Mixed"})
+        assert len(out["items"]) == 2
+        assert server.JUKE["stop_after_current"] is False
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous)
+
+
+def test_rc50_fade_docs_describe_pre_endpoint_completion_and_no_native_extension():
+    root = Path(server.ROOT)
+    readme = " ".join((root / "README.md").read_text(encoding="utf-8").split())
+    help_js = " ".join((root / "static/help_content.js").read_text(encoding="utf-8").split())
+    html = (root / "static/index.html").read_text(encoding="utf-8")
+    assert "starts the linear browser fade before the documented endpoint" in readme
+    assert "compact native `.ssl` duration is not extended" in readme
+    assert "starts a browser-side fade before the documented endpoint" in help_js
+    assert "selected native .ssl duration is not extended" in help_js
+    assert "Fade duration ending at the documented Songlengths endpoint" in html
+
+
+# --- v1.9.0 Release Candidate 50 private reissue 4: launch-clock fade fix ---
+
+def test_rc50_fade_clock_excludes_delayed_cartridge_restore(monkeypatch):
+    previous_juke = dict(server.JUKE)
+    previous_cfg = dict(server.CFG)
+    now = [100.0]
+    captured = {}
+    item = {
+        "label": "Clock.sid", "path": "/HVSC/Clock.sid", "data": b"sid",
+        "meta": {"name": "Clock", "start_song": 1, "songs": 1},
+    }
+
+    class FakeTimer:
+        def __init__(self, interval, callback, args=()):
+            captured.update(interval=interval, callback=callback, args=args)
+        def start(self):
+            captured["started"] = True
+        def cancel(self):
+            pass
+
+    def fake_monotonic():
+        return now[0]
+
+    def fake_cart_safe(fn, **kwargs):
+        result = fn()
+        # Simulate slow freezer-cartridge restoration after native SID launch.
+        now[0] += 4.0
+        timings = kwargs.get("timings")
+        if timings is not None:
+            timings["cart_restore_ms"] = 4000.0
+            timings["cart_safe_total_ms"] = 4000.0
+        return result
+
+    def fake_upload(*args, **kwargs):
+        now[0] += 0.2
+        return {}
+
+    try:
+        server.CFG["sid_jukebox_browser_fade_enabled"] = True
+        server.CFG["sid_jukebox_browser_fade_secs"] = 5.0
+        server.JUKE.clear(); server.JUKE.update({
+            "items": [item], "index": -1, "playing": False,
+            "shuffle": False, "radio": False, "song": 0, "timer": None,
+            "folder": "", "loading": False, "source": "test",
+            "generation": 0, "stop_after_current": False,
+        })
+        monkeypatch.setattr(server.time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(server, "_run_cart_safe", fake_cart_safe)
+        monkeypatch.setattr(server, "_post_sid_upload", fake_upload)
+        monkeypatch.setattr(
+            server, "_juke_auto_advance_plan",
+            lambda item, song: (120.0, 0.0, 120.0, "songlengths"),
+        )
+        monkeypatch.setattr(server._threading, "Timer", FakeTimer)
+        monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+
+        out = server._juke_play(0)
+
+        assert server.JUKE["playback_started_monotonic"] == pytest.approx(100.2)
+        assert captured["interval"] == pytest.approx(116.0)
+        assert captured["started"] is True
+        assert out["active_browser_fade"]["starts_in_secs"] == pytest.approx(111.0)
+        assert out["play_timing"]["sid_launch_request_ms"] == pytest.approx(200.0)
+        assert out["play_timing"]["launch_to_state_commit_ms"] == pytest.approx(4000.0)
+        assert out["play_timing"]["auto_advance_timer_secs"] == pytest.approx(116.0)
+        assert out["play_timing"]["playback_clock_basis"] == "sid_request_complete"
+    finally:
+        server.JUKE.clear(); server.JUKE.update(previous_juke)
+        server.CFG.clear(); server.CFG.update(previous_cfg)
+
+
+def test_rc50_r5_dashboard_artwork_is_proportionately_prominent():
+    css = (Path(server.ASSETS) / "static" / "app.css").read_text(encoding="utf-8")
+    block = css[css.index("/* RC50 private reissue 5"):]
+    assert "flex-basis:208px" in block
+    assert "width:208px" in block
+    assert "height:208px" in block
+    assert "flex-basis:152px" in block
+    assert "font-size:24px" in block
+
+
+# --- v1.9.0 Release Candidate 50 private reissue 5: Legacy drain-confirmed delivery ---
+
+def test_rc50_r5_legacy_mount_run_waits_for_each_chunk_to_drain(monkeypatch):
+    counts = iter([0, 0, 8, 3, 0, 0, 4, 1, 0, 0])
+    transmitted = []
+    diagnostics = []
+    monkeypatch.setattr(server, "_read_legacy_keyboard_buffer_count", lambda: next(counts))
+    monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        server, "_legacy_type",
+        lambda data, **kwargs: transmitted.append((bytes(data), dict(kwargs))),
+    )
+    monkeypatch.setattr(
+        server, "_diag_event",
+        lambda level, message, **kwargs: diagnostics.append((level, message, kwargs)),
+    )
+
+    ok, delivery = server._type_mount_run_legacy(
+        b'LOAD"*",8,1\r', command_name="LOAD"
+    )
+
+    assert ok is True
+    assert delivery == "Legacy KERNAL buffer drain-confirmed"
+    assert [item[0] for item in transmitted] == [b'LOAD"*",', b'8,1\r']
+    assert all(item[1]["delay"] == 0.0 for item in transmitted)
+    assert all(item[1]["log_codes"] is False for item in transmitted)
+    assert sum("consumption confirmed" in message for _level, message, _kw in diagnostics) == 2
+    assert any("2 drain-confirmed chunks" in message for _level, message, _kw in diagnostics)
+
+
+def test_rc50_r5_legacy_mount_run_uses_character_fallback_only_before_send(monkeypatch):
+    transmitted = []
+    monkeypatch.setattr(
+        server, "_wait_legacy_keyboard_buffer_empty",
+        lambda *args, **kwargs: "unsupported",
+    )
+    monkeypatch.setattr(
+        server, "_legacy_type",
+        lambda data, **kwargs: transmitted.append((bytes(data), dict(kwargs))),
+    )
+    monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+
+    ok, delivery = server._type_mount_run_legacy(b"RUN\r", command_name="RUN")
+
+    assert ok is True
+    assert delivery == "Legacy KERNAL buffer character fallback"
+    assert transmitted == [(b"RUN\r", {
+        "chunk": 1,
+        "delay": server._LEGACY_FALLBACK_CHAR_DELAY,
+        "origin": "mount-run-run",
+        "log_codes": False,
+    })]
+
+
+def test_rc50_r5_legacy_mount_run_aborts_after_ambiguous_first_chunk(monkeypatch):
+    waits = iter(["empty", "timeout"])
+    transmitted = []
+    monkeypatch.setattr(
+        server, "_wait_legacy_keyboard_buffer_empty",
+        lambda *args, **kwargs: next(waits),
+    )
+    monkeypatch.setattr(
+        server, "_legacy_type",
+        lambda data, **kwargs: transmitted.append(bytes(data)),
+    )
+    monkeypatch.setattr(server, "_diag_event", lambda *args, **kwargs: None)
+
+    ok, delivery = server._type_mount_run_legacy(
+        b'LOAD"*",8,1\r', command_name="LOAD"
+    )
+
+    assert ok is False
+    assert transmitted == [b'LOAD"*",']
+    assert "remaining bytes not sent" in delivery
+    assert "keyboard buffer did not drain" in delivery
+
+
+def test_rc50_r5_legacy_buffer_wait_requires_two_empty_samples():
+    values = iter([0, 5, 0, 0])
+    now = [0.0]
+    diagnostics = []
+
+    def sleeper(seconds):
+        now[0] += max(0.001, float(seconds))
+
+    result = server._wait_legacy_keyboard_buffer_empty(
+        "test",
+        timeout=1.0,
+        reader=lambda: next(values),
+        sleeper=sleeper,
+        clock=lambda: now[0],
+    )
+
+    assert result == "empty"
+
+# --- v1.9.0 Release Candidate 50 private reissue 6: styled local SID picker ---
+
+def test_rc50_r6_local_sid_picker_replaces_native_file_control():
+    root = Path(server.ROOT)
+    html = (root / "static/index.html").read_text(encoding="utf-8")
+    css = (root / "static/app.css").read_text(encoding="utf-8")
+    js = (root / "static/app.js").read_text(encoding="utf-8")
+
+    assert 'id="jkLocal" accept=".sid" multiple hidden' in html
+    assert 'class="jk-file-button"' in html
+    assert '>Choose SID files</button>' in html
+    assert 'id="jkLocalStatus" class="jk-file-status" aria-live="polite"' in html
+    assert '>No files selected</span>' in html
+    assert 'aria-describedby="jkLocalStatus"' in html
+    assert ".jk-local-picker" in css
+    assert ".jk-file-status" in css
+    assert "text-overflow:ellipsis" in css
+    assert "function jkLocalSelectionChanged()" in js
+    assert 'text=`${files.length} files selected`' in js
+    assert '$("#jkLocal").value="";jkLocalSelectionChanged();' in js
+
+
+
+# --- v1.9.0 Release Candidate 51: frozen baseline and packaging assets ---
+
+def _ico_frame_sizes(path: Path) -> list[int]:
+    import struct
+    data = path.read_bytes()
+    reserved, kind, count = struct.unpack_from("<HHH", data, 0)
+    assert reserved == 0 and kind == 1
+    sizes = []
+    offset = 6
+    for _ in range(count):
+        width, height = struct.unpack_from("<BB", data, offset)
+        width = 256 if width == 0 else width
+        height = 256 if height == 0 else height
+        assert width == height
+        sizes.append(width)
+        offset += 16
+    return sizes
+
+
+def test_rc51_release_identity_and_frozen_baseline_wording():
+    import release
+    root = Path(server.ROOT)
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert release.RELEASE_LABEL == "Release Candidate 51"
+    assert f"v1.9.0 — Release Candidate 51 · build {server.BUILD}" in readme
+    assert "hardware-accepted RC50 private reissue 6 application baseline" in " ".join(readme.replace(">", "").split())
+    assert "## 1.9.0 — Release Candidate 51" in changelog
+
+
+def test_rc51_canonical_library_is_empty_except_readme():
+    root = Path(server.ROOT)
+    library = root / "library"
+    canonical = (
+        "Drop .crt/.prg/.t64/.sid/.mod/.d64/.d71/.d81/.g64/.dnp files here.\n"
+        "Each appears as a Quick Launch button in u64deck's SCREEN tab.\n"
+    ).encode("utf-8")
+    assert library.is_dir()
+    files = sorted(p.relative_to(library).as_posix() for p in library.rglob("*") if p.is_file())
+    assert files == ["README.txt"]
+    assert (library / "README.txt").read_bytes() == canonical
+
+
+def test_rc51_icon_has_complete_frame_set_and_binary_attributes():
+    root = Path(server.ROOT)
+    assert _ico_frame_sizes(root / "u64deck.ico") == [16, 24, 32, 48, 64, 128, 256]
+    assert (root / "u64deck-icon-master.svg").is_file()
+    assert (root / "u64deck-icon-master-1024.png").is_file()
+    assert (root / "u64deck-icon-256.png").is_file()
+    attrs = (root / ".gitattributes").read_text(encoding="utf-8")
+    assert "*.ico  binary" in attrs
+    assert "*.png  binary" in attrs
+
+
+def test_rc51_spec_preserves_path_fix_icon_and_pe_version_info():
+    root = Path(server.ROOT)
+    spec = (root / "u64deck.spec").read_text(encoding="utf-8")
+    assert 'import sys' in spec
+    assert 'sys.path.insert(0, str(Path(globals().get("SPECPATH", ".")).resolve()))' in spec
+    assert 'icon="u64deck.ico"' in spec
+    assert 'version=str(version_info_path)' in spec
+    assert "StringStruct('ReleaseLabel', '{RELEASE_LABEL}')" in spec
+    assert "StringStruct('BuildId', '{stamp_value}')" in spec
+
+
+def test_rc51_windows_workflow_checks_pe_metadata_and_library_package():
+    root = Path(server.ROOT)
+    workflow = (root / ".github/workflows/build-exe.yml").read_text(encoding="utf-8")
+    assert "Verify PE VERSIONINFO" in workflow
+    assert "ReleaseLabel" in workflow and "BuildId" in workflow
+    assert "library/README.txt" in workflow
+    assert "u64deck-v1.9.0-rc.51-windows.zip" in workflow
+    assert "Verify packaged library" in workflow

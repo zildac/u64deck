@@ -46,6 +46,28 @@ jobs:
           "U64DECK_EXPECTED_BUILD=$($parts[2])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "Expected identity: v$($parts[0]) · $($parts[1]) · $($parts[2])"
 
+      - name: Verify icon source frames
+        shell: pwsh
+        run: |
+          @'
+          import struct
+          from pathlib import Path
+          data = Path("u64deck.ico").read_bytes()
+          reserved, kind, count = struct.unpack_from("<HHH", data, 0)
+          assert (reserved, kind) == (0, 1)
+          sizes = []
+          offset = 6
+          for _ in range(count):
+              width, height = struct.unpack_from("<BB", data, offset)
+              width = 256 if width == 0 else width
+              height = 256 if height == 0 else height
+              assert width == height
+              sizes.append(width)
+              offset += 16
+          assert sizes == [16, 24, 32, 48, 64, 128, 256], sizes
+          print("ICO source frames OK:", sizes)
+          '@ | python -
+
       - name: Build
         run: pyinstaller u64deck.spec
 
@@ -73,6 +95,34 @@ jobs:
           assert 3 in types, "RT_ICON resource is missing"
           assert 14 in types, "RT_GROUP_ICON resource is missing"
           print("embedded icon resources OK")
+          '@ | python -
+
+      - name: Verify PE VERSIONINFO
+        shell: pwsh
+        run: |
+          @'
+          import pefile
+          pe = pefile.PE("dist/u64deck.exe")
+          strings = {}
+          for group in getattr(pe, "FileInfo", []) or []:
+              entries = group if isinstance(group, list) else [group]
+              for entry in entries:
+                  if getattr(entry, "Key", b"") == b"StringFileInfo":
+                      for table in entry.StringTable:
+                          for key, value in table.entries.items():
+                              k = key.decode("utf-8", "replace") if isinstance(key, bytes) else str(key)
+                              v = value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
+                              strings[k] = v
+          expected = {
+              "FileVersion": f"{__import__('os').environ['U64DECK_EXPECTED_VERSION']}.0",
+              "ProductVersion": f"{__import__('os').environ['U64DECK_EXPECTED_VERSION']}.0",
+              "ReleaseLabel": __import__('os').environ['U64DECK_EXPECTED_RELEASE'],
+              "BuildId": __import__('os').environ['U64DECK_EXPECTED_BUILD'],
+              "OriginalFilename": "u64deck.exe",
+          }
+          for key, value in expected.items():
+              assert strings.get(key) == value, (key, strings.get(key), value)
+          print("PE VERSIONINFO OK:", expected)
           '@ | python -
 
       - name: Smoke test normal Edge app exit and frozen identity
@@ -167,16 +217,48 @@ jobs:
               ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
           }
 
+      - name: Stage Windows release package
+        shell: pwsh
+        run: |
+          $packageRoot = "dist/u64deck-windows"
+          Remove-Item $packageRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path "$packageRoot/library" -Force | Out-Null
+          Copy-Item "dist/u64deck.exe" "$packageRoot/u64deck.exe"
+          Copy-Item "library/README.txt" "$packageRoot/library/README.txt"
+          Compress-Archive -Path "$packageRoot/*" -DestinationPath "dist/u64deck-v1.9.0-rc.51-windows.zip" -Force
+
+      - name: Verify packaged library
+        shell: pwsh
+        run: |
+          @'
+          import zipfile
+          from pathlib import Path
+          archive = Path("dist/u64deck-v1.9.0-rc.51-windows.zip")
+          canonical = (
+              "Drop .crt/.prg/.t64/.sid/.mod/.d64/.d71/.d81/.g64/.dnp files here.\n"
+              "Each appears as a Quick Launch button in u64deck's SCREEN tab.\n"
+          ).encode("utf-8")
+          with zipfile.ZipFile(archive) as zf:
+              files = sorted(name.replace("\\", "/") for name in zf.namelist() if not name.endswith("/"))
+              assert files == ["library/README.txt", "u64deck.exe"], files
+              assert zf.read("library/README.txt") == canonical
+          print("Windows package and canonical library README OK")
+          '@ | python -
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: u64deck-windows
-          path: dist/u64deck.exe
+          path: |
+            dist/u64deck.exe
+            dist/u64deck-v1.9.0-rc.51-windows.zip
           if-no-files-found: error
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
-          files: dist/u64deck.exe
+          files: |
+            dist/u64deck.exe
+            dist/u64deck-v1.9.0-rc.51-windows.zip
           fail_on_unmatched_files: true

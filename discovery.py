@@ -150,8 +150,25 @@ def _transport_hits(results: list[dict]) -> list[dict]:
 
 
 async def _scan_stage(ips: list[str], port: int, workers: int,
-                      overall_started: float, stage: str) -> list[dict]:
-    """Run one stage through the exact shared threaded scanner."""
+                      overall_started: float, stage: str, *,
+                      result_callback: Callable[[dict], object] | None = None,
+                      cancel_event: object | None = None) -> list[dict]:
+    """Run one stage through the exact shared threaded scanner.
+
+    Older injected test scanners use the original positional-only signature.
+    Production transport accepts optional progressive-result and cancellation
+    hooks; detecting support here keeps those tests and third-party diagnostics
+    compatible without changing the wire behaviour.
+    """
+    kwargs = {}
+    try:
+        parameters = inspect.signature(discovery_transport.scan_direct).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "result_callback" in parameters:
+        kwargs["result_callback"] = result_callback
+    if "cancel_event" in parameters:
+        kwargs["cancel_event"] = cancel_event
     return await asyncio.to_thread(
         discovery_transport.scan_direct,
         ips,
@@ -161,6 +178,7 @@ async def _scan_stage(ips: list[str], port: int, workers: int,
         overall_started,
         stage,
         port,
+        **kwargs,
     )
 
 
@@ -189,9 +207,16 @@ def _replace_matching_mac(record: dict, current_ip: str, current_address: dict,
 
 
 async def _group_hits(hits: list[dict], known_devices: dict, detector: LinkDetector,
-                      *, events: list[str] | None = None) -> list[dict]:
-    """Group verified hits and classify interfaces without further REST calls."""
+                      *, events: list[str] | None = None,
+                      persist: bool = True) -> list[dict]:
+    """Group verified hits and classify interfaces without further REST calls.
+
+    Progressive Finder snapshots use ``persist=False`` so an early live result
+    can be shown immediately without updating remembered-device state before
+    the bounded subnet pass has completed.
+    """
     events = events if events is not None else []
+    working_known = known_devices if persist else {}
     current: dict[str, dict[str, dict]] = {}
     for hit in hits:
         ip = _valid_ipv4(hit.get("ip", ""))
@@ -204,7 +229,7 @@ async def _group_hits(hits: list[dict], known_devices: dict, detector: LinkDetec
     for identity, by_ip in current.items():
         rows = list(by_ip.values())
         first = rows[0]
-        known = known_devices.get(identity) if isinstance(known_devices.get(identity), dict) else {}
+        known = working_known.get(identity) if isinstance(working_known.get(identity), dict) else {}
         old_addresses = dict(known.get("addresses") or {}) if isinstance(known, dict) else {}
         live_ips = list(by_ip)
 
@@ -235,14 +260,14 @@ async def _group_hits(hits: list[dict], known_devices: dict, detector: LinkDetec
                 if observation is not None
                 else {"ip": ip, "link_type": "unknown", "mac": "", "method": "unknown"}
             )
-            if isinstance(record, dict):
+            if persist and isinstance(record, dict):
                 _replace_matching_mac(record, ip, address, events)
             _identity, record = merge_known_device(
-                known_devices, info=row.get("info") or row, address=address)
+                working_known, info=row.get("info") or row, address=address)
             persisted = (record.get("addresses") or {}).get(ip, address)
             live_addresses.append(dict(persisted))
 
-        stale = sorted(ip for ip in old_addresses if ip not in live_ips)
+        stale = sorted(ip for ip in old_addresses if ip not in live_ips) if persist else []
         for ip in stale:
             events.append(f"Historical address omitted: {ip} (no response)")
 
@@ -284,16 +309,15 @@ async def discover(extra_subnets: list[str] | None = None, port: int = 80,
                    *, known_devices: dict | None = None,
                    detector: LinkDetector | None = None,
                    candidate_ips: list[str] | None = None,
-                   progress_callback: Callable[[dict], object] | None = None) -> dict:
+                   progress_callback: Callable[[dict], object] | None = None,
+                   cancel_event: object | None = None) -> dict:
     """Return live Ultimate devices using one prioritised direct REST pass.
 
-    Configured and remembered addresses are placed at the front of the same
-    64-worker scan as the remaining local-/24 candidates.  They therefore stay
-    useful without forming a separate blocking phase: a stale persisted address
-    can no longer delay the fresh subnet scan.  Every address still receives at
-    most one direct ``/v1/info`` request through
-    :func:`discovery_transport.scan_direct`, with the proven split TCP-connect
-    and HTTP-response deadlines and no retry.
+    Configured and remembered addresses remain first in the same 64-worker pass
+    as the rest of the selected local networks. Every candidate still receives
+    at most one direct ``/v1/info`` request with the proven split timeout
+    budgets and no retry. RC50 adds progressive delivery only: completed rows
+    are surfaced while the remaining futures continue in the background.
     """
     started = time.perf_counter()
     networks = _scan_networks(extra_subnets)
@@ -318,10 +342,15 @@ async def discover(extra_subnets: list[str] | None = None, port: int = 80,
             "subnets": [str(network) for network in networks],
             "devices": [],
             "candidate_count": 0,
+            "checked_count": 0,
+            "remaining_count": 0,
             "verified_count": 0,
             "cached_candidate_count": 0,
             "cached_verified_count": 0,
+            "time_to_first_verified_ms": None,
+            "phase": "complete",
             "complete": True,
+            "cancelled": False,
             "elapsed_ms": 0.0,
             "diagnostics": ["Discovery scan: no candidate addresses"],
         }
@@ -334,11 +363,119 @@ async def discover(extra_subnets: list[str] | None = None, port: int = 80,
         key=ipaddress.ip_address,
     )
     scan_order = [*priority_ips, *remaining_ips]
+    candidate_count = len(scan_order)
+    progress_queue: asyncio.Queue[dict] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    try:
+        transport_parameters = inspect.signature(discovery_transport.scan_direct).parameters
+    except (TypeError, ValueError):
+        transport_parameters = {}
+    progressive_delivery = progress_callback is not None and "result_callback" in transport_parameters
+
+    def completed_row(row: dict) -> None:
+        loop.call_soon_threadsafe(progress_queue.put_nowait, dict(row))
+
+    initial = {
+        "subnets": [str(network) for network in networks],
+        "devices": [],
+        "candidate_count": candidate_count,
+        "checked_count": 0,
+        "remaining_count": candidate_count,
+        "verified_count": 0,
+        "cached_candidate_count": len(priority_ips),
+        "cached_verified_count": 0,
+        "time_to_first_verified_ms": None,
+        "phase": "scanning",
+        "complete": False,
+        "cancelled": False,
+        "elapsed_ms": 0.0,
+        "diagnostics": [],
+    }
+    if progressive_delivery:
+        await _publish_progress(progress_callback, initial)
+
     scan_started = time.perf_counter()
-    scan_results = await _scan_stage(
-        scan_order, port, SCAN_CONCURRENCY, started, "direct-all")
+    scan_task = asyncio.create_task(_scan_stage(
+        scan_order, port, SCAN_CONCURRENCY, started, "direct-all",
+        result_callback=completed_row if progressive_delivery else None,
+        cancel_event=cancel_event))
+    observed_rows: list[dict] = []
+    observed_by_ip: dict[str, dict] = {}
+    live_hits: list[dict] = []
+    partial_devices: list[dict] = []
+    first_verified_ms: float | None = None
+    last_publish = 0.0
+
+    async def process_row(row: dict) -> None:
+        nonlocal live_hits, partial_devices, first_verified_ms, last_publish
+        ip = str(row.get("ip") or "")
+        if ip and ip in observed_by_ip:
+            return
+        if ip:
+            observed_by_ip[ip] = row
+        observed_rows.append(row)
+        is_ultimate = row.get("status") == "ultimate"
+        if is_ultimate:
+            live_hits = _transport_hits(observed_rows)
+            if first_verified_ms is None:
+                value = row.get("found_after_ms")
+                first_verified_ms = float(value) if value is not None else round(
+                    (time.perf_counter() - started) * 1000.0, 1)
+            if progressive_delivery:
+                partial_devices = await _group_hits(
+                    live_hits, known_devices, detector, persist=False)
+
+        now = time.perf_counter()
+        should_publish = (
+            is_ultimate
+            or len(observed_rows) == candidate_count
+            or len(observed_rows) % 16 == 0
+            or now - last_publish >= 0.25
+        )
+        if not progressive_delivery or not should_publish:
+            return
+        last_publish = now
+        hit_ips = {str(item.get("ip") or "") for item in live_hits}
+        snapshot = {
+            "subnets": [str(network) for network in networks],
+            "devices": partial_devices,
+            "candidate_count": candidate_count,
+            "checked_count": len(observed_rows),
+            "remaining_count": max(0, candidate_count - len(observed_rows)),
+            "verified_count": len(live_hits),
+            "cached_candidate_count": len(priority_ips),
+            "cached_verified_count": sum(1 for ip in priority_ips if ip in hit_ips),
+            "time_to_first_verified_ms": first_verified_ms,
+            "phase": "cancelling" if cancel_event is not None and bool(cancel_event.is_set()) else "scanning",
+            "complete": False,
+            "cancelled": False,
+            "elapsed_ms": round((now - started) * 1000.0, 1),
+            "diagnostics": [],
+        }
+        await _publish_progress(progress_callback, snapshot)
+
+    while True:
+        if scan_task.done() and progress_queue.empty():
+            await asyncio.sleep(0)
+            if progress_queue.empty():
+                break
+        try:
+            row = await asyncio.wait_for(progress_queue.get(), timeout=0.10)
+        except asyncio.TimeoutError:
+            continue
+        await process_row(row)
+
+    scan_results = await scan_task
+    for row in scan_results:
+        if str(row.get("ip") or "") not in observed_by_ip:
+            await process_row(row)
+
     hits = _transport_hits(scan_results)
     scan_elapsed = round((time.perf_counter() - scan_started) * 1000.0, 1)
+    cancelled = (
+        cancel_event is not None and bool(cancel_event.is_set())
+        and len(scan_results) < candidate_count
+    )
 
     events: list[str] = []
     if priority_ips:
@@ -346,7 +483,7 @@ async def discover(extra_subnets: list[str] | None = None, port: int = 80,
         candidate_details = []
         for ip in priority_ips:
             row = by_ip.get(ip, {})
-            status = str(row.get("status") or "missing")
+            status = str(row.get("status") or ("cancelled" if cancelled else "missing"))
             elapsed = row.get("elapsed_ms")
             shown = f"{elapsed} ms" if elapsed is not None else "no timing"
             candidate_details.append(f"{ip}={status} ({shown})")
@@ -371,22 +508,30 @@ async def discover(extra_subnets: list[str] | None = None, port: int = 80,
     hit_ips = {str(row.get("ip") or "") for row in hits}
     cached_verified = sum(1 for ip in priority_ips if ip in hit_ips)
     elapsed = round((time.perf_counter() - started) * 1000.0, 1)
+    first_text = f"; first verified {first_verified_ms} ms" if first_verified_ms is not None else ""
+    cancel_text = "; cancelled after verified results" if cancelled else ""
     events.insert(
         0,
-        f"Discovery scan: {len(all_candidates)} candidates, "
-        f"{len(hits)} Ultimate responses, {len(devices)} devices "
-        f"({elapsed} ms; one prioritised pass {scan_elapsed} ms; "
-        f"persisted {len(priority_ips)} candidates/{cached_verified} verified; "
-        f"outcomes {_counts_text(scan_results)})",
+        f"Discovery scan: {candidate_count} candidates, "
+        f"{len(scan_results)} checked, {len(hits)} Ultimate responses, "
+        f"{len(devices)} devices ({elapsed} ms; one prioritised pass "
+        f"{scan_elapsed} ms{first_text}; persisted {len(priority_ips)} "
+        f"candidates/{cached_verified} verified; outcomes "
+        f"{_counts_text(scan_results)}{cancel_text})",
     )
     result = {
         "subnets": [str(network) for network in networks],
         "devices": devices,
-        "candidate_count": len(all_candidates),
+        "candidate_count": candidate_count,
+        "checked_count": len(scan_results),
+        "remaining_count": max(0, candidate_count - len(scan_results)),
         "verified_count": len(hits),
         "cached_candidate_count": len(priority_ips),
         "cached_verified_count": cached_verified,
-        "complete": True,
+        "time_to_first_verified_ms": first_verified_ms,
+        "phase": "cancelled" if cancelled else "complete",
+        "complete": not cancelled,
+        "cancelled": cancelled,
         "elapsed_ms": elapsed,
         "diagnostics": events,
     }

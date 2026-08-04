@@ -239,14 +239,15 @@ DEFAULT_CONFIG = {
     # Auto-advance fallback when a tune's length is unknown (seconds; 0=off)
     "sid_default_secs": 180,
     # Additional wait after a matched HVSC Songlengths duration before the
-    # next Jukebox tune is launched. This preserves short audible tails/fades
-    # without changing the duration sent to the Ultimate's native SID player.
+    # next Jukebox tune is launched when browser fade is disabled. This
+    # preserves a short audible tail without changing the duration sent to the
+    # Ultimate's native SID player.
     "sid_jukebox_end_grace_secs": 0.5,
-    # Optional browser-stream fade after a matched Songlengths duration. The
-    # Ultimate's selected subtune is extended by the same amount so streamed
-    # audio remains available for the fade. This changes neither HDMI nor
+    # Optional browser-stream fade ending at the matched Songlengths endpoint.
+    # The fade begins this many seconds before the documented endpoint and the
+    # native .ssl duration remains unchanged. This changes neither HDMI nor
     # analogue output volume; those outputs continue at full level until the
-    # extended native endpoint.
+    # documented native endpoint.
     "sid_jukebox_browser_fade_enabled": True,
     "sid_jukebox_browser_fade_secs": 2.5,
     # Last-used local SID metadata source. This is only a convenience value;
@@ -396,6 +397,13 @@ DISCOVERY_LIVE_ADDRESSES: dict[str, set[str]] = {}
 # service and also blocks overlapping Finder scans.
 DISCOVERY_ACTIVE = threading.Event()
 DISCOVERY_SCAN_LOCK = threading.Lock()
+# RC50 progressive Finder job state. The scan transport remains one bounded
+# direct /v1/info request per address; this state only exposes completed rows
+# while the remaining subnet futures continue in the background.
+DISCOVERY_JOB_LOCK = threading.RLock()
+DISCOVERY_JOB: dict = {}
+DISCOVERY_JOB_TASK = None
+DISCOVERY_JOB_CANCEL = None
 
 
 VALID_BROWSER_STARTUP = {"edge_app", "system", "none"}
@@ -1196,7 +1204,7 @@ def _legacy_type(
         wait = float((result or {}).get("wait_seconds", 0.0))
         _diag_event(
             "info",
-            f"Legacy input delivered: origin={origin or 'unknown'} "
+            f"Legacy input socket-transmitted: origin={origin or 'unknown'} "
             f"bytes={len(payload)} codes=[{shown}] wait={wait:.3f}s",
         )
     return result
@@ -1311,8 +1319,10 @@ def _record_discovery_diagnostics(result: dict) -> None:
         _diag_event("info", str(message))
 
 
-async def _run_discovery(subnet: str = "", port: int = 80) -> dict:
-    if not DISCOVERY_SCAN_LOCK.acquire(blocking=False):
+async def _run_discovery(subnet: str = "", port: int = 80, *,
+                         progress_callback=None, cancel_event=None,
+                         lock_acquired: bool = False) -> dict:
+    if not lock_acquired and not DISCOVERY_SCAN_LOCK.acquire(blocking=False):
         raise HTTPException(409, "A device discovery scan is already running")
     DISCOVERY_ACTIVE.set()
     _health_set_activity("Finder", "scanning", subnet or "local subnets")
@@ -1324,7 +1334,8 @@ async def _run_discovery(subnet: str = "", port: int = 80) -> dict:
             active_identity, _record = _known_identity_for_host(old_host)
         result = await discovery.discover(
             extra, port, known_devices=_known_devices(), detector=LINK_DETECTOR,
-            candidate_ips=_discovery_candidate_ips())
+            candidate_ips=_discovery_candidate_ips(),
+            progress_callback=progress_callback, cancel_event=cancel_event)
         with LINK_STATE_LOCK:
             DISCOVERY_LIVE_ADDRESSES.clear()
             for device in result.get("devices", []):
@@ -1340,7 +1351,7 @@ async def _run_discovery(subnet: str = "", port: int = 80) -> dict:
         # If DHCP moved the currently selected device, retain the identity but
         # update the saved host to a verified address. The live backend is not
         # switched silently; the scanner's Use button remains the explicit action.
-        if active_identity:
+        if active_identity and not result.get("cancelled"):
             device = next((row for row in result.get("devices", [])
                            if row.get("identity") == active_identity), None)
             if device:
@@ -1350,8 +1361,12 @@ async def _run_discovery(subnet: str = "", port: int = 80) -> dict:
                     CFG["u64_host"] = preferred
                     _diag_event("info", f"Preferred address updated: {old_host or '(none)'} → {preferred}")
         save_config()
-        _health_set_activity("Finder", "complete",
-                             f"{len(result.get('devices', []))} device(s)")
+        if result.get("cancelled"):
+            _health_set_activity("Finder", "cancelled",
+                                 f"{len(result.get('devices', []))} verified device(s) retained")
+        else:
+            _health_set_activity("Finder", "complete",
+                                 f"{len(result.get('devices', []))} device(s)")
         _health_finish_activity("ok")
         return result
     except Exception as exc:
@@ -1360,6 +1375,133 @@ async def _run_discovery(subnet: str = "", port: int = 80) -> dict:
     finally:
         DISCOVERY_ACTIVE.clear()
         DISCOVERY_SCAN_LOCK.release()
+
+
+def _discovery_job_snapshot(job_id: str = "") -> dict:
+    with DISCOVERY_JOB_LOCK:
+        if not DISCOVERY_JOB:
+            raise HTTPException(404, "No Finder scan job is available")
+        current_id = str(DISCOVERY_JOB.get("job_id") or "")
+        if job_id and job_id != current_id:
+            raise HTTPException(404, "Finder scan job not found")
+        return copy.deepcopy(DISCOVERY_JOB)
+
+
+def _discovery_job_update(job_id: str, **changes) -> None:
+    with DISCOVERY_JOB_LOCK:
+        if str(DISCOVERY_JOB.get("job_id") or "") != job_id:
+            return
+        DISCOVERY_JOB.update(changes)
+        DISCOVERY_JOB["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+
+async def _discovery_job_runner(job_id: str, subnet: str, port: int,
+                                clear_first: bool, cancel_event: threading.Event) -> None:
+    global DISCOVERY_JOB_TASK
+    scan_started = False
+    try:
+        if clear_first:
+            _discovery_job_update(job_id, state="clearing", message="Clearing remembered devices…")
+            await run_in_threadpool(_clear_discovery_state)
+        if cancel_event.is_set():
+            _discovery_job_update(job_id, state="cancelled", message="Finder scan cancelled before it started")
+            return
+
+        async def publish(snapshot: dict) -> None:
+            state = "cancelling" if cancel_event.is_set() else "running"
+            message = "Stopping remaining probes…" if cancel_event.is_set() else "Scanning network…"
+            _discovery_job_update(job_id, state=state, result=copy.deepcopy(snapshot), message=message)
+
+        _discovery_job_update(job_id, state="running", message="Scanning network…")
+        scan_started = True
+        result = await _run_discovery(
+            subnet, port, progress_callback=publish,
+            cancel_event=cancel_event, lock_acquired=True)
+        state = "cancelled" if result.get("cancelled") else "complete"
+        message = (
+            "Finder scan cancelled; verified devices remain available."
+            if state == "cancelled" else "Finder scan complete."
+        )
+        _discovery_job_update(job_id, state=state, result=copy.deepcopy(result), message=message)
+    except Exception as exc:
+        _diag_event("error", f"Progressive Finder failed: {type(exc).__name__}: {exc}")
+        _discovery_job_update(job_id, state="error", error=str(exc), message="Finder scan failed.")
+    finally:
+        if not scan_started:
+            DISCOVERY_ACTIVE.clear()
+            try:
+                DISCOVERY_SCAN_LOCK.release()
+            except RuntimeError:
+                pass
+        with DISCOVERY_JOB_LOCK:
+            if str(DISCOVERY_JOB.get("job_id") or "") == job_id:
+                DISCOVERY_JOB["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        DISCOVERY_JOB_TASK = None
+
+
+def _start_discovery_job(subnet: str, port: int, *, clear_first: bool = False) -> dict:
+    global DISCOVERY_JOB, DISCOVERY_JOB_TASK, DISCOVERY_JOB_CANCEL
+    if not DISCOVERY_SCAN_LOCK.acquire(blocking=False):
+        raise HTTPException(409, "A device discovery scan is already running")
+    job_id = uuid.uuid4().hex
+    cancel_event = threading.Event()
+    now = datetime.now().isoformat(timespec="seconds")
+    with DISCOVERY_JOB_LOCK:
+        DISCOVERY_JOB = {
+            "job_id": job_id,
+            "state": "queued",
+            "message": "Finder scan queued.",
+            "subnet": subnet,
+            "port": int(port),
+            "clear_first": bool(clear_first),
+            "result": None,
+            "error": "",
+            "started_at": now,
+            "updated_at": now,
+            "finished_at": "",
+        }
+        DISCOVERY_JOB_CANCEL = cancel_event
+    try:
+        DISCOVERY_JOB_TASK = asyncio.create_task(
+            _discovery_job_runner(job_id, subnet, int(port), clear_first, cancel_event))
+    except Exception:
+        DISCOVERY_SCAN_LOCK.release()
+        raise
+    return _discovery_job_snapshot(job_id)
+
+
+@app.post("/api/discover/start")
+async def api_discover_start(subnet: str = Query(""), port: int = Query(80)):
+    """Start a progressive Finder scan and return its job identity."""
+    return _start_discovery_job(subnet, port)
+
+
+@app.post("/api/discover/clear/start")
+async def api_discover_clear_start(subnet: str = Query(""), port: int = Query(80)):
+    """Clear remembered devices, then start a progressive fresh scan."""
+    return _start_discovery_job(subnet, port, clear_first=True)
+
+
+@app.get("/api/discover/status")
+async def api_discover_status(job_id: str = Query("")):
+    """Return the latest progressive Finder snapshot."""
+    return _discovery_job_snapshot(job_id)
+
+
+@app.post("/api/discover/cancel")
+async def api_discover_cancel(job_id: str = Query("")):
+    """Request cancellation of queued Finder probes."""
+    snapshot = _discovery_job_snapshot(job_id)
+    if snapshot.get("state") in {"complete", "cancelled", "error"}:
+        return snapshot
+    with DISCOVERY_JOB_LOCK:
+        cancel_event = DISCOVERY_JOB_CANCEL
+    if cancel_event is not None:
+        cancel_event.set()
+    _discovery_job_update(
+        str(snapshot.get("job_id") or ""), state="cancelling",
+        message="Stopping remaining probes…")
+    return _discovery_job_snapshot(str(snapshot.get("job_id") or ""))
 
 
 @app.get("/api/discover")
@@ -3159,11 +3301,12 @@ _BASIC_GATE_POLL = 0.5
 _BASIC_GATE_TIMEOUT = 120.0
 _READMEM_SUPPORT: dict[str, bool] = {}
 
-# Hardware diagnostics showed that the CIA1-capable U64 could acknowledge
-# port-64 keyboard-buffer writes while discarding the first eight-byte LOAD
-# chunk. RC15 therefore uses one ordered matrix-input batch for the complete
-# command on CIA1 firmware and retains the proven one-shot buffer path only for
-# Legacy devices.
+# Hardware diagnostics showed that both CIA1-era and Legacy hardware can
+# acknowledge port-64 keyboard-buffer writes before the C64 has consumed the
+# previous bytes. CIA1 firmware therefore uses one ordered matrix-input batch.
+# Legacy Mount & Run uses bounded chunks and confirms the KERNAL keyboard
+# buffer count at $C6 has drained before sending the next chunk. Firmware
+# without machine:readmem uses a conservative character-at-a-time fallback.
 
 
 def _readmem_cache_key() -> str:
@@ -3231,6 +3374,163 @@ def standalone_basic_ready_status():
     }
 
 
+_LEGACY_BUFFER_ADDRESS = "00C6"
+_LEGACY_BUFFER_CHUNK = 8
+_LEGACY_BUFFER_POLL = 0.025
+_LEGACY_BUFFER_SETTLE = 0.100
+_LEGACY_BUFFER_TIMEOUT = 3.0
+_LEGACY_FALLBACK_CHAR_DELAY = 0.080
+
+
+def _read_legacy_keyboard_buffer_count() -> int | None:
+    """Return KERNAL keyboard-buffer count $C6.
+
+    ``None`` means machine:readmem is unsupported. ``-1`` represents a
+    transient read failure and is retried by the bounded drain waiter.
+    """
+    try:
+        data = rest.read_memory(_LEGACY_BUFFER_ADDRESS, 1)
+    except Exception:
+        return -1
+    if data is None:
+        return None
+    return int(data[0]) if data else -1
+
+
+def _wait_legacy_keyboard_buffer_empty(
+    stage: str,
+    *,
+    timeout: float = _LEGACY_BUFFER_TIMEOUT,
+    settle: float = 0.0,
+    reader=None,
+    sleeper=time.sleep,
+    clock=time.monotonic,
+) -> str:
+    """Wait for two consecutive $C6 == 0 samples.
+
+    Returns ``empty``, ``unsupported`` or ``timeout``. The initial settle
+    prevents a REST read from racing ahead of a just-transmitted command-socket
+    packet, while two empty samples avoid treating a single transient zero as
+    confirmed consumption.
+    """
+    reader = reader or _read_legacy_keyboard_buffer_count
+    started = clock()
+    last_value: int | None = -1
+    empty_samples = 0
+    if settle > 0:
+        sleeper(max(0.0, float(settle)))
+    while True:
+        value = reader()
+        last_value = value
+        if value is None:
+            _diag_event(
+                "info",
+                f"Legacy Mount & Run buffer '{stage}': machine:readmem unsupported",
+            )
+            return "unsupported"
+        if value == 0:
+            empty_samples += 1
+            if empty_samples >= 2:
+                elapsed = max(0.0, clock() - started)
+                _diag_event(
+                    "info",
+                    f"Legacy Mount & Run buffer '{stage}': empty after {elapsed:.3f}s",
+                )
+                return "empty"
+        elif value is not None and value > 0:
+            empty_samples = 0
+        if clock() - started >= max(0.0, float(timeout)):
+            shown = "read-error" if last_value == -1 else str(last_value)
+            _diag_event(
+                "warning",
+                f"Legacy Mount & Run buffer '{stage}': drain timeout "
+                f"after {max(0.0, clock() - started):.3f}s (last $C6 read: {shown})",
+            )
+            return "timeout"
+        sleeper(max(0.001, float(_LEGACY_BUFFER_POLL)))
+
+
+def _type_mount_run_legacy(data: bytes, *, command_name: str) -> tuple[bool, str]:
+    """Deliver a Legacy Mount & Run command without overwriting $0277.
+
+    On readmem-capable firmware, each bounded command-socket write is followed
+    by proof that the KERNAL keyboard buffer has drained before the next bytes
+    are sent. If readmem is unavailable before transmission, use a conservative
+    one-character path. Once any bytes have been transmitted, an ambiguous
+    drain never triggers a resend or fallback.
+    """
+    payload = bytes(data)
+    if not payload:
+        return False, f"{command_name} command is empty"
+    label = str(command_name or "command").upper()
+    origin = f"mount-run-{label.casefold()}"
+
+    with INPUT_IO_LOCK:
+        initial = _wait_legacy_keyboard_buffer_empty(f"{label} preflight")
+        if initial == "unsupported":
+            _legacy_type(
+                payload,
+                chunk=1,
+                delay=_LEGACY_FALLBACK_CHAR_DELAY,
+                origin=origin,
+                log_codes=False,
+            )
+            _diag_event(
+                "info",
+                f"Mount & Run {label} delivery: Legacy KERNAL buffer "
+                f"character fallback socket-transmitted {len(payload)} bytes "
+                "(consumption unconfirmed: machine:readmem unsupported)",
+            )
+            return True, "Legacy KERNAL buffer character fallback"
+        if initial != "empty":
+            return False, f"Legacy {label} keyboard buffer was not empty — command not sent"
+
+        chunks = [
+            payload[offset:offset + _LEGACY_BUFFER_CHUNK]
+            for offset in range(0, len(payload), _LEGACY_BUFFER_CHUNK)
+        ]
+        for index, part in enumerate(chunks, start=1):
+            _legacy_type(
+                part,
+                chunk=max(1, len(part)),
+                delay=0.0,
+                origin=origin,
+                log_codes=False,
+            )
+            shown = ",".join(str(value) for value in part)
+            _diag_event(
+                "info",
+                f"Legacy Mount & Run {label} chunk {index}/{len(chunks)} "
+                f"socket-transmitted: bytes={len(part)} codes=[{shown}]",
+            )
+            drained = _wait_legacy_keyboard_buffer_empty(
+                f"{label} chunk {index}/{len(chunks)}",
+                settle=_LEGACY_BUFFER_SETTLE,
+            )
+            if drained != "empty":
+                reason = (
+                    "machine:readmem became unavailable"
+                    if drained == "unsupported"
+                    else "keyboard buffer did not drain"
+                )
+                return False, (
+                    f"Legacy {label} chunk {index}/{len(chunks)} was transmitted but "
+                    f"consumption could not be confirmed ({reason}) — remaining bytes not sent"
+                )
+            _diag_event(
+                "info",
+                f"Legacy Mount & Run {label} chunk {index}/{len(chunks)} "
+                "consumption confirmed ($C6 drained)",
+            )
+
+    _diag_event(
+        "info",
+        f"Mount & Run {label} delivery: Legacy KERNAL buffer "
+        f"({len(chunks)} drain-confirmed chunk{'s' if len(chunks) != 1 else ''})",
+    )
+    return True, "Legacy KERNAL buffer drain-confirmed"
+
+
 _MOUNT_RUN_MATRIX_CHAR_INPUTS = {
     '"': ["left_shift", "2"],
     "*": ["star"],
@@ -3267,9 +3567,10 @@ def _type_mount_run_load(data: bytes) -> tuple[bool, str]:
     """Deliver the complete Mount & Run LOAD line on the proven device path.
 
     CIA1-capable Ultimate 64 firmware uses one ordered matrix-input batch for
-    the entire command.  Legacy-only C64 Ultimate firmware retains the exact
-    established one-shot KERNAL-buffer path that did not reproduce the fault.
-    An ambiguous matrix failure is never followed by a Legacy resend.
+    the entire command. Legacy-only C64 Ultimate firmware uses drain-confirmed
+    bounded KERNAL-buffer chunks, with a character fallback only when readmem
+    is known to be unsupported before transmission. An ambiguous failure is
+    never followed by a second transport or resend.
     """
     payload = bytes(data)
     if not payload:
@@ -3293,17 +3594,7 @@ def _type_mount_run_load(data: bytes) -> tuple[bool, str]:
         )
         return True, "CIA1 matrix"
 
-    _legacy_type(
-        payload,
-        origin="mount-run-load",
-        log_codes=True,
-    )
-    _diag_event(
-        "info",
-        "Mount & Run LOAD delivery: Legacy KERNAL buffer "
-        "(established one-shot path retained)",
-    )
-    return True, "Legacy KERNAL buffer"
+    return _type_mount_run_legacy(payload, command_name="LOAD")
 
 
 def _basic_ready_gate(stage: str, *, timeout: float = _BASIC_GATE_TIMEOUT,
@@ -3385,9 +3676,9 @@ def _dispatch_run_after_gate() -> tuple[bool, str]:
     """Deliver RUN after the load gate using the best proven transport.
 
     CIA1-capable U64 sessions use matrix key taps for both LOAD and RUN. Legacy
-    C64U sessions keep the established command-buffer delivery. A failed matrix
-    request is not followed by a second transport, avoiding a late duplicate
-    command after an ambiguous timeout.
+    C64U sessions use the same drain-confirmed KERNAL-buffer delivery for both
+    commands. A failed or ambiguous request is not followed by another
+    transport, avoiding a late duplicate command.
     """
     status = _input_status(rest)
     if status.get("available"):
@@ -3401,13 +3692,7 @@ def _dispatch_run_after_gate() -> tuple[bool, str]:
         _diag_event("info", "Mount & Run RUN delivery: CIA1 matrix")
         return True, "CIA1 matrix"
 
-    _legacy_type(
-        b"RUN\r",
-        origin="mount-run-run",
-        log_codes=True,
-    )
-    _diag_event("info", "Mount & Run RUN delivery: Legacy KERNAL buffer")
-    return True, "Legacy KERNAL buffer"
+    return _type_mount_run_legacy(b"RUN\r", command_name="RUN")
 
 
 def _mount_and_boot(drive: str, mode: str, *, device_path: str = None,
@@ -6850,10 +7135,15 @@ def _juke_state():
         "enabled": bool(CFG.get("sid_jukebox_browser_fade_enabled", True)),
         "duration_secs": _juke_browser_fade_config_seconds(),
         "browser_only": True,
-        "note": ("Fade affects audio heard or recorded through this browser only; "
-                 "Ultimate HDMI and analogue output remain at full volume until "
-                 "the extended native endpoint."),
+        "note": ("Fade begins before the documented Songlengths endpoint and "
+                 "affects audio heard or recorded through this browser only; "
+                 "Ultimate HDMI and analogue output remain at full volume."),
     }
+    playback_elapsed_secs = 0.0
+    if JUKE.get("playing") and float(JUKE.get("playback_started_monotonic") or 0) > 0:
+        playback_elapsed_secs = max(
+            0.0, time.monotonic() - float(JUKE["playback_started_monotonic"])
+        )
     fade_active = {"enabled": False, "playback_id": int(JUKE.get("playback_id") or 0)}
     if JUKE.get("playing") and float(JUKE.get("playback_started_monotonic") or 0) > 0:
         fade_secs = float(JUKE.get("playback_fade_secs") or 0)
@@ -6861,16 +7151,18 @@ def _juke_state():
         length = float(JUKE.get("playback_length_secs") or 0)
         if fade_secs > 0 and source == "songlengths" and length > 0:
             elapsed = max(0.0, time.monotonic() - float(JUKE["playback_started_monotonic"]))
-            fade_end = length + fade_secs
+            fade_start = max(0.0, length - fade_secs)
+            fade_end = length
             fade_active = {
                 "enabled": True,
                 "playback_id": int(JUKE.get("playback_id") or 0),
                 "duration_secs": round(fade_secs, 1),
-                "starts_in_secs": round(length - elapsed, 3),
+                "starts_in_secs": round(fade_start - elapsed, 3),
                 "remaining_secs": round(max(0.0, fade_end - elapsed), 3),
                 "auto_advance_remaining_secs": round(max(0.0,
                     float(JUKE.get("playback_auto_advance_secs") or 0) - elapsed), 3),
-                "native_extension_secs": round(fade_secs, 1),
+                "native_extension_secs": 0.0,
+                "completes_at_documented_endpoint": True,
             }
     return {"items": [{"label": i["label"], "meta": i["meta"],
                        "path": i.get("path", ""),
@@ -6893,6 +7185,7 @@ def _juke_state():
                         "needs_update": bool(sidflow.get("needs_update"))},
             "songlengths_loaded": len(SONGLENGTHS),
             "playback_id": int(JUKE.get("playback_id") or 0),
+            "playback_elapsed_secs": round(playback_elapsed_secs, 3),
             "queue_revision": int(JUKE.get("queue_revision") or 0),
             "browser_fade": fade_config,
             "active_browser_fade": fade_active}
@@ -6983,18 +7276,17 @@ def _juke_browser_fade_seconds() -> float:
 def _juke_auto_advance_plan(it: dict, song: int) -> tuple[float, float, float, str]:
     """Return base length, post-length allowance, timer delay and source.
 
-    Matched Songlengths entries use the browser fade duration as the complete
-    post-length allowance while fade is enabled; the separate end-grace value
-    applies only when fade is disabled. Unknown tunes retain the established
-    one-second fallback allowance so sid_default_secs behaviour is unchanged.
+    With a matched Songlengths entry, browser fade is a lead-in to the
+    documented endpoint rather than extra playback time: it begins before the
+    endpoint and auto-advance occurs at the documented length. The separate
+    end-grace value applies only when fade is disabled. Unknown tunes retain
+    the established one-second fallback allowance so sid_default_secs
+    behaviour is unchanged.
     """
     length = _juke_length(it, song)
     if length is not None:
-        # The browser fade starts at the documented endpoint and replaces the
-        # separate end-grace allowance. Combining both settings could leave a
-        # silent tail after the fade or reopen a transition window.
-        fade = _juke_browser_fade_seconds()
-        grace = fade if fade > 0 else _juke_end_grace_seconds()
+        fade = min(_juke_browser_fade_seconds(), max(0.0, float(length)))
+        grace = 0.0 if fade > 0 else _juke_end_grace_seconds()
         source = "songlengths"
     else:
         length = float(CFG.get("sid_default_secs", 180) or 0)
@@ -7496,18 +7788,51 @@ def _juke_play(index: int, song: int = 0, *, expected_generation: int | None = N
         )
         song = song or int(it.get("song") or it["meta"].get("start_song", 1) or 1)
         length, grace, auto_delay, duration_source = _juke_auto_advance_plan(it, song)
-        fade_secs = (_juke_browser_fade_seconds()
+        fade_secs = (min(_juke_browser_fade_seconds(), max(0.0, length))
                      if duration_source == "songlengths" else 0.0)
+        # Capture the native SID launch clock inside the cartridge-safe action.
+        # The Ultimate starts the SID runner during this request, while
+        # _run_cart_safe() may still spend several seconds restoring a parked
+        # freezer cartridge afterwards.  Recording the clock only after the
+        # wrapper returned shifted browser fade and auto-advance late by that
+        # restoration time on real hardware.
+        launch_clock: dict[str, float] = {}
+
+        def launch_sid():
+            launch_clock["request_started"] = time.monotonic()
+            try:
+                return _post_sid_upload(
+                    it["label"], it["data"], songnr=song
+                )
+            finally:
+                # A successful runner response is the tightest available
+                # local approximation of native playback start: the complete
+                # SID has reached the Ultimate and the runner has accepted it,
+                # but cartridge restoration has not yet begun.
+                launch_clock["request_completed"] = time.monotonic()
+
         try:
-            _run_cart_safe(lambda: _post_sid_upload(
-                it["label"], it["data"], songnr=song,
-                songlength_extension_secs=fade_secs
-            ), preserve_jukebox=True, timings=play_timing)
+            _run_cart_safe(launch_sid, preserve_jukebox=True, timings=play_timing)
         except (UltimateError, httpx.HTTPError) as e:
             err(e)
 
-        playback_started = time.monotonic()
-        stage = playback_started
+        playback_started = float(
+            launch_clock.get("request_completed")
+            or launch_clock.get("request_started")
+            or time.monotonic()
+        )
+        state_commit_started = time.monotonic()
+        launch_to_commit = max(0.0, state_commit_started - playback_started)
+        request_started = float(launch_clock.get("request_started") or playback_started)
+        request_completed = float(launch_clock.get("request_completed") or playback_started)
+        play_timing["sid_launch_request_ms"] = round(
+            max(0.0, request_completed - request_started) * 1000.0, 1
+        )
+        play_timing["launch_to_state_commit_ms"] = round(
+            launch_to_commit * 1000.0, 1
+        )
+        play_timing["playback_clock_basis"] = "sid_request_complete"
+        stage = state_commit_started
         with JUKE_TIMER_LOCK:
             if (expected_generation is not None and
                     int(JUKE.get("generation", 0)) != int(expected_generation)):
@@ -7535,10 +7860,18 @@ def _juke_play(index: int, song: int = 0, *, expected_generation: int | None = N
                 "end_grace_secs": grace,
                 "auto_advance_secs": auto_delay,
                 "browser_fade_secs": fade_secs,
-                "native_length_extension_secs": fade_secs,
+                "native_length_extension_secs": 0.0,
             })
             if auto_delay > 0:
-                t = _threading.Timer(auto_delay, _juke_auto_next,
+                # The timer is armed after cartridge restoration and state
+                # commit, so subtract time already consumed since native SID
+                # launch.  This keeps queue advance at the same documented
+                # endpoint used by the browser fade.
+                timer_delay = max(
+                    0.0, auto_delay - max(0.0, time.monotonic() - playback_started)
+                )
+                play_timing["auto_advance_timer_secs"] = round(timer_delay, 3)
+                t = _threading.Timer(timer_delay, _juke_auto_next,
                                      args=(generation,))
                 t.daemon = True
                 JUKE["timer"] = t
@@ -7559,6 +7892,7 @@ def _juke_play(index: int, song: int = 0, *, expected_generation: int | None = N
                     "duration_source", "song_length_secs",
                     "end_grace_secs", "auto_advance_secs",
                     "browser_fade_secs", "native_length_extension_secs",
+                    "auto_advance_timer_secs", "playback_clock_basis",
                 }
             ),
         )
@@ -7569,6 +7903,12 @@ def _juke_play(index: int, song: int = 0, *, expected_generation: int | None = N
 
 
 def _juke_next_index():
+    """Choose the next queued item without consulting item provenance.
+
+    Search, Favourites, saved queues, manual additions, More Like This and
+    Radio all feed the same ordered queue. Source metadata may be retained for
+    display and diagnostics, but it must never suppress normal auto-advance.
+    """
     n = len(JUKE["items"])
     if n < 2:
         return JUKE["index"]
@@ -7681,7 +8021,7 @@ def playlists_load_one(payload: dict = Body(...)):
     _juke_reset_similarity_session()
     JUKE.update({"items": items, "index": -1, "playing": False, "song": 0,
                  "folder": name, "loading": False, "source": "saved play queue",
-                 "recommendation_seed_label": ""})
+                 "recommendation_seed_label": "", "stop_after_current": False})
     out = _juke_state()
     out["skipped"] = 0
     return out
@@ -7721,7 +8061,7 @@ def juke_play_path(payload: dict = Body(...)):
                  "index": -1, "playing": False, "song": 0,
                  "folder": path.rsplit("/", 1)[0] or "/",
                  "loading": False, "source": "Ultimate storage",
-                 "recommendation_seed_label": ""})
+                 "recommendation_seed_label": "", "stop_after_current": False})
     try:
         _index_store().put_sid_metadata(path, len(data), "", meta,
                                         source="played SID")
@@ -7869,7 +8209,8 @@ async def juke_upload(files: list[UploadFile] = File(...)):
     _juke_reset_similarity_session()
     JUKE.update({"items": [], "index": -1, "playing": False, "song": 0,
                  "folder": "(local files)", "loading": False,
-                 "source": "local upload", "recommendation_seed_label": ""})
+                 "source": "local upload", "recommendation_seed_label": "",
+                 "stop_after_current": False})
     skipped, total = 0, 0
     for f in files:
         try:
@@ -8568,7 +8909,7 @@ def _juke_install_lazy_folder(folder: str, rows: list[dict], selected_path: str,
     JUKE.update({"items": items, "index": current_index,
                  "playing": bool(JUKE.get("playing") and current_index >= 0),
                  "folder": folder, "loading": False, "source": source,
-                 "recommendation_seed_label": ""})
+                 "recommendation_seed_label": "", "stop_after_current": False})
 
 
 @app.post("/api/juke/random")

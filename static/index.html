@@ -3,47 +3,136 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>u64deck</title>
+<title>u64deck v1.9.0 · Release Candidate 51</title>
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
 
-<header>
-  <div class="header-status">
+<header class="app-header">
+  <div class="header-brand-area">
     <div class="header-mainline">
-      <div class="brand"><span class="brand-name"><span class="brand-stars">****</span> u64deck <span class="brand-stars">****</span></span> <span class="brand-version" id="ver"></span></div>
-      <div id="devinfo">Connecting…</div>
+      <div class="brand">
+        <img class="brand-logo" src="/static/u64deck-logo.png" alt="u64deck">
+        <span class="brand-version" id="ver"></span>
+      </div>
     </div>
-    <div class="ready-line">READY.<span class="cursor"></span></div>
+    <div class="ready-line" aria-label="Ready">READY.<span class="cursor"></span></div>
+    <div id="devinfo" hidden></div>
   </div>
-  <div class="row header-actions">
-    <button onclick="openDiscover()">Select Ultimate…</button>
-    <button id="helpBtn" onclick="openHelp()">Help</button>
-    <button id="btnAppExit" class="danger tip" style="display:none" data-tip="Stop the local u64deck server and close its dedicated Edge app window. The Ultimate keeps running." onclick="exitU64deck()">Exit u64deck</button>
-  </div>
-  <div class="machine">
-    <button class="tip" data-tip="Reset the C64 core. The Ultimate device and network services remain running." onclick="machine('reset')">Reset C64</button>
-    <button class="tip" data-tip="Restart the complete Ultimate device. Streams and network control disconnect briefly." onclick="machine('reboot')">Reboot Ultimate</button>
-    <button onclick="machine('pause')">Pause C64</button>
-    <button onclick="machine('resume')">Resume C64</button>
-    <button onclick="machine('menu_button')" title="Open the Ultimate menu on the C64 display">Ultimate Menu</button>
-    <button class="danger" onclick="confirmPowerOff()">Power Off Ultimate</button>
+  <div class="header-command-area">
+    <div class="row header-actions">
+      <button onclick="openDiscover()">Select Ultimate…</button>
+      <button id="helpBtn" onclick="openHelp()">Help</button>
+    </div>
+    <div class="machine">
+      <button class="tip" data-tip="Reset the C64 core. The Ultimate device and network services remain running." onclick="machine('reset')">Reset C64</button>
+      <button class="tip" data-tip="Restart the complete Ultimate device. Streams and network control disconnect briefly." onclick="machine('reboot')">Reboot Ultimate</button>
+      <button onclick="machine('pause')">Pause C64</button>
+      <button onclick="machine('resume')">Resume C64</button>
+      <button onclick="machine('menu_button')" title="Open the Ultimate menu on the C64 display">Ultimate Menu</button>
+      <button id="btnAppExit" class="danger tip" style="display:none" data-tip="Stop the local u64deck server and close its dedicated Edge app window. The Ultimate keeps running." onclick="exitU64deck()">Exit u64deck</button>
+      <button class="danger" onclick="confirmPowerOff()">Power Off Ultimate</button>
+    </div>
   </div>
 </header>
 
 <main>
-<nav>
-  <button data-tab="screen" class="active" onclick="tab('screen')">SCREEN</button>
-  <button data-tab="home" onclick="tab('home')">FAVOURITES</button>
-  <button data-tab="disks" onclick="tab('disks')">STORAGE</button>
-  <button data-tab="health" onclick="tab('health')">HEALTH</button>
-  <button data-tab="settings" onclick="tab('settings')">SETTINGS</button>
-  <button data-tab="asm64" onclick="tab('asm64')">ASSEMBLY64</button>
-  <button data-tab="sid" onclick="tab('sid')">SID JUKEBOX</button>
+<nav class="app-nav" aria-label="Primary navigation">
+  <button data-tab="dashboard" class="active" onclick="tab('dashboard')"><span class="nav-icon">⌂</span>DASHBOARD</button>
+  <button data-tab="screen" onclick="tab('screen')"><span class="nav-icon">▣</span>SCREEN MIRROR</button>
+  <button data-tab="home" onclick="tab('home')"><span class="nav-icon">♥</span>FAVOURITES</button>
+  <button data-tab="disks" onclick="tab('disks')"><span class="nav-icon">▤</span>STORAGE</button>
+  <button data-tab="health" onclick="tab('health')"><span class="nav-icon">◉</span>HEALTH</button>
+  <button data-tab="settings" onclick="tab('settings')"><span class="nav-icon">⚙</span>SETTINGS</button>
+  <button data-tab="asm64" onclick="tab('asm64')"><span class="nav-icon">A</span>ASSEMBLY64</button>
+  <button data-tab="sid" onclick="tab('sid')"><span class="nav-icon">♪</span>SID JUKEBOX</button>
 </nav>
 
+<!-- ============ DASHBOARD ============ -->
+<section id="tab-dashboard" class="active dashboard-page">
+  <div class="dashboard-intro">
+    <div class="dashboard-heading-copy">
+      <div class="eyebrow">U64DECK UI NEXT</div>
+      <h1>Dashboard</h1>
+      <p>Your Ultimate workspace at a glance.</p>
+    </div>
+  </div>
+  <div class="dashboard-grid">
+    <article class="dashboard-card device-card">
+      <div class="dashboard-card-head">
+        <div class="dashboard-card-label"><span class="card-icon">◆</span>DEVICE</div>
+        <span id="dashDeviceBadge" class="connection-badge offline" role="status" aria-live="polite" aria-atomic="true"><span class="status-dot"></span>Offline</span>
+      </div>
+      <div class="dashboard-card-body">
+        <h2 id="dashDeviceProduct">Ultimate not connected</h2>
+        <div id="dashDeviceHostname" class="dashboard-subtitle">Select a verified Ultimate to begin.</div>
+        <dl class="device-facts">
+          <div><dt>IP address</dt><dd id="dashDeviceIp">—</dd></div>
+          <div><dt>Interface</dt><dd id="dashDeviceInterface">—</dd></div>
+          <div><dt>Firmware</dt><dd id="dashDeviceFirmware">—</dd></div>
+          <div><dt>Core</dt><dd id="dashDeviceCore">—</dd></div>
+          <div><dt>Input</dt><dd id="dashDeviceInput">—</dd></div>
+          <div><dt>REST</dt><dd id="dashDeviceRest">Waiting</dd></div>
+        </dl>
+      </div>
+      <button class="card-action" onclick="openDiscover()">Select Ultimate…</button>
+    </article>
+    <article class="dashboard-card jukebox-card">
+      <div class="dashboard-card-head"><div class="dashboard-card-label"><span class="card-icon">♪</span>SID JUKEBOX</div></div>
+      <div class="dashboard-card-body dashboard-media-summary">
+        <div id="dashArtwork" class="dash-artwork" aria-hidden="true"></div>
+        <div class="dashboard-media-copy">
+          <h2 id="dashJukeTitle">Nothing playing</h2>
+          <div id="dashJukeMeta" class="dashboard-subtitle">Browse your SID collection or load a saved queue.</div>
+          <div id="dashJukeState" class="dashboard-inline-status">Stopped</div>
+        </div>
+      </div>
+      <button class="card-action" onclick="tab('sid')">Open SID Jukebox</button>
+    </article>
+    <article class="dashboard-card screen-card">
+      <div class="dashboard-card-head"><div class="dashboard-card-label"><span class="card-icon">▣</span>SCREEN MIRROR</div></div>
+      <div class="dashboard-card-body">
+        <h2 id="dashScreenTitle">Screen mirror ready</h2>
+        <div id="dashScreenMeta" class="dashboard-subtitle">Live VIC video, audio, fullscreen and recording.</div>
+        <div class="dashboard-status-row">
+          <span id="dashVideoState" class="mini-state">Video off</span>
+          <span id="dashAudioState" class="mini-state">Audio off</span>
+          <span id="dashStreamRoute" class="mini-state">Direct</span>
+        </div>
+      </div>
+      <button class="card-action" onclick="tab('screen')">Open Screen Mirror</button>
+    </article>
+    <article class="dashboard-card storage-card">
+      <div class="dashboard-card-head"><div class="dashboard-card-label"><span class="card-icon">▤</span>STORAGE</div></div>
+      <div class="dashboard-card-body">
+        <div class="drive-card-row"><span class="drive-card-label">Drive A</span><span id="dashDriveAName" class="drive-card-name">No disk</span><span id="dashDriveAMode" class="mount-badge" hidden></span></div>
+        <div class="drive-card-row"><span class="drive-card-label">Drive B</span><span id="dashDriveBName" class="drive-card-name">Off</span><span id="dashDriveBMode" class="mount-badge" hidden></span></div>
+        <div class="dashboard-subtitle">Browse, inspect, mount and run device content.</div>
+      </div>
+      <button class="card-action" onclick="tab('disks')">Browse Storage</button>
+    </article>
+    <article class="dashboard-card favourites-card">
+      <div class="dashboard-card-head"><div class="dashboard-card-label"><span class="card-icon">♥</span>FAVOURITES</div></div>
+      <div class="dashboard-card-body">
+        <h2 id="dashFavTitle">Your shortcuts</h2>
+        <div id="dashFavMeta" class="dashboard-subtitle">Star storage items, SIDs and Assembly64 releases for quick access.</div>
+      </div>
+      <button class="card-action" onclick="tab('home')">Open Favourites</button>
+    </article>
+    <article class="dashboard-card health-card-dashboard">
+      <div class="dashboard-card-head"><div class="dashboard-card-label"><span class="card-icon">◉</span>HEALTH</div></div>
+      <div class="dashboard-card-body">
+        <h2 id="dashHealthTitle">Local diagnostics ready</h2>
+        <div id="dashHealthMeta" class="dashboard-subtitle">Streams, REST activity, browser status and recent events.</div>
+        <span id="dashHealthBadge" class="mini-state">Waiting</span>
+      </div>
+      <button class="card-action" onclick="tab('health')">View Health</button>
+    </article>
+  </div>
+</section>
+
 <!-- ============ SCREEN ============ -->
-<section id="tab-screen" class="active">
+<section id="tab-screen">
   <button id="screenDriveSummary" class="drive-summary-strip" onclick="jumpToMountedDrives()" title="Open Mounted Drives in Storage">
     <span class="drive-summary-title">MOUNTED DRIVES</span>
     <span class="drive-summary-content">Checking Drive A and Drive B…</span>
@@ -104,7 +193,7 @@
             <select id="qScale" onchange="scaleChanged()">
               <option value="2">2×</option>
               <option value="3">3×</option>
-              <option value="fit">Fit width</option>
+              <option value="fit" selected>Fit pane</option>
             </select>
           </label>
           <label class="hint">Stream route
@@ -190,6 +279,16 @@
         </div>
       </div>
     </div>
+  </div>
+  <div class="screen-status-bar" aria-label="Connection and local health summary">
+    <span class="screen-status-device"><span class="status-dot"></span><strong id="screenStatusDevice">Ultimate</strong></span>
+    <span id="screenStatusConnection">Offline</span>
+    <span id="screenStatusIp">—</span>
+    <span class="screen-status-spacer"></span>
+    <span>REST: <b id="screenStatusRest">—</b></span>
+    <span>Uptime: <b id="screenStatusUptime">—</b></span>
+    <span>CPU: <b id="screenStatusCpu">—</b></span>
+    <span>RAM: <b id="screenStatusRam">—</b></span>
   </div>
 </section>
 
@@ -674,6 +773,25 @@
 
 <!-- ============ SID JUKEBOX ============ -->
 <section id="tab-sid">
+  <div class="sid-player-hero panel" id="jkHero">
+    <div id="jkArtwork" class="sid-artwork" role="img" aria-label="Generated SID artwork"></div>
+    <div class="sid-hero-main">
+      <div class="eyebrow">NOW PLAYING</div>
+      <h1 id="jkHeroTitle">Nothing playing</h1>
+      <div id="jkHeroMeta" class="sid-hero-meta">Choose a SID, folder or saved play queue.</div>
+      <div class="sid-progress" aria-label="Playback progress"><div id="jkHeroProgress" class="sid-progress-fill"></div></div>
+      <div class="sid-time-row"><span id="jkHeroElapsed">0:00</span><span id="jkHeroDuration">—</span></div>
+      <div class="sid-hero-controls">
+        <button class="transport-button" onclick="jk('prev')" title="Previous tune">⏮</button>
+        <button class="transport-button primary hero-play" onclick="jkPlayCurrent()" title="Play current tune">▶</button>
+        <button class="transport-button" onclick="jkStop()" title="Stop SID playback">■</button>
+        <button class="transport-button" onclick="jk('next')" title="Next tune">⏭</button>
+        <button class="mini" onclick="jkMoreLike()">♪ More like this</button>
+      </div>
+      <div id="jkHeroBadges" class="sid-hero-badges"></div>
+    </div>
+    <button id="jkArtworkExpand" class="artwork-expand" type="button" onclick="toggleArtworkExpanded()" aria-expanded="false" title="Expand generated artwork">⤢</button>
+  </div>
   <div class="panel sid-jukebox-controls">
     <h2>SID JUKEBOX</h2>
     <div class="row" style="flex-wrap:wrap;gap:6px">
@@ -701,7 +819,15 @@
         title="Filter by an exact four-digit year extracted from SID release metadata"
         oninput="jkSearchFilterChanged()" onkeydown="if(event.key==='Enter')jkSearchGo()">
       <button class="mini" onclick="jkSearchGo()">Search</button>
-      <input type="file" id="jkLocal" accept=".sid" multiple style="min-width:180px">
+      <span class="jk-local-picker">
+        <input type="file" id="jkLocal" accept=".sid" multiple hidden
+          onchange="jkLocalSelectionChanged()">
+        <button type="button" class="jk-file-button" onclick="$('#jkLocal').click()"
+          aria-controls="jkLocal" aria-describedby="jkLocalStatus"
+          title="Choose one or more local SID files">Choose SID files</button>
+        <span id="jkLocalStatus" class="jk-file-status" aria-live="polite"
+          title="No files selected">No files selected</span>
+      </span>
       <button onclick="jukeLocal()">Load Local SIDs</button>
     </div>
     <div id="jkSearchOut" style="display:none;margin-top:8px;padding:6px;border:1px solid var(--line);border-radius:4px">
@@ -759,15 +885,15 @@
         title="Add or remove the currently playing SID from Favourites">☆</button>
       <button id="jkMoreNow" class="mini" style="display:none" onclick="jkMoreLike()"
         title="Insert similar SIDFlow matches after the current tune">♪ More like this</button>
-      <label class="hint"><input type="checkbox" id="jkShuffle" onchange="jkShuffleSet()"> Shuffle</label>
-      <label class="hint sidflow-radio"><input type="checkbox" id="jkRadio" onchange="jkRadioSet()"> Radio</label>
+      <label class="hint sid-toggle"><input type="checkbox" id="jkShuffle" onchange="jkShuffleSet()"> Shuffle</label>
+      <label class="hint sid-toggle"><input type="checkbox" id="jkRadio" onchange="jkRadioSet()"> Radio</label>
       <button id="jkAudio" onclick="toggleAudio().then(()=>jkAudioSync())" title="Stream the machine's audio to this browser">🔊 Listen here</button>
       <span id="jkNow" class="jk-now"></span>
       <span id="jkSong" style="display:none"></span>
     </div>
     <div class="row" style="margin-top:6px;align-items:center;flex-wrap:wrap;gap:6px">
       <label class="hint"><input type="checkbox" id="jkFadeEnabled" onchange="jukeFadeChanged()"> Fade streamed SID ending</label>
-      <select id="jkFadeSecs" class="mini" onchange="jukeFadeChanged()" title="Fade duration after the documented Songlengths endpoint">
+      <select id="jkFadeSecs" class="mini" onchange="jukeFadeChanged()" title="Fade duration ending at the documented Songlengths endpoint">
         <option value="1.0">1.0 sec</option><option value="1.5">1.5 sec</option>
         <option value="2.0">2.0 sec</option><option value="2.5">2.5 sec</option>
         <option value="3.0">3.0 sec</option><option value="5.0">5.0 sec</option>

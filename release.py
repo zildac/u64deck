@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 VERSION = "1.9.0"
-RELEASE_LABEL = "Release Candidate 48"
+RELEASE_LABEL = "Release Candidate 51"
 BUILD_STAMP_NAME = "u64deck-build-id.txt"
 _BUILD_ID_RE = re.compile(r"^[0-9a-f]{7}$")
 

@@ -30,8 +30,20 @@ when testing the Ethernet REST endpoint itself.
 
 # u64deck
 
-**v1.9.0 — Release Candidate 48 · build c0d1fb0**
+**v1.9.0 — Release Candidate 51 · build ea5a1b6**
 
+> **Final release candidate.** RC51 promotes the hardware-accepted RC50 private
+> reissue 6 application baseline without adding functionality or changing the
+> accepted Legacy, CIA1, Finder, SID playback, queue, Assembly64 or redesigned-UI
+> behaviour. The functional source remains frozen apart from release-identity
+> strings.
+>
+> RC51 restores the canonical empty `library/` area and its README, replaces the
+> Windows application icon with the compact redesigned u64deck mark, preserves
+> the reviewed PyInstaller path-insert correction and adds explicit packaging
+> checks for icon frames, PE release metadata, library contents and source/archive
+> parity. Linux Preview 9 is built from the same accepted shared application
+> baseline with its established Linux/XDG distribution layer.
 
 A lightweight, self-hosted control deck for the **Ultimate 64** (and, minus the
 screen mirror, the 1541 Ultimate-II+). One small Python server, a plain HTML/CSS/JavaScript interface,
@@ -135,15 +147,15 @@ Built as a leaner alternative to Ultimate64 Manager / Assembly64 with a focus on
 - **Local USB index import** — remove a large collection stick from the Ultimate,
   connect it to the u64deck PC and build `/USB0` (or another mapped subtree)
   directly from local storage without FTP traffic.
-- **Verified interface-aware discovery** — *Select Ultimate…* places previously
+- **Progressive interface-aware discovery** — *Select Ultimate…* places previously
   verified addresses at the front of the same bounded concurrent `/v1/info` pass
-  as every address on the local `/24`, so stale history cannot delay the fresh
-  subnet scan. There is no preliminary TCP port scan
-  and no retry storm. Ethernet and Wi-Fi responses are grouped into one physical
-  device using the firmware `unique_id`, verified Ethernet is preferred, and a
-  guarded **Clear discovered devices** action provides a clean recovery scan
-  without touching unrelated settings. Routine status and drive polling pause
-  while discovery runs so the Ultimate REST service is not overloaded.
+  as every address on the local network. A verified Ultimate is displayed as
+  soon as it responds while the remaining addresses continue in the background;
+  the user can select it immediately or cancel queued probes safely. There is no
+  preliminary TCP port scan and no retry storm. Ethernet and Wi-Fi responses are
+  grouped into one physical device using the firmware `unique_id`, verified
+  Ethernet is preferred, and **Clear discovered devices** performs a clean
+  progressive recovery scan without touching unrelated settings.
 - **Stream quality options** — low-latency vs all-frames buffering, sharp vs
   soft scaling, 2×/3×/fit sizing; remembered across sessions.
 - **Assembly64 workspace** — use a full-height, responsive two-pane search and release-file view to query the public Assembly64 database. A confident multi-disk family is downloaded and armed as a Disk Swap queue on the first mount, while ambiguous releases remain single-disk. Results include
@@ -226,7 +238,7 @@ does not stop the server. The connected Ultimate continues running.
 
 ### Tier 3 — Anywhere else (or by hand)
 
-The original cross-platform source launch remains available:
+Anywhere else (or by hand):
 
 ```bash
 pip install -r requirements.txt
@@ -242,46 +254,7 @@ available keys (`u64_host`, the Ultimate network `password`, FTP credentials,
 base URL). The Assembly64 application identifier is fixed as `u64deck` and is
 not a user setting.
 
-#### Linux Preview 7 — source-run preview
-
-Linux Preview 7 is a soak candidate rather than the stable supported build. It
-is provided as-is for testing on recent Debian/Ubuntu-derived desktops; report
-Linux issues with the complete version/build string. Windows RC48 is the matched
-Windows soak candidate.
-
-Extract the `.tar.gz`, then run as a normal user:
-
-```bash
-chmod +x install.sh u64deck.sh
-./install.sh
-./u64deck.sh
-```
-
-`install.sh` creates a private `.venv` inside the extracted application folder,
-installs `requirements.txt` there, creates an application-menu entry and a
-`~/.local/bin/u64deck` launcher. It never invokes `sudo` or changes system
-Python. Chromium, Chrome or Edge app-window mode is used when available;
-otherwise u64deck opens the system browser or prints the local URL.
-
-### Persistent-file locations
-
-The two platforms deliberately use different storage conventions:
-
-| Data | Windows | Linux Preview |
-|---|---|---|
-| Settings | `config.json` beside `u64deck.exe` | `${XDG_CONFIG_HOME:-~/.config}/u64deck/config.json` |
-| Storage/SID index | `.u64deck-index.sqlite3` beside the EXE | `${XDG_DATA_HOME:-~/.local/share}/u64deck/.u64deck-index.sqlite3` |
-| SIDFlow database | `.sidflow-similarity.sqlite` beside the EXE | `${XDG_DATA_HOME:-~/.local/share}/u64deck/.sidflow-similarity.sqlite` |
-| Favourites/recents | `user_items.json` beside the EXE | `${XDG_DATA_HOME:-~/.local/share}/u64deck/user_items.json` |
-| SID playlists | `playlists.json` beside the EXE | `${XDG_DATA_HOME:-~/.local/share}/u64deck/playlists.json` |
-| Logs | console / application folder context | `${XDG_STATE_HOME:-~/.local/state}/u64deck/u64deck.log` |
-
-Linux does not read JSON or SQLite runtime files placed beside the `.sh`
-scripts. Print the active paths with `./u64deck.sh --linux-print-paths`.
-
 ### Updating an existing installation
-
-#### Windows
 
 Install every release into a **new, empty folder**. Stop the previous u64deck
 process completely before copying user data, and do not extract a new release
@@ -309,29 +282,6 @@ Always run u64deck as a normal user, and always the same way — mixing elevated
 ownership and causes access-denied errors. If that has happened, use a fresh
 folder and copy only the supported persistent files listed above.
 
-#### Linux Preview
-
-Extract the new tarball into a new folder, use **Exit u64deck** in the old
-version, then run `./update-linux.sh` from the new folder. The updater installs
-the new private virtual environment, repoints the menu/command launchers and
-retains the XDG configuration and data directories. It leaves the previous
-application folder untouched. `./update-linux.sh --rollback /path/to/old/u64deck`
-repoints the launchers to a previous installed folder.
-
-For a Windows installation or an older Linux preview that stored persistent
-files beside its launcher, stop u64deck and run:
-
-```bash
-./import-existing-data.sh /path/to/old/u64deck
-```
-
-The importer copies supported settings, favourites, playlists, SIDFlow data and
-indexes into the Linux XDG locations, backs up anything it replaces, skips
-`-wal`/`-shm` files and leaves the source untouched. Windows filesystem paths
-inside `config.json`, favourites or an index are reported because Linux mount
-paths may need changing; a storage/SID index containing obsolete Windows paths
-may need to be rebuilt.
-
 ## Interface-aware Ultimate discovery
 
 An Ultimate 64 or C64 Ultimate can expose the REST API on wired Ethernet and
@@ -350,13 +300,15 @@ This network identity drives visible application behaviour:
   Wi-Fi with **STREAMING NOT AVAILABLE OVER WI-FI**, while Storage, SID,
   Settings, Assembly64 and supported machine controls remain available.
 
-### Prioritised single-pass discovery
+### Progressive single-pass discovery
 
 `config.json` retains previously verified addresses as discovery history. On a
 new scan, addresses that still belong to the PC's current local `/24` are placed
-at the front of the same 64-worker pass as the rest of the subnet. This keeps
-history useful without creating a separate blocking phase: a stale configured
-or remembered address cannot postpone the fresh `/24` scan.
+at the front of the same 64-worker pass as the rest of the subnet. Completed
+responses are published progressively: a verified Ultimate can be selected
+within milliseconds even though unreachable addresses may keep the full `/24`
+pass running for several seconds. Stale configured or remembered addresses
+remain candidates only and cannot postpone or populate the live result.
 
 History is never treated as proof that an interface is online. Every address
 must answer the current scan before it can be displayed, selected or
@@ -378,18 +330,20 @@ connect deadline while allowing an already-connected Ultimate REST service time
 to answer.
 
 The application deliberately uses no preliminary TCP port probe, async HTTP
-substitute or same-scan retry pass. Each address is requested once. This avoids
-losing a valid interface to an overly short port check and avoids the contention
-caused by layered probes and retry storms. DHCP replacements are found by the
-full subnet phase and supersede old addresses when the same interface MAC is
-observed at the new IP.
+substitute or same-scan retry pass. Each address is requested once. RC51 retains RC50's change to
+only when completed results reach the browser: the bounded scan continues in the
+background with checked/remaining progress, and **Cancel scan** stops queued
+probes while retaining devices already verified. DHCP replacements are still
+found by the full subnet phase and supersede old addresses when the same
+interface MAC is observed at the new IP.
 
 ### Responsive connection hand-off
 
 Finder results are live verification results, not merely address suggestions.
-When **Use selected address** is pressed, u64deck reuses the successful Finder
-`/v1/info` result and the current MAC-based link classification rather than
-immediately repeating those REST operations. Manual IP addresses still receive
+A verified device is shown before the complete subnet pass finishes. Pressing
+**Use now** safely cancels remaining queued probes, waits for the bounded in-flight
+requests to settle, then reuses the successful Finder `/v1/info` result and the
+current MAC-based link classification rather than repeating those operations. Manual IP addresses still receive
 a fresh verification request before the active backend is changed.
 
 Connect does not block on the optional CIA1 keyboard capability check. A cached
@@ -414,8 +368,9 @@ While **Find Ultimate Devices** is scanning, u64deck pauses routine status and
 Mounted Drives polling. Discovery uses independent one-shot socket requests and sends at most one
 `/v1/info` request to each subnet address during that scan. Interface classification then uses current MAC/ARP evidence only; it does
 not issue follow-up `/v1/version` latency probes. Normal polling resumes when
-the bounded scan finishes or fails. A second Finder scan cannot overlap the
-first.
+the bounded scan finishes, is cancelled or fails. Cancellation never promotes a
+remembered address that did not answer, and a second Finder scan cannot overlap
+the first.
 
 For troubleshooting, `discovery_diagnostic.py` imports this exact production
 transport rather than maintaining a second scanner. For example:
@@ -608,8 +563,9 @@ The repo includes a PyInstaller spec and a GitHub Actions workflow
 1. Push this folder to a GitHub repo.
 2. The **build-exe** action runs on every push — grab `u64deck.exe` from the
    workflow's artifacts (Actions tab → latest run → *u64deck-windows*).
-3. Tag a release (`git tag v1.9.0-rc.46 && git push --tags`) and the exe is attached
-   to the GitHub Release automatically.
+3. Public tags remain reserved for accepted releases. RC49 is a private source
+   test build and must not be tagged or promoted until its UI and hardware checks
+   have passed.
 
 Double-click the exe: it starts the server, opens the dedicated Edge app, and
 you hit **Select Ultimate…**. A `config.json` placed next to the exe is picked
@@ -886,17 +842,20 @@ documented length for the selected subtune. The complete Songlengths database
 is never uploaded to the device. Queue lengths are resolved from the path
 catalogue before lazy tunes are fetched, then confirmed by digest once a tune is
 played. For matched Songlengths entries, u64deck waits a configurable short
-end grace before launching the next tune when streamed fade is disabled. The
-optional **Fade streamed SID ending** control keeps the selected native subtune
-alive for the chosen fade duration, starts a linear browser fade at the
-documented endpoint, then holds browser gain at zero until the backend confirms
-the replacement SID has started. Any buffered tail from the previous tune is
+end grace before launching the next tune when streamed fade is disabled; this
+remains configurable as `sid_jukebox_end_grace_secs`. The
+optional **Fade streamed SID ending** control starts the linear browser fade
+before the documented endpoint so that it completes exactly at the advertised
+play length. The compact native `.ssl` duration is not extended. At the
+endpoint, u64deck holds browser gain at zero until the backend confirms the
+replacement SID has started. Any buffered tail from the previous tune is
 cleared before full gain is restored, preventing the old SID from briefly
-returning between tracks. While fade is enabled, its duration replaces rather
-than combines with `sid_jukebox_end_grace_secs`. The fade affects audio heard
-through the u64deck browser and browser recordings only. Ultimate HDMI and
-analogue output remain at full volume until the extended native endpoint.
-browser fade defaults to 2.5 seconds and can be disabled in the Jukebox UI. Without Songlengths, `sid_default_secs` (default 180) applies (0 =
+returning between tracks. The fade affects audio heard through the u64deck
+browser and browser recordings only; Ultimate HDMI and analogue output remain
+at full volume until the native player reaches the documented endpoint. The default is unchanged: browser fade defaults to 2.5 seconds and can be disabled in the Jukebox UI. Queue auto-advance follows the ordered
+queue regardless of whether the next tune was added through Search, Favourites,
+a saved queue, a manual queue action, More Like This or Radio. Without
+Songlengths, `sid_default_secs` (default 180) applies (0 =
 loop forever) with the established fallback timing and no fade. If your HVSC lives on the device, you don't even need to set it:
 on first jukebox use u64deck **auto-detects the HVSC root** (a folder
 with MUSICIANS + DOCUMENTS, e.g. `/Usb0/HVSC` or `/Usb0/C64Music`),

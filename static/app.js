@@ -52,6 +52,12 @@ let DEVICE_REQUEST_TIMEOUT_MS=15000;
 const MOUNT_RUN_REQUEST_TIMEOUT_MS=300000;
 let LINK_STATUS={ip:"",link_type:"unknown",label:"Unknown",addresses:[],ethernet_ip:"",wifi_ip:"",control_ip:"",control_link_type:"unknown",rest_via_alternate:false,rest_route_label:"",streaming_available:true,rest_timeout:8};
 let UI_INTERACTIVE_DEPTH=0,INFO_IN_FLIGHT=false,DRIVES_IN_FLIGHT=false,INPUT_PROBE_TIMER=null;
+let DASH_CONNECTION_STATE="offline";
+function setDashboardConnectionState(state){
+  const allowed=new Set(["offline","connecting","connected","reconnecting","failed"]);
+  DASH_CONNECTION_STATE=allowed.has(state)?state:"offline";
+  p2UpdateDashboard();
+}
 function uiInteractiveStart(){UI_INTERACTIVE_DEPTH++}
 function uiInteractiveEnd(){UI_INTERACTIVE_DEPTH=Math.max(0,UI_INTERACTIVE_DEPTH-1)}
 function uiInteractive(){return UI_INTERACTIVE_DEPTH>0}
@@ -478,104 +484,172 @@ document.addEventListener("visibilitychange",()=>{if(document.querySelector("#ta
 
 /* ---------- discovery ---------- */
 let DISCOVERY_SCAN_ACTIVE=false,DISCOVERY_DIALOG_OPEN=false;
+let DISCOVERY_JOB_ID="",DISCOVERY_POLL_TIMER=null,DISCOVERY_LAST_RESULT=null;
 const DISCOVERY_SELECTION={};
 function closeDiscover(resumePolling=true){
+  if(DISCOVERY_SCAN_ACTIVE)return;
   DISCOVERY_DIALOG_OPEN=false;const ov=$("#discOverlay");if(ov)ov.remove();
-  if(resumePolling&&!DISCOVERY_SCAN_ACTIVE)setTimeout(()=>{loadInfo();if(DRIVE_STATUS_READY)refreshDrives()},0);
+  if(resumePolling)setTimeout(()=>{loadInfo();if(DRIVE_STATUS_READY)refreshDrives()},0);
 }
 function openDiscover(){
   DISCOVERY_DIALOG_OPEN=true;let ov=$("#discOverlay");
   if(!ov){
     ov=document.createElement("div");ov.id="discOverlay";
-    ov.style.cssText="position:fixed;inset:0;background:rgba(0,0,0,.72);display:flex;align-items:flex-start;justify-content:center;padding-top:9vh;z-index:50";
-    ov.innerHTML=`<div class="panel" style="width:min(620px,92vw)">
+    ov.style.cssText="position:fixed;inset:0;background:rgba(0,0,0,.72);display:flex;align-items:flex-start;justify-content:center;padding-top:7vh;z-index:50";
+    ov.innerHTML=`<div class="panel discovery-panel">
       <h2>FIND ULTIMATE DEVICES</h2>
-      <div id="discBody" class="hint">Includes previously verified addresses at the front of the same bounded
-        concurrent <code>/v1/info</code> pass as the local /24, so stale history cannot delay the fresh scan.
-        Ethernet and Wi-Fi interfaces are grouped into one physical device. Only interfaces verified during this scan are shown.</div>
-      <div class="row" style="margin-top:10px">
+      <div id="discBody" class="hint">Previously verified addresses are prioritised within the same bounded
+        <code>/v1/info</code> pass as the local network. Verified devices appear immediately while the remaining
+        addresses continue in the background. Ethernet and Wi-Fi are grouped into one physical device. Only interfaces verified during this scan are shown.</div>
+      <div class="row discovery-actions">
         <button class="primary" id="discGo" onclick="runDiscover()">Scan network</button>
+        <button id="discCancel" onclick="cancelDiscoveryScan()" hidden>Cancel scan</button>
         <input id="discSubnet" placeholder="extra subnet e.g. 192.168.50." style="flex:1">
-        <button onclick="closeDiscover()">Close</button>
+        <button id="discClose" onclick="closeDiscover()">Close</button>
       </div>
       <div class="row" style="margin-top:10px">
         <input id="discManual" placeholder="…or type an IP manually" style="flex:1"
           onkeydown="if(event.key==='Enter')connectTo($('#discManual').value)">
-        <button onclick="connectTo($('#discManual').value)">Connect</button>
+        <button id="discManualGo" onclick="connectTo($('#discManual').value)">Connect</button>
       </div>
       <div class="row" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
         <button class="danger" id="discClear" onclick="clearDiscoveredDevices()">Clear discovered devices</button>
         <span class="hint">Recovery option: clears remembered hosts only, then performs a fresh scan.</span>
       </div></div>`;
-    ov.addEventListener("click",e=>{if(e.target===ov)closeDiscover()});
+    ov.addEventListener("click",e=>{if(e.target===ov&&!DISCOVERY_SCAN_ACTIVE)closeDiscover()});
     document.body.appendChild(ov);
   }
+}
+function discoveryControls(active){
+  DISCOVERY_SCAN_ACTIVE=!!active;
+  const go=$("#discGo"),clear=$("#discClear"),cancel=$("#discCancel"),close=$("#discClose");
+  const manual=$("#discManual"),manualGo=$("#discManualGo");
+  if(go)go.disabled=!!active;if(clear)clear.disabled=!!active;if(close)close.disabled=!!active;
+  if(manual)manual.disabled=!!active;if(manualGo)manualGo.disabled=!!active;
+  if(cancel){cancel.hidden=!active;cancel.disabled=false;cancel.textContent="Cancel scan"}
 }
 function selectDiscoveryAddress(group,ip,button){
   DISCOVERY_SELECTION[group]=ip;
   const root=button?.closest?.(".disc-device");
   if(root)root.querySelectorAll(".disc-choice").forEach(btn=>btn.classList.toggle("selected",btn.dataset.ip===ip));
 }
-function useSelectedDiscoveryAddress(group){
-  const host=DISCOVERY_SELECTION[group]||"";if(host)connectTo(host);
-}
-function renderDiscoveryResults(r){
-  const body=$("#discBody");
-  if(!r.devices.length){
-    body.innerHTML=`No Ultimate devices found on ${esc(r.subnets.join(", ")||"any local subnet")}.<br>
-      Check the device is on, on the same network, and that <b>Web Remote Control</b> is enabled
-      in its Network Settings — or enter its IP below.`;
-    return;
+async function waitForDiscoveryStop(jobId,timeoutMs=6000){
+  const deadline=performance.now()+timeoutMs;
+  while(performance.now()<deadline){
+    const job=await api("/api/discover/status?job_id="+encodeURIComponent(jobId),{timeoutMs:3000});
+    if(["complete","cancelled","error"].includes(job.state))return job;
+    await new Promise(resolve=>setTimeout(resolve,100));
   }
-  body.innerHTML=r.devices.map((d,index)=>{
-    const addresses=(d.addresses||[]),preferred=d.preferred_ip||(addresses[0]?.ip||"");
-    const group="device-"+index;DISCOVERY_SELECTION[group]=preferred;
-    const choices=addresses.map(a=>{
-      const label=a.link_type==="ethernet"?"Ethernet":a.link_type==="wifi"?"Wi-Fi":"Unknown link";
-      const recommended=a.ip===preferred&&a.link_type==="ethernet"?" · recommended":"";
-      return `<button class="mini disc-choice${a.ip===preferred?" selected":""}" data-ip="${esc(a.ip)}" onclick="selectDiscoveryAddress('${group}','${jsq(a.ip)}',this)">${label} · ${esc(a.ip)}${recommended}</button>`;
-    }).join("");
-    return `<div class="disc-device">
-      <div class="disc-device-main"><div><b>${esc(d.product)}</b>${d.firmware?" · fw "+esc(d.firmware):""}${d.hostname?" · "+esc(d.hostname):(d.unique_id?" · "+esc(d.unique_id):"")}
-      <div class="disc-address-line">Select the address to use:</div><div class="disc-choice-row">${choices}</div></div>
-      <button class="primary" onclick="useSelectedDiscoveryAddress('${group}')">Use selected address</button></div></div>`;
-  }).join("");
+  throw new Error("Finder is still stopping remaining probes");
 }
-
-async function runDiscover(){
-  const body=$("#discBody"),btn=$("#discGo"),clear=$("#discClear");
-  btn.disabled=true;if(clear)clear.disabled=true;DISCOVERY_SCAN_ACTIVE=true;
-  body.innerHTML="Scanning remembered and local-/24 addresses together… <span class='cursor'></span>";
+async function useSelectedDiscoveryAddress(group){
+  const host=DISCOVERY_SELECTION[group]||"";if(!host)return;
+  if(DISCOVERY_SCAN_ACTIVE&&DISCOVERY_JOB_ID){
+    const jobId=DISCOVERY_JOB_ID;
+    try{
+      await api("/api/discover/cancel?job_id="+encodeURIComponent(jobId),{method:"POST",timeoutMs:3000});
+      await waitForDiscoveryStop(jobId);
+    }catch(e){toast(e.message,"err");return}
+  }
+  connectTo(host);
+}
+function discoveryProgressHtml(r,state,message){
+  const total=Number(r?.candidate_count||0),checked=Number(r?.checked_count||0);
+  const verified=Number(r?.verified_count||0),remaining=Math.max(0,Number(r?.remaining_count??total-checked));
+  const pct=total?Math.min(100,Math.round(checked*100/total)):0;
+  const first=Number(r?.time_to_first_verified_ms);
+  const stateText=state==="cancelling"?"Stopping remaining probes…":state==="cancelled"?"Scan cancelled":state==="complete"?"Scan complete":"Scanning remaining network addresses…";
+  const firstText=Number.isFinite(first)&&first>=0?` · first verified in ${Math.round(first)} ms`:"";
+  return `<div class="disc-progress ${esc(state||"running")}">
+    <div class="disc-progress-head"><b>${esc(stateText)}</b><span>${checked} of ${total} checked · ${remaining} remaining</span></div>
+    <div class="disc-progress-track"><span style="width:${pct}%"></span></div>
+    <div class="hint">${verified} verified interface${verified===1?"":"s"}${firstText}${message?` · ${esc(message)}`:""}</div>
+  </div>`;
+}
+function discoveryGroup(d,index){return "device-"+String(d.identity||d.unique_id||d.hostname||index).replace(/[^a-z0-9_-]/gi,"_")}
+function renderDiscoveryResults(r,job={}){
+  const body=$("#discBody");if(!body)return;
+  r=r||{devices:[],candidate_count:0,checked_count:0,remaining_count:0,verified_count:0};
+  DISCOVERY_LAST_RESULT=r;
+  const state=job.state||(r.cancelled?"cancelled":r.complete?"complete":"running");
+  const progress=discoveryProgressHtml(r,state,job.message||"");
+  const devices=r.devices||[];
+  let content="";
+  if(devices.length){
+    content=devices.map((d,index)=>{
+      const addresses=(d.addresses||[]),preferred=d.preferred_ip||(addresses[0]?.ip||"");
+      const group=discoveryGroup(d,index);
+      const remembered=DISCOVERY_SELECTION[group];
+      const selected=addresses.some(a=>a.ip===remembered)?remembered:preferred;
+      DISCOVERY_SELECTION[group]=selected;
+      const choices=addresses.map(a=>{
+        const label=a.link_type==="ethernet"?"Ethernet":a.link_type==="wifi"?"Wi-Fi":"Unknown link";
+        const recommended=a.ip===preferred&&a.link_type==="ethernet"?" · recommended":"";
+        return `<button class="mini disc-choice${a.ip===selected?" selected":""}" data-ip="${esc(a.ip)}" onclick="selectDiscoveryAddress('${group}','${jsq(a.ip)}',this)">${label} · ${esc(a.ip)}${recommended}</button>`;
+      }).join("");
+      return `<div class="disc-device">
+        <div class="disc-device-main"><div><b>${esc(d.product)}</b>${d.firmware?" · fw "+esc(d.firmware):""}${d.hostname?" · "+esc(d.hostname):(d.unique_id?" · "+esc(d.unique_id):"")}
+        <div class="disc-address-line">Verified during this scan — select the address to use:</div><div class="disc-choice-row">${choices}</div></div>
+        <button class="primary" onclick="useSelectedDiscoveryAddress('${group}')">${DISCOVERY_SCAN_ACTIVE?"Use now":"Use selected address"}</button></div></div>`;
+    }).join("");
+  }else if(state==="complete"||state==="cancelled"){
+    content=`<div class="disc-empty">No Ultimate devices were verified on ${esc((r.subnets||[]).join(", ")||"any local subnet")}.<br>
+      Check the device is on, on the same network, and that <b>Web Remote Control</b> is enabled — or enter its IP below.</div>`;
+  }else{
+    content='<div class="disc-empty">No Ultimate response yet. The bounded scan is still running.</div>';
+  }
+  body.innerHTML=progress+content;
+}
+async function pollDiscoveryJob(jobId){
+  if(!jobId||jobId!==DISCOVERY_JOB_ID)return;
+  try{
+    const job=await api("/api/discover/status?job_id="+encodeURIComponent(jobId),{timeoutMs:5000});
+    const terminal=["complete","cancelled","error"].includes(job.state);
+    if(terminal)discoveryControls(false);
+    if(job.result)renderDiscoveryResults(job.result,job);
+    if(terminal){
+      if(job.state==="error")$("#discBody").innerHTML=`<span style="color:var(--err)">${esc(job.error||job.message||"Finder scan failed")}</span>`;
+      DISCOVERY_JOB_ID="";DISCOVERY_POLL_TIMER=null;
+      if(!DISCOVERY_DIALOG_OPEN)setTimeout(()=>{loadInfo();if(DRIVE_STATUS_READY)refreshDrives()},0);
+      return;
+    }
+    DISCOVERY_POLL_TIMER=setTimeout(()=>pollDiscoveryJob(jobId),250);
+  }catch(e){
+    $("#discBody").innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`;
+    discoveryControls(false);DISCOVERY_JOB_ID="";
+  }
+}
+async function startDiscoveryJob(clearFirst=false){
+  const body=$("#discBody");
+  discoveryControls(true);
+  body.innerHTML=(clearFirst?"Clearing discovery history…":"Starting Finder…")+" <span class='cursor'></span>";
   try{
     const sub=$("#discSubnet").value.trim();
-    const r=await api("/api/discover"+(sub?"?subnet="+encodeURIComponent(sub):""),{timeoutMs:30000});
-    renderDiscoveryResults(r);
-  }catch(e){body.innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`}
-  finally{
-    DISCOVERY_SCAN_ACTIVE=false;btn.disabled=false;if(clear)clear.disabled=false;
-    if(!DISCOVERY_DIALOG_OPEN)setTimeout(()=>{loadInfo();if(DRIVE_STATUS_READY)refreshDrives()},0);
-  }
+    const path=(clearFirst?"/api/discover/clear/start":"/api/discover/start")+(sub?"?subnet="+encodeURIComponent(sub):"");
+    const job=await api(path,{method:"POST",timeoutMs:5000});
+    DISCOVERY_JOB_ID=job.job_id;
+    if(clearFirst){
+      closeLocalStreamsForLinkChange();clearStandaloneScreenNotice();
+      LINK_STATUS={ip:"",link_type:"unknown",label:"Unknown",addresses:[],ethernet_ip:"",wifi_ip:"",control_ip:"",control_link_type:"unknown",rest_via_alternate:false,rest_route_label:"",streaming_available:true,rest_timeout:8};
+      LAST_DEVICE_INFO=null;DRIVE_STATUS_READY=false;INPUT_STATUS={available:false,mode:"buffer",label:"Legacy KERNAL buffer",status:0};
+      setDashboardConnectionState("offline");applyLinkStatus(LINK_STATUS);matrixClearLocalState();renderInputMode();
+      $("#devinfo").innerHTML='<span style="color:var(--err)">No device configured — choose a verified result below</span>';
+      toast("Discovery history cleared — scanning for Ultimate devices.","ok");
+    }
+    pollDiscoveryJob(DISCOVERY_JOB_ID);
+  }catch(e){body.innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`;discoveryControls(false)}
+}
+async function runDiscover(){await startDiscoveryJob(false)}
+async function cancelDiscoveryScan(){
+  if(!DISCOVERY_JOB_ID)return;
+  const button=$("#discCancel");if(button){button.disabled=true;button.textContent="Stopping…"}
+  try{await api("/api/discover/cancel?job_id="+encodeURIComponent(DISCOVERY_JOB_ID),{method:"POST",timeoutMs:3000})}
+  catch(e){toast(e.message,"err");if(button){button.disabled=false;button.textContent="Cancel scan"}}
 }
 async function clearDiscoveredDevices(){
   const question="Clear all remembered Ultimate devices and addresses?\n\nThe current connection will be removed and a fresh network scan will begin. Other settings will not be changed.";
   if(!await u64Confirm(question))return;
-  const body=$("#discBody"),btn=$("#discGo"),clear=$("#discClear");
-  if(btn)btn.disabled=true;if(clear)clear.disabled=true;DISCOVERY_SCAN_ACTIVE=true;
-  body.innerHTML="Clearing discovery history and scanning… <span class='cursor'></span>";
-  try{
-    const sub=$("#discSubnet").value.trim();
-    const r=await api("/api/discover/clear"+(sub?"?subnet="+encodeURIComponent(sub):""),{method:"POST",timeoutMs:30000});
-    closeLocalStreamsForLinkChange();
-    clearStandaloneScreenNotice();
-    LINK_STATUS={ip:"",link_type:"unknown",label:"Unknown",addresses:[],ethernet_ip:"",wifi_ip:"",control_ip:"",control_link_type:"unknown",rest_via_alternate:false,rest_route_label:"",streaming_available:true,rest_timeout:8};
-    LAST_DEVICE_INFO=null;DRIVE_STATUS_READY=false;INPUT_STATUS={available:false,mode:"buffer",label:"Legacy KERNAL buffer",status:0};
-    applyLinkStatus(LINK_STATUS);matrixClearLocalState();renderInputMode();
-    $("#devinfo").innerHTML='<span style="color:var(--err)">No device configured — choose a verified result below</span>';
-    toast("Discovery history cleared — scanning for Ultimate devices.","ok");
-    renderDiscoveryResults(r);
-  }catch(e){body.innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`}
-  finally{DISCOVERY_SCAN_ACTIVE=false;if(btn)btn.disabled=false;if(clear)clear.disabled=false;
-    if(!DISCOVERY_DIALOG_OPEN)setTimeout(()=>{loadInfo();if(DRIVE_STATUS_READY)refreshDrives()},0)}
+  await startDiscoveryJob(true);
 }
 function scheduleInputProbe(delay=2500){
   clearTimeout(INPUT_PROBE_TIMER);INPUT_PROBE_TIMER=setTimeout(()=>{
@@ -589,6 +663,7 @@ async function connectTo(host){
   clearStandaloneScreenNotice();
   const previousDriveReady=DRIVE_STATUS_READY;DRIVE_STATUS_READY=false;
   const connectStarted=performance.now(),body=$("#discBody");
+  setDashboardConnectionState("connecting");
   if(body)body.innerHTML=`Connecting to <b>${esc(host)}</b>… <span class='cursor'></span>`;
   toast("Connecting to "+host+"…","ok");
   uiInteractiveStart();
@@ -600,17 +675,19 @@ async function connectTo(host){
       toast("Connected to "+host+(r.rest_via_alternate?" · REST control via "+r.control_host:"")+` · ${elapsed} ms`,"ok");
       if(r.input){INPUT_STATUS=r.input;renderInputMode()}
       if(r.link)applyLinkStatus(r.link);
-      if(r.info){LAST_DEVICE_INFO=r.info;INFO_FAILURES=0;DRIVE_STATUS_READY=true;renderDeviceInfo(r.info)}
+      if(r.info){LAST_DEVICE_INFO=r.info;INFO_FAILURES=0;DRIVE_STATUS_READY=true;setDashboardConnectionState("connected");renderDeviceInfo(r.info)}
+      else{setDashboardConnectionState("connecting");setTimeout(loadInfo,0)}
       loadBootOptions();
       matrixClearLocalState();closeDiscover(false);
       if(inputStatusPending())scheduleInputProbe();
       if(DRIVE_STATUS_READY)setTimeout(refreshDrives,0);
     }else{
       DRIVE_STATUS_READY=previousDriveReady;
+      setDashboardConnectionState("failed");
       if(body)body.innerHTML=`<span style="color:var(--err)">Could not connect to ${esc(host)}: ${esc(r.error||"unknown error")}</span>`;
       toast("Could not connect to "+host+": "+r.error,"err");
     }
-  }catch(e){DRIVE_STATUS_READY=previousDriveReady;if(body)body.innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`;toast(e.message,"err")}
+  }catch(e){DRIVE_STATUS_READY=previousDriveReady;setDashboardConnectionState("failed");if(body)body.innerHTML=`<span style="color:var(--err)">${esc(e.message)}</span>`;toast(e.message,"err")}
   finally{uiInteractiveEnd()}
 }
 
@@ -889,6 +966,8 @@ async function loadInputStatus(refresh=false){
 async function loadInfo(){
   if(DISCOVERY_SCAN_ACTIVE||DISCOVERY_DIALOG_OPEN||uiInteractive()||INFO_IN_FLIGHT)return;
   INFO_IN_FLIGHT=true;
+  if(!LAST_DEVICE_INFO)setDashboardConnectionState("connecting");
+  else if(INFO_FAILURES>0)setDashboardConnectionState("reconnecting");
   try{
     if(!VER_SHOWN){try{const c=await api("/api/app_config");
       if(c.version){$("#ver").textContent="v"+c.version+(c.release_label?" · "+c.release_label:"")+(c.build?" · "+c.build:"");
@@ -914,7 +993,7 @@ async function loadInfo(){
       INFO_RETRY_TIMER=setTimeout(()=>{INFO_RETRY_TIMER=null;loadInfo()},retry);
       return;
     }
-    LAST_DEVICE_INFO=i;INFO_FAILURES=0;MOUNT_RUN_BUSY=false;renderMountRunPrompt(null);
+    LAST_DEVICE_INFO=i;INFO_FAILURES=0;MOUNT_RUN_BUSY=false;setDashboardConnectionState("connected");renderMountRunPrompt(null);
     if(INFO_RETRY_TIMER){clearTimeout(INFO_RETRY_TIMER);INFO_RETRY_TIMER=null}
     if(i.u64deck_link)applyLinkStatus(i.u64deck_link);else await loadLinkStatus(previousFailures>0);
     if(i.u64deck_input){INPUT_STATUS=i.u64deck_input;renderInputMode();
@@ -927,12 +1006,14 @@ async function loadInfo(){
     const unconfig=/No device configured/.test(e.message);
     if(!unconfig&&LAST_DEVICE_INFO&&INFO_FAILURES===0){
       INFO_FAILURES=1;
+      setDashboardConnectionState("reconnecting");
       renderDeviceInfo(LAST_DEVICE_INFO,` <span class="reconnecting">· Reconnecting…</span>`);
       if(INFO_RETRY_TIMER)clearTimeout(INFO_RETRY_TIMER);
       INFO_RETRY_TIMER=setTimeout(()=>{INFO_RETRY_TIMER=null;loadInfo()},2000);
       return;
     }
     INFO_FAILURES++;
+    setDashboardConnectionState(unconfig?"offline":"failed");
     $("#devinfo").innerHTML=`<span style="color:var(--err)">${unconfig
       ?"No device configured — click Select Ultimate… →":esc("Offline: "+e.message)}</span>`;
   }finally{INFO_IN_FLIGHT=false}
@@ -2168,7 +2249,7 @@ function applyBusyMountSnapshot(mounts){
 function renderDriveSummaries(){
   const parts=["a","b"].map(k=>{
     const state=DRIVE_STATE[k]||{},name=driveImageName(state);
-    const label=name||(!state.enabled?"Off":"Empty");
+    const label=name||(!state.enabled?"Off":"No disk");
     const mode=state.mode||state.reported_mode||"";
     const badge=name&&mode?` <span class="mount-badge ${esc(mode)}">${mountModeShort(mode)}</span>`:"";
     return `<span class="drive-summary-item" title="Drive ${k.toUpperCase()}: ${esc(state.image_file||state.path||label)}"><b>Drive ${k.toUpperCase()}</b>: ${esc(label)}${badge}</span>`;
@@ -3204,11 +3285,20 @@ async function jukeFolder(path){
     jkRender(s);toast(s.items.length+" tunes loaded"+(s.skipped?` (${s.skipped} skipped)`:""),"ok");
     rememberRecent(itemSpec("sid_folder",path.split("/").filter(Boolean).pop()||path,path,"sid_folder",{path}))}
   catch(e){toast(e.message,"err")}}
+function jkLocalSelectionChanged(){
+  const input=$("#jkLocal"),status=$("#jkLocalStatus"),files=input?.files||[];
+  if(!status)return;
+  let text="No files selected";
+  if(files.length===1)text=files[0].name;
+  else if(files.length>1)text=`${files.length} files selected`;
+  status.textContent=text;
+  status.title=files.length?Array.from(files).map(file=>file.name).join("\n"):text;
+}
 async function jukeLocal(){
   const fl=$("#jkLocal").files;if(!fl.length){toast("Pick .sid files first","err");return}
   const fd=new FormData();for(const f of fl)fd.append("files",f);
   try{const s=await api("/api/juke/upload",{method:"POST",body:fd});
-    $("#jkLocal").value="";jkRender(s);toast(s.items.length+" tunes loaded","ok")}
+    $("#jkLocal").value="";jkLocalSelectionChanged();jkRender(s);toast(s.items.length+" tunes loaded","ok")}
   catch(e){toast(e.message,"err")}}
 async function jkHvsc(force){
   $("#jkBDirs").innerHTML='<span class="hint">'+(force?"re-detecting HVSC…":"…")+'</span>';
@@ -3603,6 +3693,124 @@ for(const id of ["fslist","inspector"]){
     tr.closest("tbody").querySelectorAll("tr.sel").forEach(t=>t.classList.remove("sel"));
     tr.classList.add("sel")});
 }
+
+
+/* ---------- v1.10.0 UI Preview 2 presentation ---------- */
+const PREVIEW2_ART_CACHE=new Map();
+const PREVIEW2_HERO={playbackId:null,startedAt:0,baseElapsed:0,length:0,playing:false,raf:0,lastTextSecond:-1};
+function p2Xml(value){return String(value??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+function p2Hash(value){let h=2166136261>>>0;for(const ch of String(value||"u64deck")){h^=ch.charCodeAt(0);h=Math.imul(h,16777619)>>>0}return h>>>0}
+function p2Palette(seed){const palettes=[
+  ["#40318d","#7869c4","#b9beff","#f2d58a"],["#0d4a3f","#177862","#8bd8a7","#e5f29a"],
+  ["#4a1d64","#833f8e","#da8fc4","#f5d28f"],["#172c61","#3359a5","#71c5e8","#f4df9b"],
+  ["#5a2d18","#9a5a2c","#dca85d","#f3e0a1"],["#233844","#39677c","#78bfd0","#e3d2a1"],
+  ["#252453","#514ea1","#a8a4ef","#f0d487"],["#153a46","#276d7c","#79c2c8","#f1cf8a"]];
+  return palettes[(seed>>>4)%palettes.length]
+}
+function p2ArtworkLines(value,maxChars=22,maxLines=2){
+  const words=String(value||"").replace(/[_]+/g," ").replace(/\s+/g," ").trim().split(" ").filter(Boolean),lines=[];let current="";
+  while(words.length&&lines.length<maxLines){let word=words.shift();if(word.length>maxChars)word=word.slice(0,maxChars-1)+"…";const candidate=current?current+" "+word:word;if(candidate.length<=maxChars){current=candidate;continue}if(current)lines.push(current);current=word}
+  if(current&&lines.length<maxLines)lines.push(current);
+  if(words.length&&lines.length){let last=lines.length-1;lines[last]=(lines[last].replace(/…$/,'').slice(0,maxChars-1)+"…")}
+  return lines.length?lines:["UNTITLED SID"]
+}
+function p2ArtworkScene(seed,colours,title=""){
+  const [c0,c1,c2,c3]=colours,lower=String(title||"").toLowerCase();
+  let variant=seed%7;
+  if(/space|star|galax|orbit|moon|cosmic|universe/.test(lower))variant=2;
+  else if(/cyber|neon|future|night|drive|racer|outrun/.test(lower))variant=0;
+  else if(/chip|digital|computer|machine|system|loader/.test(lower))variant=1;
+  else if(/demo|intro|crack|scene|mix|remix/.test(lower))variant=4;
+  if(variant===0){
+    const grid=Array.from({length:8},(_,i)=>`<path d="M128 72 L${-40+i*48} 130" stroke="${c2}" stroke-opacity=".34"/>`).join("")+
+      Array.from({length:5},(_,i)=>`<path d="M0 ${86+i*10} H256" stroke="${c2}" stroke-opacity="${.12+i*.055}"/>`).join("");
+    return `<g data-art-theme="synthwave"><circle cx="${66+(seed%124)}" cy="48" r="32" fill="${c3}" fill-opacity=".92"/><path d="M0 82 L34 52 L70 76 L111 35 L154 74 L196 45 L256 82 V132 H0Z" fill="#07101f" fill-opacity=".82" stroke="${c2}" stroke-opacity=".6"/>${grid}<path d="M0 82 H256" stroke="${c3}" stroke-opacity=".8"/></g>`;
+  }
+  if(variant===1){
+    const traces=Array.from({length:12},(_,i)=>{const y=18+i*9,x=i%2?72:184;return `<path d="M${i%2?0:256} ${y} H${x} ${i%3===0?`V${y+18}`:""}" fill="none" stroke="${i%3?c2:c3}" stroke-opacity=".42" stroke-width="2"/><circle cx="${i%2?68:188}" cy="${y}" r="2.5" fill="${c3}"/>`}).join("");
+    return `<g data-art-theme="circuit">${traces}<rect x="82" y="29" width="92" height="72" rx="10" fill="#07101f" fill-opacity=".78" stroke="${c3}" stroke-width="3"/><rect x="98" y="43" width="60" height="44" rx="5" fill="${c1}" fill-opacity=".55"/><text x="128" y="70" text-anchor="middle" fill="${c3}" font-family="ui-monospace,monospace" font-size="14" font-weight="900">SID</text></g>`;
+  }
+  if(variant===2){
+    const stars=Array.from({length:32},(_,i)=>{const x=(seed*(i+3)*17)%252+2,y=(seed+(i+5)*31)%112+4,r=i%7===0?1.8:i%3===0?1.2:.7;return `<circle cx="${x}" cy="${y}" r="${r}" fill="${i%5===0?c3:'#fff'}" fill-opacity="${.38+(i%4)*.14}"/>`}).join("");
+    return `<g data-art-theme="cosmic">${stars}<circle cx="${58+(seed%138)}" cy="${40+((seed>>>7)%38)}" r="${25+((seed>>>12)%18)}" fill="${c2}" fill-opacity=".72"/><ellipse cx="${58+(seed%138)}" cy="${40+((seed>>>7)%38)}" rx="${42+((seed>>>12)%18)}" ry="10" fill="none" stroke="${c3}" stroke-opacity=".72" stroke-width="3" transform="rotate(-14 ${58+(seed%138)} ${40+((seed>>>7)%38)})"/><path d="M18 108 Q92 54 238 96" fill="none" stroke="${c3}" stroke-opacity=".35" stroke-width="2"/></g>`;
+  }
+  if(variant===3){
+    const blocks=Array.from({length:15},(_,i)=>{const w=10+((seed>>>(i%19))&18),h=25+((seed>>>((i*2)%21))&70),x=2+i*18;const windows=Array.from({length:Math.max(1,Math.floor(h/13))},(_,j)=>`<rect x="${x+3}" y="${116-h+j*12}" width="3" height="5" fill="${c3}" fill-opacity="${.35+((i+j)%3)*.2}"/>`).join("");return `<rect x="${x}" y="${122-h}" width="${w}" height="${h}" fill="${i%3===0?c2:c1}" fill-opacity=".48"/>${windows}`}).join("");
+    return `<g data-art-theme="pixel-city"><circle cx="194" cy="37" r="23" fill="${c3}" fill-opacity=".65"/>${blocks}<path d="M0 122 H256" stroke="${c3}" stroke-opacity=".7"/></g>`;
+  }
+  if(variant===4){
+    const pts=Array.from({length:25},(_,i)=>`${i*11-4},${62+Math.round(Math.sin((i+(seed%11))*.68)*29)+((seed>>>(i%20))&9)}`).join(" ");
+    const particles=Array.from({length:18},(_,i)=>`<rect x="${(seed+i*37)%248}" y="${(seed+i*19)%112}" width="${2+i%4}" height="${2+i%4}" transform="rotate(45 ${(seed+i*37)%248} ${(seed+i*19)%112})" fill="${i%2?c2:c3}" fill-opacity="${.18+(i%5)*.11}"/>`).join("");
+    return `<g data-art-theme="demoscene">${particles}<polyline points="${pts}" fill="none" stroke="${c2}" stroke-opacity=".3" stroke-width="15" stroke-linecap="round"/><polyline points="${pts}" fill="none" stroke="${c3}" stroke-opacity=".92" stroke-width="3" stroke-linecap="round"/><circle cx="128" cy="62" r="46" fill="none" stroke="${c3}" stroke-opacity=".18" stroke-width="8"/></g>`;
+  }
+  if(variant===5){
+    const rings=Array.from({length:7},(_,i)=>{const inset=10+i*13;return `<rect x="${inset}" y="${inset*.48}" width="${256-inset*2}" height="${122-inset*.96}" rx="${14-i}" fill="none" stroke="${i%2?c2:c3}" stroke-opacity="${.12+i*.07}" stroke-width="${1+i%3}"/>`}).join("");
+    return `<g data-art-theme="arcade-tunnel">${rings}<path d="M22 118 L128 55 L234 118" fill="${c1}" fill-opacity=".24" stroke="${c3}" stroke-opacity=".45"/></g>`;
+  }
+  const tiles=Array.from({length:40},(_,i)=>{const x=(i%10)*26,y=Math.floor(i/10)*28,w=20,h=20,on=((seed>>>(i%24))&1);return `<rect x="${x+3}" y="${y+4}" width="${w}" height="${h}" rx="${on?3:10}" fill="${on?c3:i%3===0?c2:c1}" fill-opacity="${.08+(i%5)*.065}"/>`}).join("");
+  return `<g data-art-theme="chip-mosaic">${tiles}<path d="M22 106 C68 36 103 108 132 49 S196 102 238 32" fill="none" stroke="${c3}" stroke-opacity=".72" stroke-width="4"/></g>`;
+}
+function p2ArtworkSvg(meta={},path="",label="",songNumber=1,totalSongs=1){
+  const rawTitle=String(meta.name||label||String(path).split(/[\\/]/).pop()||"SID").replace(/\.sid$/i,"").trim()||"SID";
+  const author=String(meta.author||"Unknown artist").replace(/\s+/g," ").trim()||"Unknown artist";
+  const released=String(meta.released||meta.year||"").trim(),chip=String(meta.chip||"SID").trim()||"SID",format=String(meta.format||"SID").trim()||"SID";
+  const song=Math.max(1,Number(songNumber||1)|0),songs=Math.max(song,Number(totalSongs||meta.songs||1)|0),subtune=`SUBTUNE ${song}/${songs}`;
+  const baseKey=[path,rawTitle,author,released,chip,format].join("|"),cacheKey=baseKey+`|${song}/${songs}`;
+  if(PREVIEW2_ART_CACHE.has(cacheKey))return PREVIEW2_ART_CACHE.get(cacheKey);
+  const h=p2Hash(baseKey),accent=p2Hash(cacheKey),colours=p2Palette(h),[c0,c1,c2,c3]=colours,titleLines=p2ArtworkLines(rawTitle,22,2),artistLine=p2ArtworkLines(author,29,1)[0];
+  const scene=p2ArtworkScene(h,colours,rawTitle);
+  const titleText=titleLines.map((line,i)=>`<text x="18" y="${148+i*20}" fill="#fff4d8" font-family="ui-sans-serif,system-ui,sans-serif" font-size="${titleLines.length>1?16:18}" font-weight="800">${p2Xml(line)}</text>`).join("");
+  const metaTail=[released,chip].filter(Boolean).join(" · ")||chip;
+  const aria=`Generated SID artwork: ${rawTitle} by ${author}, ${subtune.toLowerCase()}`;
+  const svg=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="${p2Xml(aria)}">
+    <title>${p2Xml(`${rawTitle} — ${author} — ${subtune}`)}</title>
+    <defs><linearGradient id="g${h}" x1="0" y1="0" x2="1" y2="1"><stop stop-color="${c0}"/><stop offset=".58" stop-color="${c1}"/><stop offset="1" stop-color="#07101f"/></linearGradient><radialGradient id="r${accent}" cx="42%" cy="34%"><stop stop-color="${c3}" stop-opacity=".95"/><stop offset="1" stop-color="${c2}" stop-opacity=".18"/></radialGradient></defs>
+    <rect width="256" height="256" rx="18" fill="url(#g${h})"/>${scene}
+    <path d="M0 126 L256 105 L256 256 L0 256Z" fill="#050b15" fill-opacity=".82"/><path d="M0 127 L256 106" stroke="${c2}" stroke-opacity=".5"/>
+    <text x="18" y="28" fill="${c3}" font-family="ui-monospace,monospace" font-size="20" font-weight="850" letter-spacing="2">${p2Xml(format.toUpperCase())}</text>
+    <text x="238" y="28" text-anchor="end" fill="${c2}" font-family="ui-monospace,monospace" font-size="10" font-weight="800">${p2Xml(chip.toUpperCase())}</text>
+    ${titleText}
+    <text x="18" y="${titleLines.length>1?191:174}" fill="${c2}" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11" font-weight="750">${p2Xml(artistLine)}</text>
+    <path d="M18 207 H238" stroke="${c2}" stroke-opacity=".34"/>
+    <text x="18" y="224" fill="${c3}" font-family="ui-monospace,monospace" font-size="11" font-weight="850" letter-spacing="1">${p2Xml(subtune)}</text>
+    <text x="18" y="244" fill="#f6e7bd" font-family="ui-monospace,monospace" font-size="9" font-weight="700">${p2Xml(metaTail)}</text>
+    <text x="238" y="244" text-anchor="end" fill="${c2}" fill-opacity=".78" font-family="ui-monospace,monospace" font-size="8">U64DECK</text></svg>`;
+  PREVIEW2_ART_CACHE.set(cacheKey,svg);if(PREVIEW2_ART_CACHE.size>512)PREVIEW2_ART_CACHE.delete(PREVIEW2_ART_CACHE.keys().next().value);return svg
+}
+function p2SetArtwork(el,meta,path,label,songNumber=1,totalSongs=1){if(!el)return;el.innerHTML=p2ArtworkSvg(meta,path,label,songNumber,totalSongs);const title=String(meta?.name||label||"SID"),author=String(meta?.author||"Unknown artist"),song=Math.max(1,Number(songNumber||1)|0),songs=Math.max(song,Number(totalSongs||meta?.songs||1)|0);el.setAttribute("aria-label",`${title} by ${author}, subtune ${song} of ${songs}`)}
+function toggleArtworkExpanded(){const hero=$("#jkHero"),btn=$("#jkArtworkExpand");if(!hero)return;const on=hero.classList.toggle("artwork-expanded");if(btn){btn.setAttribute("aria-expanded",String(on));btn.textContent=on?"⤡":"⤢"}}
+function p2HeroElapsed(now=performance.now()){return PREVIEW2_HERO.playing?Math.max(0,PREVIEW2_HERO.baseElapsed+(now-PREVIEW2_HERO.startedAt)/1000):Math.max(0,PREVIEW2_HERO.baseElapsed)}
+function p2HeroPaint(now=performance.now()){const elapsed=p2HeroElapsed(now),shown=PREVIEW2_HERO.length?Math.min(elapsed,PREVIEW2_HERO.length):elapsed,ratio=PREVIEW2_HERO.length?Math.min(1,shown/PREVIEW2_HERO.length):0;const fill=$("#jkHeroProgress");if(fill)fill.style.transform=`scaleX(${ratio})`;const whole=Math.floor(shown);if(whole!==PREVIEW2_HERO.lastTextSecond){PREVIEW2_HERO.lastTextSecond=whole;const e=$("#jkHeroElapsed"),d=$("#jkHeroDuration");if(e)e.textContent=fmtLen(shown);if(d)d.textContent=PREVIEW2_HERO.length?fmtLen(PREVIEW2_HERO.length):"—"}}
+function p2HeroClock(now=performance.now()){p2HeroPaint(now);PREVIEW2_HERO.raf=requestAnimationFrame(p2HeroClock)}
+function p2HeroRender(s){const n=s?.now,m=n?.meta||{},playing=!!s?.playing,pid=Number(s?.playback_id||0),serverElapsed=Math.max(0,Number(s?.playback_elapsed_secs||0)),now=performance.now(),localElapsed=p2HeroElapsed(now),newPlayback=pid!==PREVIEW2_HERO.playbackId||playing!==PREVIEW2_HERO.playing;if(newPlayback||Math.abs(localElapsed-serverElapsed)>.8){PREVIEW2_HERO.playbackId=pid;PREVIEW2_HERO.baseElapsed=serverElapsed;PREVIEW2_HERO.startedAt=now;PREVIEW2_HERO.lastTextSecond=-1}PREVIEW2_HERO.playing=playing;PREVIEW2_HERO.length=Number(n?.length||0);const title=$("#jkHeroTitle"),meta=$("#jkHeroMeta"),badges=$("#jkHeroBadges");if(n){if(title)title.textContent=m.name||n.label||"Untitled SID";if(meta)meta.textContent=[m.author,m.released].filter(Boolean).join(" · ")||"SID playback";p2SetArtwork($("#jkArtwork"),m,n.path,n.label,Number(n.song||1),Number(m.songs||1));if(badges)badges.innerHTML=[m.format?`<span class="badge">${esc(m.format)}</span>`:"",sidChipBadge(m,true),m.songs>1?`<span class="badge">song ${Number(n.song||1)}/${Number(m.songs)}</span>`:""].join("")}else{if(title)title.textContent="Nothing playing";if(meta)meta.textContent="Choose a SID, folder or saved play queue.";p2SetArtwork($("#jkArtwork"),{name:"u64deck",author:"SID Jukebox",format:"SID",songs:1},"fallback","SID",1,1);if(badges)badges.innerHTML='<span class="badge">Ready</span>'}p2HeroPaint(now)}
+function p2DriveLabel(state){const name=driveImageName(state||{});if(name)return name;return state?.enabled?"No disk":"Off"}
+function p2DriveMode(state){const name=driveImageName(state||{});return name?String(state?.mode||state?.reported_mode||""):""}
+function p2UpdateDashboard(){
+  const info=LAST_DEVICE_INFO||{},hasInfo=!!LAST_DEVICE_INFO,state=DASH_CONNECTION_STATE||"offline",connected=state==="connected"&&hasInfo,reconnecting=state==="reconnecting"&&hasInfo,showInfo=hasInfo,badge=$("#dashDeviceBadge"),set=(id,v)=>{const e=$(id);if(e)e.textContent=v??"—"};
+  const badgeLabels={offline:"Offline",connecting:"Connecting…",connected:"Connected",reconnecting:"Reconnecting…",failed:"Connection failed"};
+  if(badge){badge.className="connection-badge "+state;badge.innerHTML=`<span class="status-dot"></span>${badgeLabels[state]||badgeLabels.offline}`}
+  set("#dashDeviceProduct",showInfo?(info.product||"Ultimate"):state==="connecting"?"Connecting to Ultimate…":state==="failed"?"Ultimate unavailable":"Ultimate not connected");
+  set("#dashDeviceHostname",showInfo?(info.hostname||info.unique_id||"Known Ultimate"):state==="connecting"?"Checking the configured device…":state==="failed"?"The last connection attempt did not complete.":"Select a verified Ultimate to begin.");
+  set("#dashDeviceIp",showInfo?(LINK_STATUS.ip||LINK_STATUS.control_ip||"—"):"—");set("#dashDeviceInterface",showInfo?(LINK_STATUS.label||linkName(LINK_STATUS.link_type)||"Unknown"):"—");set("#dashDeviceFirmware",showInfo?(info.firmware_version||"—"):"—");set("#dashDeviceCore",showInfo?(info.core_version||info.core||"—"):"—");set("#dashDeviceInput",showInfo?(INPUT_STATUS.label||"Detecting…"):"—");
+  const restHealth=HEALTH.last?.ultimate||{};set("#dashDeviceRest",connected?(restHealth.consecutive_failures?"Attention":restHealth.last_success_age_seconds<65?"Healthy":"Connected"):reconnecting?"Retrying…":state==="connecting"?"Connecting…":state==="failed"?"Failed":"Waiting");
+  const j=JK.state||{},n=j.now,m=n?.meta||{};set("#dashJukeTitle",n?(m.name||n.label||"SID playing"):"Nothing playing");set("#dashJukeMeta",n?([m.author,m.released].filter(Boolean).join(" · ")||"SID playback"):"Browse your SID collection or load a saved queue.");set("#dashJukeState",j.playing?"Playing":j.loading?"Loading":"Stopped");p2SetArtwork($("#dashArtwork"),m,n?.path,n?.label||"SID",Number(n?.song||1),Number(m.songs||1));
+  const vs=$("#dashVideoState"),as=$("#dashAudioState"),route=$("#dashStreamRoute");if(vs){vs.textContent=videoOn?"Video active":"Video off";vs.className="mini-state"+(videoOn?" on":"")}if(as){as.textContent=audioOn?"Audio active":"Audio off";as.className="mini-state"+(audioOn?" on":"")}if(route)route.textContent=$("#qTransport")?.value==="multicast"?"Multicast":"Direct";set("#dashScreenTitle",videoOn||audioOn?"Screen mirror active":"Screen mirror ready");
+  for(const [key,upper] of [["a","A"],["b","B"]]){const state=DRIVE_STATE[key]||{},name=$("#dashDrive"+upper+"Name"),mode=$("#dashDrive"+upper+"Mode"),mval=p2DriveMode(state);if(name){name.textContent=p2DriveLabel(state);name.title=driveImageName(state)?String(state.image_file||state.path||driveImageName(state)):""}if(mode){mode.hidden=!mval;mode.textContent=mval?mountModeShort(mval):"";mode.className="mount-badge "+mval}}
+  const favs=ITEMS.favorites||[];set("#dashFavTitle",favs.length?`${favs.length} favourite${favs.length===1?"":"s"}`:"Your shortcuts");set("#dashFavMeta",favs.length?"Storage items, SIDs and releases ready for one-click access.":"Star storage items, SIDs and Assembly64 releases for quick access.");
+  const sum=HEALTH.last?.summary||{},hb=$("#dashHealthBadge");set("#dashHealthTitle",sum.state==="healthy"?"Everything looks healthy":sum.state==="degraded"?"Some telemetry deserves attention":sum.state==="attention"?"Action may be required":"Local diagnostics ready");set("#dashHealthMeta",(sum.reasons||[]).join(" · ")||"Streams, REST activity, browser status and recent events.");if(hb){hb.textContent=healthStatusLabel(sum.label||"Waiting");hb.className="mini-state"+(sum.state==="healthy"?" on":sum.state==="attention"?" bad":sum.state==="degraded"?" warn":"")}
+  const statusBar=$(".screen-status-bar"),proc=HEALTH.last?.process||{},host=HEALTH.last?.host||{};if(statusBar){statusBar.classList.toggle("connected",connected);statusBar.classList.toggle("connecting",state==="connecting"||state==="reconnecting")}set("#screenStatusDevice",showInfo?(info.product||"Ultimate"):"Ultimate");set("#screenStatusConnection",badgeLabels[state]||badgeLabels.offline);set("#screenStatusIp",showInfo?(LINK_STATUS.ip||LINK_STATUS.control_ip||"—"):"—");set("#screenStatusRest",Number.isFinite(Number(restHealth.average_ms))?`${Number(restHealth.average_ms).toFixed(1)} ms avg`:"—");set("#screenStatusUptime",proc.uptime_seconds==null?"—":healthDuration(proc.uptime_seconds));set("#screenStatusCpu",host.cpu_percent==null?"—":`${Number(host.cpu_percent).toFixed(0)}%`);set("#screenStatusRam",host.memory_percent==null?"—":`${Number(host.memory_percent).toFixed(0)}%`);
+}
+const p2OriginalTab=tab;tab=function(name){p2OriginalTab(name);if(name==="dashboard"){itemsLoad();jkRefresh();refreshDrives();healthStart();p2UpdateDashboard()}else if(name!=="health")healthStop()};
+const p2OriginalScaleChanged=scaleChanged;scaleChanged=function(save=true){p2OriginalScaleChanged(save);const sec=$("#tab-screen");if(sec)sec.classList.toggle("screen-fit",$("#qScale")?.value==="fit")};
+const p2OriginalRenderDeviceInfo=renderDeviceInfo;renderDeviceInfo=function(i,suffix=""){p2OriginalRenderDeviceInfo(i,suffix);p2UpdateDashboard()};
+const p2OriginalRenderLinkState=renderLinkState;renderLinkState=function(){p2OriginalRenderLinkState();p2UpdateDashboard()};
+const p2OriginalRenderDriveSummaries=renderDriveSummaries;renderDriveSummaries=function(){p2OriginalRenderDriveSummaries();p2UpdateDashboard()};
+const p2OriginalJkRender=jkRender;jkRender=function(s){p2OriginalJkRender(s);p2HeroRender(s);p2UpdateDashboard()};
+const p2OriginalHealthRender=healthRender;healthRender=function(h){p2OriginalHealthRender(h);p2UpdateDashboard()};
+const p2OriginalItemsLoad=itemsLoad;itemsLoad=async function(){const out=await p2OriginalItemsLoad();p2UpdateDashboard();return out};
+const p2OriginalTransportChanged=transportChanged;transportChanged=async function(){const out=await p2OriginalTransportChanged();p2UpdateDashboard();return out};
+const p2OriginalIfaceChanged=ifaceChanged;ifaceChanged=async function(){const out=await p2OriginalIfaceChanged();await loadIfaces();p2UpdateDashboard();return out};
+if(!PREVIEW2_HERO.raf)PREVIEW2_HERO.raf=requestAnimationFrame(p2HeroClock);
 
 /* ---------- boot ---------- */
 loadQuality();loadTransport();loadIfaces();loadBootOptions();loadMountOptions();loadRecSettings();setAudioState("off",0);clearVideoCanvas();itemsLoad();qlRefresh();idxPollStart();

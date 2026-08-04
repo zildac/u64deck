@@ -32,7 +32,7 @@ import json
 import re
 import socket
 import time
-from typing import Any
+from typing import Any, Callable
 
 ULTIMATE_HINT_KEYS = {
     "unique_id", "hostname", "product", "firmware_version", "core_version"
@@ -255,16 +255,27 @@ def scan_direct(
     overall_started: float,
     stage: str,
     port: int = 80,
+    *,
+    result_callback: Callable[[dict[str, Any]], None] | None = None,
+    cancel_event: Any | None = None,
 ) -> list[dict[str, Any]]:
-    """Scan each supplied address once using the shared threaded transport."""
+    """Scan each supplied address once using the shared threaded transport.
+
+    ``result_callback`` is invoked as each completed row becomes available. It
+    changes only result delivery; request construction, timeout budgets and the
+    maximum 64-worker fan-out remain identical. ``cancel_event`` is an optional
+    thread-safe event used by the progressive Finder UI to stop queued work.
+    Requests already in flight are allowed to finish, while futures that have
+    not started are cancelled.
+    """
     results: list[dict[str, Any]] = []
 
     if not ips:
         return results
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=max(1, workers)
-    ) as executor:
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers))
+    future_map: dict[concurrent.futures.Future, str] = {}
+    try:
         future_map = {
             executor.submit(
                 get_info,
@@ -278,8 +289,11 @@ def scan_direct(
             for ip in ips
         }
 
+        cancellation_applied = False
         for future in concurrent.futures.as_completed(future_map):
             ip = future_map[future]
+            if future.cancelled():
+                continue
             try:
                 row = future.result()
             except Exception as exc:
@@ -290,6 +304,21 @@ def scan_direct(
                     "detail": f"{type(exc).__name__}: {exc}",
                 }
             results.append(row)
+            if result_callback is not None:
+                try:
+                    result_callback(dict(row))
+                except Exception:
+                    # Progress reporting must never affect discovery accuracy.
+                    pass
+            if (cancel_event is not None and bool(cancel_event.is_set())
+                    and not cancellation_applied):
+                cancellation_applied = True
+                for pending in future_map:
+                    if not pending.done():
+                        pending.cancel()
+    finally:
+        cancelled = cancel_event is not None and bool(cancel_event.is_set())
+        executor.shutdown(wait=True, cancel_futures=cancelled)
 
     return sorted(results, key=lambda row: ipaddress.ip_address(row["ip"]))
 
