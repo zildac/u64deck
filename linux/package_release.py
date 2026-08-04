@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .build_id import BASE_BUILD, BASE_RELEASE, PREVIEW_LABEL, PREVIEW_VERSION, identity, linux_build_id
 
-ARCHIVE_NAME = "u64deck-v1.9.0-linux-preview.9-private.tar.gz"
+ARCHIVE_NAME = "u64deck-v1.9.0-linux-preview.9.tar.gz"
 EXECUTABLES = {
     "install.sh", "u64deck.sh", "update-linux.sh",
     "uninstall-linux.sh", "import-existing-data.sh",
@@ -110,19 +110,59 @@ def release_notes(root: Path, digest: str, file_count: int,
 **Identity:** `u64deck v1.9.0 · Linux Preview 9 · build {build}`  
 **Base lineage:** `{BASE_RELEASE} · build {BASE_BUILD}`
 
-Linux Preview 9 is a private source-run test build matched to Windows RC51. It is not a frozen ELF or AppImage and is not approved for public release.
+Linux Preview 9 is a public source-run soak candidate published as a GitHub **Pre-release** alongside Windows RC51. It is not a frozen ELF or AppImage.
+
+## New since Preview 7
+
+Linux Preview 9 is the first public Linux preview to carry the RC49/RC50 shared-application work:
+
+- Redesigned u64deck interface and Dashboard presentation.
+- Styled normal, important and destructive confirmation modals.
+- Progressive Ultimate Finder with verified results appearing during the scan.
+- SIDFlow queue diversification to avoid repeated files or visually identical entries.
+- Corrected SID fade scheduling based on the actual SID launch clock.
+- Source-agnostic queue auto-advance.
+- Legacy Mount & Run keyboard-buffer drain handling.
+- Enlarged Dashboard SID Jukebox artwork.
+- Styled local SID multi-file selection control.
+- RC51 compact application icon and restored `library/README.txt` Quick Launch scaffold.
 
 ## Hardware status
 
-Linux Preview 4 was hardware-tested on Ubuntu 24.04.4 LTS x86-64 with GNOME/Wayland and Chromium Snap. Linux Preview 9 retains that distribution architecture and adopts the accepted redesigned shared UI, but this tarball has not yet been hardware-validated on the maintainer NUC. Do not treat the inherited Preview 4 result as a Preview 9 hardware pass.
+Linux Preview 4 was hardware-tested on Ubuntu 24.04.4 LTS x86-64 with GNOME/Wayland and Chromium Snap. Linux Preview 9 retains that distribution architecture and adopts the accepted RC51 shared application baseline, but this corrected public tarball has not been hardware-tested on the maintainer NUC during this packaging run. Do not treat the inherited Preview 4 result as a Preview 9 hardware pass.
 
-## Redesigned shared UI
+## Install & run
+
+```bash
+tar xzf u64deck-v1.9.0-linux-preview.9.tar.gz
+cd u64deck
+./install.sh
+./u64deck.sh
+```
+
+`install.sh` creates a private virtual environment inside the extracted u64deck folder, installs the Python dependencies there, and creates a per-user application-menu entry and `u64deck` launcher. The installer itself does not use `sudo`, modify system Python, or make system-wide changes.
+
+Linux configuration is stored under `${{XDG_CONFIG_HOME:-~/.config}}/u64deck/` and persistent indexes, SIDFlow data, favourites and playlists are stored under `${{XDG_DATA_HOME:-~/.local/share}}/u64deck/`; they are not stored beside the scripts.
+
+## Upgrading from an earlier preview
+
+1. Extract the new preview, enter its `u64deck` directory, and run:
+
+   ```bash
+   ./update-linux.sh
+   ```
+
+2. Keep only **one Linux preview active at a time**. All previews share the same XDG configuration and data directories, so running two copies side by side can cross-contaminate configuration, indexes and runtime state.
+3. `./uninstall-linux.sh` removes the per-user command and application-menu entry. It leaves the extracted source folder and XDG configuration/data untouched.
+4. For Windows-to-Linux or older in-folder migration, run `./import-existing-data.sh /path/to/old/u64deck`. It backs up replaced Linux files, skips live WAL/SHM sidecars, warns about genuine Windows paths and leaves the source folder untouched.
+
+## Shared application updates
 
 - Adopts the accepted Windows RC51 layout, typography, Dashboard, single-page Screen Mirror and Jukebox presentation.
 - The final Assembly64 non-commercial-client sentence uses the same font size as the surrounding support copy, with only a muted colour.
-- Finder/discovery is unchanged and remains a separate reliability investigation.
+- Finder now uses the accepted progressive discovery implementation from the RC50 hardware-tested baseline.
 
-## Auto F7 Legacy correction
+## Auto F7 Legacy behaviour
 
 - Auto F7 defaults to enabled for new installations and older configurations where `boot_prekey` is absent; an explicit disabled value remains disabled.
 - The checkbox remains selectable on Legacy KERNAL-buffer connections. Enabling it stores the preference and shows physical-F7 guidance only.
@@ -150,7 +190,7 @@ Linux Preview 4 was hardware-tested on Ubuntu 24.04.4 LTS x86-64 with GNOME/Wayl
 - Python compile, JavaScript syntax and shell syntax: passed
 - Isolated XDG runtime preparation, Linux API identity/title and graceful Exit: passed
 - Installer/update shell syntax and focused tests: passed; dependency installation was not rerun in this sandbox
-- Owned Chromium-process cleanup: not rerun in this packaging container; retained for private hardware validation
+- Owned Chromium-process cleanup: not rerun in this packaging container; remains part of the public preview soak checklist
 - Data import, backup, URL-scheme and genuine Windows-path warning focused tests: passed
 - Update and rollback validation: {validation}
 - Archive hygiene and personal-path scan: passed
@@ -184,7 +224,7 @@ def main() -> int:
         "\n".join(manifest) + "\n", encoding="utf-8")
     notes = release_notes(root, digest, len(manifest), args.source_tests,
                           args.archive_tests, args.update_validation)
-    (out / "u64deck-v1.9.0-linux-preview.9-private-release-notes.md").write_text(
+    (out / "u64deck-v1.9.0-linux-preview.9-release-notes.md").write_text(
         notes, encoding="utf-8")
     print(tarball)
     print(f"SHA-256 {digest}")

@@ -198,12 +198,39 @@ def test_preview9_manifest_excludes_windows_only_files_and_has_lf_coverage():
     assert "*.txt  text eol=lf" in attrs
 
 
-def test_preview9_release_workflows_use_private_artifact_names():
+def test_preview9_release_workflow_uses_public_artifact_names():
     ci = (ROOT / ".github/workflows/linux-ci.yml").read_text(encoding="utf-8")
     release = (ROOT / ".github/workflows/linux-release.yml").read_text(encoding="utf-8")
+    packager = (ROOT / "linux/package_release.py").read_text(encoding="utf-8")
+    public_base = "u64deck-v1.9.0-linux-preview.9"
     assert "Linux Preview 9" in ci
-    assert "u64deck-v1.9.0-linux-preview.9-private.tar.gz" in release
-    assert "private" in release.lower()
+    assert f"{public_base}.tar.gz" in release
+    assert f"{public_base}.tar.gz.sha256.txt" in release
+    assert f"{public_base}.tar.gz.manifest.txt" in release
+    assert f"{public_base}-release-notes.md" in release
+    legacy_private_name = "preview.9-" + "private"
+    assert legacy_private_name not in release
+    assert legacy_private_name not in packager
+
+
+def test_preview9_generated_notes_are_public_and_self_contained(tmp_path):
+    from linux.package_release import ARCHIVE_NAME, release_notes
+    notes = release_notes(ROOT, "0" * 64, 65, "source passed",
+                          "archive passed", "passed")
+    assert ARCHIVE_NAME == "u64deck-v1.9.0-linux-preview.9.tar.gz"
+    assert "public source-run soak candidate" in notes
+    assert ("not approved for " + "public release") not in notes
+    assert "## New since Preview 7" in notes
+    assert "## Install & run" in notes
+    assert "tar xzf u64deck-v1.9.0-linux-preview.9.tar.gz" in notes
+    assert "cd u64deck" in notes
+    assert "./install.sh" in notes and "./u64deck.sh" in notes
+    assert "## Upgrading from an earlier preview" in notes
+    assert "./update-linux.sh" in notes
+    assert "one Linux preview active at a time" in notes
+    assert "./uninstall-linux.sh" in notes
+    assert "./import-existing-data.sh /path/to/old/u64deck" in notes
+    assert "## Artifact" in notes and "SHA-256" in notes
 
 
 def test_preview9_packager_preserves_every_shell_executable(tmp_path):
