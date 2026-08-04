@@ -30,20 +30,21 @@ when testing the Ethernet REST endpoint itself.
 
 # u64deck
 
-**v1.9.0 — Release Candidate 51 · build ea5a1b6**
+**v1.9.0 — Linux Preview 9 · build cd9ed24**
 
-> **Final release candidate.** RC51 promotes the hardware-accepted RC50 private
-> reissue 6 application baseline without adding functionality or changing the
-> accepted Legacy, CIA1, Finder, SID playback, queue, Assembly64 or redesigned-UI
-> behaviour. The functional source remains frozen apart from release-identity
-> strings.
+**Matched Windows baseline: v1.9.0 — Release Candidate 51 · build ea5a1b6**
+
+Windows RC51 is the final release candidate for the shared application core.
+
+> **Private source-run Linux preview.** Linux Preview 9 uses the same
+> hardware-accepted RC50 private reissue 6 application baseline promoted as
+> Windows RC51, including the accepted Legacy, CIA1, Finder, SID playback, queue,
+> Assembly64 and redesigned-UI behaviour. Its Linux/XDG launcher, installer,
+> updater, importer, Chromium handling and clean-Exit layer remain separate.
 >
-> RC51 restores the canonical empty `library/` area and its README, replaces the
-> Windows application icon with the compact redesigned u64deck mark, preserves
-> the reviewed PyInstaller path-insert correction and adds explicit packaging
-> checks for icon frames, PE release metadata, library contents and source/archive
-> parity. Linux Preview 9 is built from the same accepted shared application
-> baseline with its established Linux/XDG distribution layer.
+> The canonical empty `library/` directory and README are present in both
+> packages. Linux uses the matching compact u64deck desktop icon; the Windows
+> multi-frame ICO and PE VERSIONINFO checks remain Windows-specific.
 
 A lightweight, self-hosted control deck for the **Ultimate 64** (and, minus the
 screen mirror, the 1541 Ultimate-II+). One small Python server, a plain HTML/CSS/JavaScript interface,
@@ -254,6 +255,43 @@ available keys (`u64_host`, the Ultimate network `password`, FTP credentials,
 base URL). The Assembly64 application identifier is fixed as `u64deck` and is
 not a user setting.
 
+#### Linux Preview 9 — private source-run preview
+
+Linux Preview 9 is a private test build rather than the stable supported build. It
+is provided as-is for testing on recent Debian/Ubuntu-derived desktops; report
+Linux issues with the complete version/build string. Windows RC51 build
+`ea5a1b6` is the matched shared-application baseline.
+
+Extract the `.tar.gz`, then run as a normal user:
+
+```bash
+chmod +x install.sh u64deck.sh
+./install.sh
+./u64deck.sh
+```
+
+`install.sh` creates a private `.venv` inside the extracted application folder,
+installs `requirements.txt` there, creates an application-menu entry and a
+`~/.local/bin/u64deck` launcher. It never invokes `sudo` or changes system
+Python. Chromium, Chrome or Edge app-window mode is used when available;
+otherwise u64deck opens the system browser or prints the local URL.
+
+### Persistent-file locations
+
+The two platforms deliberately use different storage conventions:
+
+| Data | Windows | Linux Preview |
+|---|---|---|
+| Settings | `config.json` beside `u64deck.exe` | `${XDG_CONFIG_HOME:-~/.config}/u64deck/config.json` |
+| Storage/SID index | `.u64deck-index.sqlite3` beside the EXE | `${XDG_DATA_HOME:-~/.local/share}/u64deck/.u64deck-index.sqlite3` |
+| SIDFlow database | `.sidflow-similarity.sqlite` beside the EXE | `${XDG_DATA_HOME:-~/.local/share}/u64deck/.sidflow-similarity.sqlite` |
+| Favourites/recents | `user_items.json` beside the EXE | `${XDG_DATA_HOME:-~/.local/share}/u64deck/user_items.json` |
+| SID playlists | `playlists.json` beside the EXE | `${XDG_DATA_HOME:-~/.local/share}/u64deck/playlists.json` |
+| Logs | console / application folder context | `${XDG_STATE_HOME:-~/.local/state}/u64deck/u64deck.log` |
+
+Linux does not read JSON or SQLite runtime files placed beside the `.sh`
+scripts. Print the active paths with `./u64deck.sh --linux-print-paths`.
+
 ### Updating an existing installation
 
 Install every release into a **new, empty folder**. Stop the previous u64deck
@@ -281,6 +319,29 @@ Always run u64deck as a normal user, and always the same way — mixing elevated
 ('Run as administrator') and normal launches leaves files with mismatched
 ownership and causes access-denied errors. If that has happened, use a fresh
 folder and copy only the supported persistent files listed above.
+
+#### Linux Preview
+
+Extract the new tarball into a new folder, use **Exit u64deck** in the old
+version, then run `./update-linux.sh` from the new folder. The updater installs
+the new private virtual environment, repoints the menu/command launchers and
+retains the XDG configuration and data directories. It leaves the previous
+application folder untouched. `./update-linux.sh --rollback /path/to/old/u64deck`
+repoints the launchers to a previous installed folder.
+
+For a Windows installation or an older Linux preview that stored persistent
+files beside its launcher, stop u64deck and run:
+
+```bash
+./import-existing-data.sh /path/to/old/u64deck
+```
+
+The importer copies supported settings, favourites, playlists, SIDFlow data and
+indexes into the Linux XDG locations, backs up anything it replaces, skips
+`-wal`/`-shm` files and leaves the source untouched. Windows filesystem paths
+inside `config.json`, favourites or an index are reported because Linux mount
+paths may need changing; a storage/SID index containing obsolete Windows paths
+may need to be rebuilt.
 
 ## Interface-aware Ultimate discovery
 

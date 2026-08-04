@@ -17,15 +17,15 @@ pytestmark = pytest.mark.skipif(
 
 ROOT = Path(__file__).resolve().parents[1]
 
-def test_linux_identity_is_separate_from_windows_rc48():
+def test_linux_identity_is_separate_from_windows_rc51():
     from linux.build_id import BASE_BUILD, PREVIEW_LABEL, identity, linux_build_id
     build = linux_build_id(ROOT)
-    assert PREVIEW_LABEL == "Linux Preview 7"
-    assert BASE_BUILD == "c0d1fb0"
+    assert PREVIEW_LABEL == "Linux Preview 9"
+    assert BASE_BUILD == "ea5a1b6"
     assert len(build) == 7 and all(c in "0123456789abcdef" for c in build)
-    assert identity(ROOT) == f"u64deck v1.9.0 · Linux Preview 7 · build {build}"
+    assert identity(ROOT) == f"u64deck v1.9.0 · Linux Preview 9 · build {build}"
 
-def test_rc48_core_manifest_matches_reviewed_files():
+def test_rc51_core_manifest_matches_reviewed_files():
     from linux.runtime import verify_core
     ok, failures = verify_core(ROOT)
     assert ok, failures
@@ -55,7 +55,7 @@ def test_generated_runtime_redirects_config_and_data(monkeypatch, tmp_path):
     release = (runtime / "release.py").read_text(encoding="utf-8")
     assert 'U64DECK_DATA_DIR' in server
     assert 'CONFIG_ROOT / "config.json"' in server
-    assert "Linux Preview 7" in release and build in release
+    assert "Linux Preview 9" in release and build in release
     assert paths["config"].is_dir() and paths["data"].is_dir()
 
 def test_generated_static_overlay_is_linux_specific(monkeypatch, tmp_path):
@@ -67,11 +67,11 @@ def test_generated_static_overlay_is_linux_specific(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     runtime, _, _ = prepare_runtime(ROOT)
     html = (runtime / "static/index.html").read_text(encoding="utf-8")
-    assert "<title>u64deck v1.9.0 · Linux Preview 7</title>" in html
+    assert "<title>u64deck v1.9.0 · Linux Preview 9</title>" in html
     assert "U64DECK LINUX PREVIEW HELP" in html
     assert "dedicated Linux app window" in html
     assert (ROOT / "static/index.html").read_text(encoding="utf-8").startswith("<!DOCTYPE html>")
-    assert "<title>u64deck</title>" in (ROOT / "static/index.html").read_text(encoding="utf-8")
+    assert "<title>u64deck v1.9.0 · Release Candidate 51</title>" in (ROOT / "static/index.html").read_text(encoding="utf-8")
 
 def test_linux_scripts_are_executable_and_strict():
     for name in ("install.sh", "u64deck.sh", "update-linux.sh",
@@ -187,10 +187,10 @@ def test_no_personal_paths_or_identifiers_in_release_sources():
         assert not any(pattern.search(text) for pattern in patterns), path
 
 
-def test_preview7_manifest_excludes_windows_only_files_and_has_lf_coverage():
+def test_preview9_manifest_excludes_windows_only_files_and_has_lf_coverage():
     manifest = (ROOT / "linux/core-manifest.sha256").read_text(encoding="utf-8")
     attrs = (ROOT / ".gitattributes").read_text(encoding="utf-8")
-    assert "Windows RC48 shared application core" in manifest
+    assert "Windows RC51 shared application core" in manifest
     for rel in (".github/workflows/build-exe.yml", "u64deck.spec", "start.bat"):
         assert rel not in manifest
     assert "*.sh   text eol=lf" in attrs
@@ -198,20 +198,39 @@ def test_preview7_manifest_excludes_windows_only_files_and_has_lf_coverage():
     assert "*.txt  text eol=lf" in attrs
 
 
-def test_preview7_release_workflows_use_public_artifact_names():
+def test_preview9_release_workflows_use_private_artifact_names():
     ci = (ROOT / ".github/workflows/linux-ci.yml").read_text(encoding="utf-8")
     release = (ROOT / ".github/workflows/linux-release.yml").read_text(encoding="utf-8")
-    assert "Linux Preview 7" in ci
-    assert "u64deck-v1.9.0-linux-preview.7.tar.gz" in release
-    assert "private" not in release.lower()
+    assert "Linux Preview 9" in ci
+    assert "u64deck-v1.9.0-linux-preview.9-private.tar.gz" in release
+    assert "private" in release.lower()
 
 
-def test_preview7_packager_preserves_every_shell_executable(tmp_path):
+def test_preview9_packager_preserves_every_shell_executable(tmp_path):
     from linux.package_release import build_tarball
-    out = tmp_path / "preview7.tar.gz"
+    out = tmp_path / "preview9.tar.gz"
     _, _ = build_tarball(ROOT, out)
     with tarfile.open(out, "r:gz") as tf:
         modes = {m.name: stat.S_IMODE(m.mode) for m in tf.getmembers() if m.isfile()}
     for name in ("install.sh", "u64deck.sh", "update-linux.sh",
                  "uninstall-linux.sh", "import-existing-data.sh"):
         assert modes[f"u64deck/{name}"] == 0o755
+
+
+def test_preview9_assembly64_final_clause_matches_support_copy_font_size():
+    css = (ROOT / "static/app.css").read_text(encoding="utf-8")
+    assert ".asm-support-copy span{color:var(--txt);font-size:14px;line-height:1.5" in css
+    assert ".asm-support-copy small{color:var(--dim);font-size:14px;line-height:1.5" in css
+
+
+def test_preview9_library_and_desktop_icon_contract():
+    canonical = (
+        "Drop .crt/.prg/.t64/.sid/.mod/.d64/.d71/.d81/.g64/.dnp files here.\n"
+        "Each appears as a Quick Launch button in u64deck's SCREEN tab.\n"
+    ).encode("utf-8")
+    library = ROOT / "library"
+    assert sorted(p.name for p in library.iterdir()) == ["README.txt"]
+    assert (library / "README.txt").read_bytes() == canonical
+    assert (ROOT / "u64deck-icon-256.png").is_file()
+    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+    assert "Icon=$SCRIPT_DIR/u64deck-icon-256.png" in installer

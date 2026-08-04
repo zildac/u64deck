@@ -1,19 +1,21 @@
-# u64deck v1.9.0 — Linux Preview 7
+# u64deck v1.9.0 — Linux Preview 9
 
-Linux Preview 7 is the source-run Linux distribution matched to the reviewed
-Windows v1.9.0 RC48 core (`c0d1fb0`). It is published in the same `zildac/u64deck`
+Linux Preview 9 is the source-run Linux distribution matched to the reviewed
+Windows v1.9.0 RC51 private core (`ea5a1b6`). It is published in the same `zildac/u64deck`
 repository. No frozen ELF or AppImage is produced.
 
-Windows RC48 and Linux Preview 7 are matched soak candidates. The Linux preview
+Windows RC51 and Linux Preview 9 are matched private test builds. The Linux preview
 is provided as-is for testing: expect rough edges, include the full Linux
 version/build identity in reports, and state the distribution, desktop session,
 Python version and browser package used.
+
+This private preview adopts the accepted redesigned interface shared with Windows RC51. The Assembly64 final non-commercial-client sentence is the same size as the surrounding support text, with only muted colour. Finder/discovery behaviour is unchanged.
 
 ## Tested platform
 
 The earlier Linux Preview 4 hardware-tested environment was Ubuntu 24.04.4 LTS on amd64, kernel
 6.8.0-136-generic, Ubuntu GNOME under Wayland, Python 3.12.3 and Chromium
-150.0.7871.128 from Canonical's stable Snap channel. Linux Preview 7 retains that architecture but has not yet been run on the maintainer NUC.
+150.0.7871.128 from Canonical's stable Snap channel. Linux Preview 9 retains that architecture but has not yet been run on the maintainer NUC.
 
 That earlier hardware validation covered installation and application-menu launch, Chromium
 app-window mode, Ultimate discovery and connection, screen mirror at about
@@ -34,7 +36,7 @@ sudo snap install chromium
 The u64deck installer itself does not invoke `sudo`:
 
 ```bash
-tar -xzf u64deck-v1.9.0-linux-preview.7.tar.gz
+tar -xzf u64deck-v1.9.0-linux-preview.8-private.tar.gz
 cd u64deck
 ./install.sh
 ./u64deck.sh
@@ -53,14 +55,14 @@ Run `./u64deck.sh --linux-print-paths` to print the active persistent paths.
   Chromium, Chrome or Edge with `--app`; if none is available it uses the
   system browser or prints the URL. Only a Linux app process launched by the
   current u64deck process is terminated on Exit.
-- **Exit:** the shared RC48 `/api/app/exit` endpoint stops Uvicorn and reaches
+- **Exit:** the shared RC49 `/api/app/exit` endpoint stops Uvicorn and reaches
   normal application cleanup. The Linux wrapper then terminates only its owned
   app-browser process group and removes its PID file.
 - **Paths:** Windows stores persistent data beside `u64deck.exe`; Linux uses XDG
   per-user directories as documented below.
 
 The Linux runtime verifies `linux/core-manifest.sha256`, generates an ephemeral
-runtime facade under the XDG cache and runs the byte-identical RC48 shared modules
+runtime facade under the XDG cache and runs the byte-identical RC49 shared modules
 through it. The generated facade changes only release identity, XDG root paths
 and Linux wording. The original `server.py`, discovery, indexing, SIDFlow,
 device-control and static source files remain unchanged.

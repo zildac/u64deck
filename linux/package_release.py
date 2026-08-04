@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .build_id import BASE_BUILD, BASE_RELEASE, PREVIEW_LABEL, PREVIEW_VERSION, identity, linux_build_id
 
-ARCHIVE_NAME = "u64deck-v1.9.0-linux-preview.7.tar.gz"
+ARCHIVE_NAME = "u64deck-v1.9.0-linux-preview.9-private.tar.gz"
 EXECUTABLES = {
     "install.sh", "u64deck.sh", "update-linux.sh",
     "uninstall-linux.sh", "import-existing-data.sh",
@@ -105,16 +105,22 @@ def build_tarball(root: Path, output: Path) -> tuple[str, list[str]]:
 def release_notes(root: Path, digest: str, file_count: int,
                   source_tests: str, archive_tests: str, validation: str) -> str:
     build = linux_build_id(root)
-    return f"""# u64deck v1.9.0 — Linux Preview 7
+    return f"""# u64deck v1.9.0 — Linux Preview 9
 
-**Identity:** `u64deck v1.9.0 · Linux Preview 7 · build {build}`  
+**Identity:** `u64deck v1.9.0 · Linux Preview 9 · build {build}`  
 **Base lineage:** `{BASE_RELEASE} · build {BASE_BUILD}`
 
-Linux Preview 7 is a source-run soak candidate published alongside Windows RC48 in the same repository. It is not a frozen ELF or AppImage. Both artefacts are soak candidates rather than Final releases.
+Linux Preview 9 is a private source-run test build matched to Windows RC51. It is not a frozen ELF or AppImage and is not approved for public release.
 
 ## Hardware status
 
-Linux Preview 4 was hardware-tested on Ubuntu 24.04.4 LTS x86-64 with GNOME/Wayland and Chromium Snap. Linux Preview 7 retains that distribution architecture, but this final tarball has not yet been hardware-validated on the maintainer NUC. Do not treat the inherited Preview 4 result as a Preview 7 hardware pass.
+Linux Preview 4 was hardware-tested on Ubuntu 24.04.4 LTS x86-64 with GNOME/Wayland and Chromium Snap. Linux Preview 9 retains that distribution architecture and adopts the accepted redesigned shared UI, but this tarball has not yet been hardware-validated on the maintainer NUC. Do not treat the inherited Preview 4 result as a Preview 9 hardware pass.
+
+## Redesigned shared UI
+
+- Adopts the accepted Windows RC51 layout, typography, Dashboard, single-page Screen Mirror and Jukebox presentation.
+- The final Assembly64 non-commercial-client sentence uses the same font size as the surrounding support copy, with only a muted colour.
+- Finder/discovery is unchanged and remains a separate reliability investigation.
 
 ## Auto F7 Legacy correction
 
@@ -142,14 +148,15 @@ Linux Preview 4 was hardware-tested on Ubuntu 24.04.4 LTS x86-64 with GNOME/Wayl
 - Extracted-tarball tests: **{archive_tests}**
 - Core-integrity manifest: passed
 - Python compile, JavaScript syntax and shell syntax: passed
-- Clean XDG install, API identity, config save and graceful Exit: passed
-- Owned Chromium-process cleanup: passed
-- Data import, backup, URL-scheme and genuine Windows-path warning checks: passed
-- Update and rollback smoke: {validation}
+- Isolated XDG runtime preparation, Linux API identity/title and graceful Exit: passed
+- Installer/update shell syntax and focused tests: passed; dependency installation was not rerun in this sandbox
+- Owned Chromium-process cleanup: not rerun in this packaging container; retained for private hardware validation
+- Data import, backup, URL-scheme and genuine Windows-path warning focused tests: passed
+- Update and rollback validation: {validation}
 - Archive hygiene and personal-path scan: passed
 - Archive entries: **{file_count} files**
 
-The dependency-download path was hardware-tested during the earlier Ubuntu NUC preview work. No Linux Preview 7 NUC hardware test was performed during this packaging run. The packaging sandbox had no public package-index access, so its clean installer validation used the same installed dependency versions exposed to an isolated virtual environment.
+The dependency-download path was hardware-tested during the earlier Ubuntu NUC preview work. No Linux Preview 9 NUC hardware test, live dependency-install run, owned-browser cleanup run or live updater rollback was performed during this packaging run. The packaging sandbox used its preinstalled test dependencies only.
 
 ## Artifact
 
@@ -177,7 +184,7 @@ def main() -> int:
         "\n".join(manifest) + "\n", encoding="utf-8")
     notes = release_notes(root, digest, len(manifest), args.source_tests,
                           args.archive_tests, args.update_validation)
-    (out / "u64deck-v1.9.0-linux-preview.7-release-notes.md").write_text(
+    (out / "u64deck-v1.9.0-linux-preview.9-private-release-notes.md").write_text(
         notes, encoding="utf-8")
     print(tarball)
     print(f"SHA-256 {digest}")

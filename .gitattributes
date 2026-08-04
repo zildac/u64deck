@@ -9,6 +9,8 @@
 *.json text eol=lf
 *.bat  text eol=crlf
 *.svg  text eol=lf
-library/README.txt text eol=lf
 *.ico  binary
 *.png  binary
+*.sh   text eol=lf
+*.sha256 text eol=lf
+*.txt  text eol=lf

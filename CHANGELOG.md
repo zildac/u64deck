@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.9.0 — Linux Preview 9
+
+**Private Linux source-run preview:** `cd9ed24`  
+**Matched Windows baseline:** `Release Candidate 51 · ea5a1b6`
+
+- Adopts the hardware-accepted RC51 shared application core without Linux-only functional changes.
+- Retains the established XDG configuration/data layout, installer, updater, importer, Chromium app-window handling and graceful Exit lifecycle.
+- Restores the canonical empty `library/` directory and README in the Linux tarball.
+- Uses the matching compact u64deck PNG for the Linux desktop/application-menu icon.
+- Adds package-level checks for canonical library contents, icon presence, shared-core parity and extracted-tarball hygiene.
+
 ## 1.9.0 — Release Candidate 51
 
 **Public final release candidate:** `ea5a1b6`
