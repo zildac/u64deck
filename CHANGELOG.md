@@ -2,7 +2,7 @@
 
 ## 1.9.0
 
-**Windows Final:** `579a5f8`
+**Windows Final:** `919f533`
 
 - Promotes the hardware-tested RC51 application code unchanged apart from the release identity.
 - Retains the canonical empty `library/` directory containing only `library/README.txt`.
