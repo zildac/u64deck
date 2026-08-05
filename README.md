@@ -30,7 +30,7 @@ when testing the Ethernet REST endpoint itself.
 
 # u64deck
 
-**v1.9.0 · build 579a5f8**
+**v1.9.0 · build 919f533**
 
 > **Windows Final.** This is the hardware-tested RC51 application code promoted
 > unchanged apart from the release identity. The accepted Legacy, CIA1, Finder,
