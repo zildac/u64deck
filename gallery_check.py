@@ -8,6 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 README = ROOT / "README.md"
 CANONICAL_IMAGES = (
+    "docs/dashboard.png",
     "docs/screen-tab.png",
     "docs/storage-search.png",
     "docs/jukebox.png",
@@ -19,7 +20,6 @@ CANONICAL_IMAGES = (
     "docs/split-route.png",
     "docs/wifi-streaming-gated.png",
     "docs/mount-and-run.png",
-    "docs/busy-loading.png",
     "docs/disk-swap.png",
 )
 
