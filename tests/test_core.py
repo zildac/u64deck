@@ -4330,7 +4330,6 @@ def test_interface_awareness_help_readme_and_expanded_screenshot_gallery():
     assert "docs/wifi-ethernet-header.png" in readme
     assert "docs/wifi-streaming-gated.png" in readme
     assert "docs/mount-and-run.png" in readme
-    assert "docs/busy-loading.png" in readme
     assert "docs/disk-swap.png" in readme
     assert "Full firmware settings access — every category editable from the browser" in readme
     assert "## Interface-aware Ultimate discovery" in readme

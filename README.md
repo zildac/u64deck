@@ -177,6 +177,9 @@ to use the integration.
 
 ## Screenshots
 
+![Dashboard](docs/dashboard.png)
+*The Dashboard — device, storage, favourites, SID Jukebox and health at a glance, with one-click routes into everything else.*
+
 ![Screen mirror](docs/screen-tab.png)
 *Live VIC screen mirror with a working keyboard, stream controls and recording — the bezel follows the machine's real border colour.*
 
@@ -199,19 +202,16 @@ to use the integration.
 *Find Ultimate Devices — one row per device with verified Ethernet (recommended) and Wi-Fi addresses, deduplicated by unique id.*
 
 ![Wi-Fi and Ethernet header](docs/wifi-ethernet-header.png)
-*Connected header showing the active link type, with one-click Switch to Ethernet when a wired address is known.*
+*The Dashboard device card showing the active link type — u64deck detects and reports whether it is talking to the Ultimate over Ethernet or Wi-Fi.*
 
 ![Split routing](docs/split-route.png)
-*When both interfaces belong to the same Ultimate, media and commands use Ethernet while status polling uses the faster Wi-Fi REST path — shown here as "Ethernet · REST via Wi-Fi" in the header.*
+*When both interfaces belong to the same Ultimate, media and commands use Ethernet while status polling uses the faster Wi-Fi REST path — shown here as "Ethernet · REST via Wi-Fi" on the stream status badge.*
 
 ![Wi-Fi streaming gated](docs/wifi-streaming-gated.png)
-*Screen tab over Wi-Fi: streaming is wired-only, so video, audio and recording are clearly gated while the rest of the app stays available.*
+*Screen Mirror over Wi-Fi: streaming is wired-only, so video, audio and recording are clearly gated — with a one-click Switch to Ethernet — while the rest of the app stays available.*
 
 ![Mount and Run](docs/mount-and-run.png)
-*Mount & Run types LOAD and RUN automatically once the machine is ready, with each readiness gate recorded in Diagnostics.*
-
-![Busy loading](docs/busy-loading.png)
-*Amber “BUSY — loading program…” state during a slow genuine-drive load, keeping the device connected instead of showing a false timeout.*
+*Mount & Run waits for the machine to be ready, then types LOAD and RUN for you. On Legacy-input hardware with a freezer cartridge fitted, it asks for a physical F7 first and continues automatically once BASIC is back.*
 
 ![Disk swap](docs/disk-swap.png)
 *Automatic multi-disk grouping with the swap bar, plus Add to Swap Queue for sets that are intentionally left ungrouped.*
